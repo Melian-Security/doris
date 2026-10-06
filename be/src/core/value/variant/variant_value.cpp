@@ -115,23 +115,20 @@ void require_primitive(VariantPrimitiveId actual, VariantPrimitiveId expected,
 
 } // namespace
 
-VariantBasicType VariantRef::basic_type() const {
-    require_bytes(value.size, 1, "header");
-    return static_cast<VariantBasicType>(static_cast<uint8_t>(value.data[0]) &
-                                         VARIANT_BASIC_TYPE_MASK);
+void VariantRef::_throw_truncated_header() {
+    throw Exception(ErrorCode::CORRUPTION,
+                    "Truncated Variant value while reading {}: need {} bytes, have {}", "header",
+                    1, 0);
 }
 
-VariantPrimitiveId VariantRef::primitive_id() const {
-    if (basic_type() != VariantBasicType::PRIMITIVE) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT,
-                        "Variant primitive accessor used for non-primitive basic type {}",
-                        static_cast<uint8_t>(basic_type()));
-    }
-    const uint8_t id = static_cast<uint8_t>(value.data[0]) >> VARIANT_VALUE_HEADER_SHIFT;
-    if (id > VARIANT_MAX_PRIMITIVE_ID) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT, "Unknown Variant primitive id {}", id);
-    }
-    return static_cast<VariantPrimitiveId>(id);
+void VariantRef::_throw_not_primitive(VariantBasicType type) {
+    throw Exception(ErrorCode::INVALID_ARGUMENT,
+                    "Variant primitive accessor used for non-primitive basic type {}",
+                    static_cast<uint8_t>(type));
+}
+
+void VariantRef::_throw_unknown_primitive(uint8_t id) {
+    throw Exception(ErrorCode::INVALID_ARGUMENT, "Unknown Variant primitive id {}", id);
 }
 
 size_t VariantRef::value_size() const {
@@ -150,11 +147,6 @@ size_t VariantRef::value_size() const {
     }
     const ContainerLayout layout = _container_layout(type);
     return layout.values_offset + layout.values_size;
-}
-
-bool VariantRef::is_null() const {
-    return basic_type() == VariantBasicType::PRIMITIVE &&
-           primitive_id() == VariantPrimitiveId::NULL_VALUE;
 }
 
 bool VariantRef::get_bool() const {
@@ -374,6 +366,10 @@ VariantRef::ObjectView VariantRef::object_view() const {
     return ObjectView(*this, layout, dictionary_size);
 }
 
+VariantRef::ArrayView VariantRef::array_view() const {
+    return ArrayView(*this, _container_layout(VariantBasicType::ARRAY));
+}
+
 uint32_t VariantRef::_object_field_id(const ContainerLayout& layout, uint32_t index,
                                       const uint32_t* dictionary_size) const {
     if (index >= layout.count) {
@@ -394,7 +390,9 @@ uint32_t VariantRef::_object_field_id(const ContainerLayout& layout, uint32_t in
 }
 
 VariantRef VariantRef::_container_value_at(const ContainerLayout& layout, uint32_t index,
-                                           bool require_array_boundary) const {
+                                           bool require_array_boundary,
+                                           ContainerLayout* child_layout,
+                                           bool* child_has_layout) const {
     if (index >= layout.count) {
         throw Exception(ErrorCode::INVALID_ARGUMENT,
                         "Variant container index {} is out of range [0, {})", index, layout.count);
@@ -410,7 +408,19 @@ VariantRef VariantRef::_container_value_at(const ContainerLayout& layout, uint32
     VariantRef child {
             .metadata = metadata,
             .value = {value.data + layout.values_offset + offset, layout.values_size - offset}};
-    const size_t child_size = child.value_size();
+    size_t child_size = 0;
+    const VariantBasicType child_type = child_layout == nullptr ? VariantBasicType::PRIMITIVE
+                                                                : child.basic_type();
+    if (child_type == VariantBasicType::OBJECT || child_type == VariantBasicType::ARRAY) {
+        // value_size() of a container is exactly its layout extent. Keep the layout so the caller
+        // can descend without decoding the same header again. Every bound _container_layout()
+        // checks lies within that extent, so the layout is identical after truncation below.
+        *child_layout = child._container_layout(child_type);
+        *child_has_layout = true;
+        child_size = child_layout->values_offset + child_layout->values_size;
+    } else {
+        child_size = child.value_size();
+    }
     if (require_array_boundary) {
         const auto next_offset = static_cast<uint32_t>(
                 read_unsigned(value.data + layout.offsets_offset +
@@ -442,6 +452,26 @@ VariantRef VariantRef::ObjectView::value_at(uint32_t index, uint32_t* field_id_o
         *field_id_out = field_id;
     }
     return _value._container_value_at(_layout, index, false);
+}
+
+VariantRef VariantRef::ObjectView::value_at(uint32_t index, uint32_t* field_id_out,
+                                            std::optional<ObjectView>* child_object) const {
+    child_object->reset();
+    const uint32_t field_id = _value._object_field_id(_layout, index, &_dictionary_size);
+    if (field_id_out != nullptr) {
+        *field_id_out = field_id;
+    }
+    ContainerLayout child_layout {};
+    bool child_has_layout = false;
+    const VariantRef child =
+            _value._container_value_at(_layout, index, false, &child_layout, &child_has_layout);
+    if (child_has_layout && child.basic_type() == VariantBasicType::OBJECT) {
+        // The child shares this object's metadata, whose dictionary size object_view() would
+        // read again. A non-empty parent has already validated and cached it.
+        *child_object = ObjectView(child, child_layout,
+                                   child_layout.count == 0 ? 0 : _dictionary_size);
+    }
+    return child;
 }
 
 VariantRef VariantRef::array_at(uint32_t index) const {

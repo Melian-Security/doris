@@ -25,6 +25,7 @@
 #include <ranges>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 
 #include "common/config.h"
@@ -1109,6 +1110,163 @@ TEST(VariantShredderTest, ChunkedBinaryTransposeMatchesSingleChunkForOrdinaryAnd
                         assert_cast<const ColumnMap&>(*actual.binary_buckets[bucket].column);
                 EXPECT_EQ(map.size(), sparse_masks.size());
                 EXPECT_GT(map.get_keys().size(), 0) << "bucket=" << bucket;
+            }
+        }
+    }
+}
+
+class ScopedVariantV2ShredderFastPath {
+public:
+    explicit ScopedVariantV2ShredderFastPath(bool enabled)
+            : _old_value(config::variant_v2_shredder_fast_path) {
+        config::variant_v2_shredder_fast_path = enabled;
+    }
+    ~ScopedVariantV2ShredderFastPath() { config::variant_v2_shredder_fast_path = _old_value; }
+
+private:
+    bool _old_value;
+};
+
+// Synthetic OCSF-shaped event. Row-dependent choices cover nested objects, arrays of scalars,
+// arrays of objects, nested arrays, arrays with nulls or only nulls, JSON nulls, empty containers,
+// per-path type changes (int -> double -> string, bool -> int, int array -> string array), dotted
+// keys that collide with nested paths, and a long tail of row-unique paths that pushes the column
+// past its subcolumn budget.
+static std::string ocsf_like_json(size_t row, bool dotted_keys) {
+    const std::string r = std::to_string(row);
+    std::string json = "{";
+    json += R"("class_uid":)" + std::to_string(3000 + row % 7);
+    json += R"(,"time":)" + std::to_string(1700000000000 + row);
+    json += R"(,"message":"event )" + r + R"( é")";
+    json += R"(,"metadata":{"product":{"name":"prod)" + std::to_string(row % 5) +
+            R"(","vendor_name":"vendor","version":"1.)" + std::to_string(row % 3) +
+            R"("},"uid":"uid-)" + r + R"(","labels":["a","b)" + std::to_string(row % 4) + R"("]})";
+    if (row % 3 == 0) {
+        json += R"(,"severity_id":)" + std::to_string(row % 6);
+    } else if (row % 3 == 1) {
+        json += R"(,"severity_id":)" + std::to_string(row % 6) + ".5";
+    } else if (row % 11 == 2) {
+        json += R"(,"severity_id":"high")";
+    }
+    json += R"(,"flag":)" + std::string(row % 13 == 0 ? "1" : (row % 2 == 0 ? "true" : "false"));
+    json += R"(,"actor":)";
+    if (row % 4 == 0) {
+        json += "null";
+    } else {
+        json += R"({"user":{"name":"u)" + std::to_string(row % 9) + R"(","uid":)" +
+                std::to_string(row);
+        json += R"(,"groups":[{"name":"g1"},{"name":"g2","privileges":["p"]}]},)";
+        json += R"("session":{"is_remote":)" + std::string(row % 2 == 0 ? "true" : "false") +
+                R"(,"empty":{}}})";
+    }
+    json += R"(,"src_endpoint":{"ip":)" +
+            (row % 5 == 0 ? std::string("null") : "\"10.0.0." + std::to_string(row % 255) + "\"") +
+            R"(,"port":)" + std::to_string(1024 + row % 1000) + "}";
+    json += R"(,"observables":[{"name":"src_endpoint.ip","type_id":2,"value":"10.0.0.1"},)"
+            R"({"name":"actor.user.name","type_id":4}])";
+    if (row % 29 == 0) {
+        json += R"(,"categories":["x"])";
+    } else {
+        json += R"(,"categories":[1,2,)" + std::to_string(row % 3) + "]";
+    }
+    json += R"(,"scores":[1.5,null,)" + std::to_string(row % 7) + ".25]";
+    json += R"(,"bools":[true,null,)" + std::string(row % 2 == 0 ? "false" : "true") + "]";
+    json += row % 6 == 0 ? R"(,"sometimes_null":[null])" : R"(,"sometimes_null":["s"])";
+    json += R"(,"mixed":[1,"a",null,)" + std::string(row % 2 == 0 ? "2.5" : "true") + "]";
+    json += R"(,"matrix":[[1,2],[3]],"empty_list":[])";
+    json += R"(,"unmapped":{"k_)" + r + R"(":)" + r + R"(,"shared_)" + std::to_string(row % 50) +
+            R"(":"v"})";
+    if (dotted_keys && row % 10 == 0) {
+        json += R"(,"dotted.key":)" + r;
+    } else if (dotted_keys && row % 10 == 1) {
+        json += R"(,"dotted":{"key":)" + r + "}";
+    }
+    json += "}";
+    return json;
+}
+
+static void build_ocsf_like_column(size_t rows, bool dotted_keys, ColumnVariantV2* values) {
+    DataTypeVariantV2SerDe serde;
+    DataTypeSerDe::FormatOptions format_options;
+    for (size_t row = 0; row < rows; ++row) {
+        std::string json;
+        if (row % 97 == 5) {
+            json = R"("root scalar")";
+        } else if (row % 97 == 6) {
+            json = R"([1,{"a":2}])";
+        } else {
+            json = ocsf_like_json(row, dotted_keys);
+        }
+        Slice slice(json.data(), json.size());
+        ASSERT_TRUE(serde.deserialize_one_cell_from_json(*values, slice, format_options).ok())
+                << json;
+    }
+}
+
+static Status shred_in_chunks(bool fast_path, const segment_v2::VariantShredderOptions& options,
+                              const ColumnVariantV2& values,
+                              const std::vector<uint8_t>& outer_nulls,
+                              segment_v2::VariantShreddedColumns* output) {
+    ScopedVariantV2ShredderFastPath scoped(fast_path);
+    segment_v2::VariantShredder shredder(options);
+    const auto view = values.read_view();
+    // Uneven appends exercise per-append metadata caches and builders created mid-segment.
+    size_t begin = 0;
+    for (const size_t length : {size_t {1}, size_t {127}, values.size()}) {
+        const size_t count = std::min(length, values.size() - begin);
+        const std::span<const uint8_t> nulls(outer_nulls.data() + begin, count);
+        RETURN_IF_ERROR(shredder.append(view, begin, count, nulls));
+        begin += count;
+    }
+    DORIS_CHECK_EQ(begin, values.size());
+    return shredder.finish(output);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- GTest macros expand assertions.
+TEST(VariantShredderTest, FastPathMatchesGeneralPathForOcsfLikeDocuments) {
+    constexpr size_t ROWS = 2600;
+    for (const auto physical_layout : {segment_v2::VariantShredderPhysicalLayout::ORDINARY,
+                                       segment_v2::VariantShredderPhysicalLayout::DOC}) {
+        const bool doc = physical_layout == segment_v2::VariantShredderPhysicalLayout::DOC;
+        auto values = ColumnVariantV2::create();
+        // DOC rejects dotted parts, so only the ordinary layout gets colliding dotted keys.
+        build_ocsf_like_column(ROWS, !doc, values.get());
+        std::vector<uint8_t> outer_nulls(ROWS, 0);
+        for (size_t row = 0; row < ROWS; row += 17) {
+            outer_nulls[row] = 1;
+        }
+        for (const bool check_duplicate_json_path : {false, true}) {
+            for (const size_t max_subcolumns : {size_t {2048}, size_t {16}, size_t {0}}) {
+                SCOPED_TRACE(testing::Message()
+                             << (doc ? "doc" : "ordinary") << " dup=" << check_duplicate_json_path
+                             << " max_subcolumns=" << max_subcolumns);
+                const segment_v2::VariantShredderOptions options {
+                        .physical_layout = physical_layout,
+                        .max_subcolumns_count = max_subcolumns,
+                        .typed_paths_to_sparse = false,
+                        .sparse_bucket_count = 1,
+                        .max_sparse_column_statistics_size = 10000,
+                        .doc_bucket_count = 2,
+                        .doc_materialization_min_rows = 0,
+                        .check_duplicate_json_path = check_duplicate_json_path,
+                };
+                segment_v2::VariantShreddedColumns expected;
+                const Status expected_status =
+                        shred_in_chunks(false, options, *values, outer_nulls, &expected);
+                segment_v2::VariantShreddedColumns actual;
+                const Status actual_status =
+                        shred_in_chunks(true, options, *values, outer_nulls, &actual);
+                ASSERT_EQ(actual_status.to_string(), expected_status.to_string());
+                if (!expected_status.ok()) {
+                    continue;
+                }
+                expect_shredded_columns_equal(actual, expected);
+                if (!doc && max_subcolumns == 2048) {
+                    // More than 2048 distinct paths, so the sparse map is populated.
+                    ASSERT_EQ(actual.binary_buckets.size(), 1);
+                    EXPECT_GT(actual.binary_buckets[0].column->size(), 0U);
+                    EXPECT_FALSE(actual.statistics.sparse_column_non_null_size.empty());
+                }
             }
         }
     }

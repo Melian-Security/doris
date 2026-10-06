@@ -1480,6 +1480,10 @@ DECLARE_mInt32(variant_max_json_key_length);
 DECLARE_mBool(variant_throw_exeception_on_invalid_json);
 // Enable duplicate path check when parsing json into variant subcolumns/jsonb.
 DECLARE_mBool(variant_enable_duplicate_json_path_check);
+// Variant V2 segment writer: descend nested objects without re-decoding their headers and append
+// stable scalar leaves straight into the typed path column. The output is identical either way;
+// false selects the general per-value path, kept for A/B measurement and as a fallback.
+DECLARE_mBool(variant_v2_shredder_fast_path);
 // Controls storage-layer parse target for plain non-doc VARIANT columns:
 // 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
 DECLARE_mInt32(variant_storage_parse_mode);

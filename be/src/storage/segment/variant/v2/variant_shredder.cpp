@@ -18,12 +18,15 @@
 #include "storage/segment/variant/v2/variant_shredder.h"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/assert_cast.h"
 #include "core/column/column_map.h"
@@ -86,6 +89,9 @@ struct VariantShredder::Impl {
         PathInData path;
         std::optional<VariantPathBuilder> builder;
         size_t last_row_marker = 0;
+        // Child path by object key, shared by every metadata dictionary. Keys point into
+        // Impl::child_keys.
+        doris::flat_hash_map<std::string_view, PathIndex> children_by_key;
     };
 
     struct SparsePlan {
@@ -102,7 +108,8 @@ struct VariantShredder::Impl {
         size_t candidate_index = 0;
     };
 
-    explicit Impl(VariantShredderOptions options_) : options(std::move(options_)) {
+    explicit Impl(VariantShredderOptions options_)
+            : options(std::move(options_)), fast_path(config::variant_v2_shredder_fast_path) {
         paths.emplace_back(PathInData());
         if (options.physical_layout == VariantShredderPhysicalLayout::ORDINARY &&
             options.sparse_bucket_count == 0) {
@@ -187,9 +194,21 @@ struct VariantShredder::Impl {
             return found->second;
         }
 
+        const std::string_view key = metadata_cache.metadata.key_at(field).to_string_view();
+        // A memtable block carries one dictionary per load batch, and the per-dictionary cache
+        // starts cold for each of them on every append. The canonical child is a function of the
+        // parent path and the key alone, so resolve it by key before building and hashing the
+        // full child path.
+        if (fast_path) {
+            const auto& children = paths[parent].children_by_key;
+            if (const auto found = children.find(key); found != children.end()) {
+                metadata_cache.child_paths.emplace(cache_key, found->second);
+                return found->second;
+            }
+        }
+
         PathInDataBuilder builder;
-        builder.append(paths[parent].path.get_parts(), false)
-                .append(metadata_cache.metadata.key_at(field).to_string_view(), false);
+        builder.append(paths[parent].path.get_parts(), false).append(key, false);
         PathInData child = builder.build();
         // V2 object traversal keeps arrays as leaves. Canonicalizing into the dotted on-disk
         // namespace also makes {"a.b": 1} and {"a": {"b": 1}} share one path.
@@ -206,6 +225,10 @@ struct VariantShredder::Impl {
             child_index = static_cast<PathIndex>(paths.size());
             path_indices.emplace(child, child_index);
             paths.emplace_back(child);
+        }
+        if (fast_path) {
+            const std::string& owned_key = child_keys.emplace_back(key);
+            paths[parent].children_by_key.emplace(owned_key, child_index);
         }
         metadata_cache.child_paths.emplace(cache_key, child_index);
         return child_index;
@@ -229,6 +252,33 @@ struct VariantShredder::Impl {
             RETURN_IF_ERROR(visit(child, metadata_cache, child_path, row));
         }
         return Status::OK();
+    }
+
+    // Equivalent to visit() on an OBJECT value: the same children in the same order reach the
+    // same append_leaf() calls. Each nested object's header is decoded once, when its parent
+    // sizes it, instead of again by object_view(), and leaves skip visit()'s re-classification.
+    Status visit_object(const VariantRef::ObjectView& object, MetadataPathCache& metadata_cache,
+                        PathIndex path_index, size_t row) {
+        std::optional<VariantRef::ObjectView> child_object;
+        for (uint32_t index = 0; index < object.size(); ++index) {
+            uint32_t field = 0;
+            const VariantRef child = object.value_at(index, &field, &child_object);
+            const PathIndex child_path = resolve_child_path(metadata_cache, path_index, field);
+            RETURN_IF_ERROR(validate_doc_path(child_path));
+            if (child_object.has_value()) {
+                RETURN_IF_ERROR(visit_object(*child_object, metadata_cache, child_path, row));
+            } else if (!child.is_null() || options.check_duplicate_json_path) {
+                RETURN_IF_ERROR(append_leaf(child, child_path, row));
+            }
+        }
+        return Status::OK();
+    }
+
+    Status visit_root_object(VariantRef value, MetadataPathCache& metadata_cache, size_t row) {
+        if (fast_path) {
+            return visit_object(value.object_view(), metadata_cache, 0, row);
+        }
+        return visit(value, metadata_cache, 0, row);
     }
 
     Status complete_builder_rows(size_t completed_rows) {
@@ -323,8 +373,15 @@ struct VariantShredder::Impl {
                     options.physical_layout == VariantShredderPhysicalLayout::DOC
                             ? normalize_doc_publication_path(raw_path)
                             : raw_path;
-            const std::span<const uint32_t> compact_rowids = builder.rowids();
-            DorisVector<uint32_t> rowids(compact_rowids.begin(), compact_rowids.end());
+            // Each builder is published once, after every reader of its row ids (path selection,
+            // statistics, the binary maps) has run, so the ids can move instead of being copied.
+            DorisVector<uint32_t> rowids;
+            if (fast_path) {
+                rowids = builder.take_rowids();
+            } else {
+                const std::span<const uint32_t> compact_rowids = builder.rowids();
+                rowids.assign(compact_rowids.begin(), compact_rowids.end());
+            }
             result->materialized.push_back({.path = publication_path,
                                             .type = builder.type(),
                                             .column = builder.column(),
@@ -644,11 +701,13 @@ struct VariantShredder::Impl {
     }
 
     VariantShredderOptions options;
+    const bool fast_path;
     State state = State::COLLECTING;
     Status failure;
     size_t rows = 0;
     std::unordered_map<PathInData, PathIndex, PathInData::Hash> path_indices = {{PathInData(), 0}};
     DorisVector<PathState> paths;
+    std::deque<std::string> child_keys;
     ColumnString::MutablePtr root_values = ColumnString::create();
     JsonbWriter root_writer;
 #if defined(BE_TEST) && !defined(BE_BENCHMARK)
@@ -714,7 +773,8 @@ Status VariantShredder::append(const ColumnVariantV2::ReadView& view, size_t beg
                 return _impl->fail(std::move(status));
             }
             if (value.basic_type() == VariantBasicType::OBJECT) {
-                status = _impl->visit(value, metadata_caches[metadata_index], 0, _impl->rows);
+                status = _impl->visit_root_object(value, metadata_caches[metadata_index],
+                                                  _impl->rows);
                 if (!status.ok()) {
                     return _impl->fail(std::move(status));
                 }
@@ -755,8 +815,13 @@ size_t VariantShredder::byte_size() const {
         size += sizeof(std::pair<const PathInData, Impl::PathIndex>) + path_allocated_bytes(path);
     }
     size += _impl->paths.capacity() * sizeof(Impl::PathState);
+    for (const std::string& key : _impl->child_keys) {
+        size += sizeof(std::string) + key.capacity();
+    }
     for (const Impl::PathState& path : _impl->paths) {
         size += path_allocated_bytes(path.path);
+        size += path.children_by_key.capacity() *
+                (sizeof(std::pair<std::string_view, Impl::PathIndex>) + 1);
         if (path.builder.has_value()) {
             size += path.builder->byte_size();
         }
