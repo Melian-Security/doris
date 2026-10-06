@@ -201,6 +201,10 @@ public:
     /// TabletManager sweep these rowsets using tracker by timing.
     void add_stale_path_version(const std::vector<RowsetMetaSharedPtr>& stale_rs_metas);
 
+    /// Remove `versions` from the stale version paths before they expire, and remove one version
+    /// graph edge for each of them. A path left without versions is dropped.
+    void remove_stale_versions(const std::vector<Version>& versions);
+
     /// Given a spec_version, this method can find a version path which is the shortest path
     /// in the graph. The version paths are added to version_path as return info.
     /// If this version not in main version, version_path can be included expired rowset.

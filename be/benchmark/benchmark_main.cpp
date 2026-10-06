@@ -24,6 +24,7 @@
 
 #include "benchmark_arrow_validation.hpp"
 #include "benchmark_bit_pack.hpp"
+#include "benchmark_cloud_hole_rowset.hpp"
 #include "benchmark_column_array_view.hpp"
 #include "benchmark_column_array_view_distance.hpp"
 #include "benchmark_fastunion.hpp"

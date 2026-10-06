@@ -173,6 +173,14 @@ public:
                                         RowsetMetaSharedPtr prev_rowset_meta,
                                         RowsetSharedPtr* rowset);
 
+    // Create an empty rowset that fills every version in `versions`. Without `rowset_id`, which
+    // a hole covering several versions requires, the rowset id is derived from
+    // (tablet_id, first version).
+    Status create_empty_rowset_for_hole(CloudTablet* tablet, const Version& versions,
+                                        RowsetMetaSharedPtr prev_rowset_meta,
+                                        RowsetSharedPtr* rowset,
+                                        const RowsetId* rowset_id = nullptr);
+
     Status list_snapshot(std::vector<SnapshotInfoPB>& snapshots);
     Status get_snapshot_properties(SnapshotSwitchStatus& switch_status,
                                    int64_t& max_reserved_snapshots,
