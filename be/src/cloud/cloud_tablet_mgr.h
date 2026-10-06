@@ -106,10 +106,15 @@ public:
     // **ATTN: JUST FOR UT**
     void put_tablet_for_UT(std::shared_ptr<CloudTablet> tablet);
 
+    // **ATTN: JUST FOR UT AND BENCHMARKS**
+    // Caches `tablet` as a get_tablet() cache miss would, without the meta service RPCs.
+    void put_tablet_in_cache_for_UT(std::shared_ptr<CloudTablet> tablet);
+
 private:
     CloudStorageEngine& _engine;
 
     class TabletMap;
+    class CacheValue;
     std::unique_ptr<TabletMap> _tablet_map;
     std::unique_ptr<LRUCachePolicy> _cache;
 };

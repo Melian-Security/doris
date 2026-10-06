@@ -137,6 +137,12 @@ DECLARE_mInt64(get_delete_bitmap_bytes_threshold);
 // Skip writing empty rowset metadata to meta service
 DECLARE_mBool(skip_writing_empty_rowset_metadata);
 
+// When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
+// no rows in a load without building a rowset writer for it, as long as the tablet is cached on
+// this BE. Only the per-tablet BE bookkeeping of the load (empty rowset markers, approximate
+// stats) is kept.
+DECLARE_mBool(skip_rowset_writer_for_empty_tablet);
+
 // enable large txn lazy commit in meta-service `commit_txn`
 DECLARE_mBool(enable_cloud_txn_lazy_commit);
 
