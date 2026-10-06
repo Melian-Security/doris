@@ -291,7 +291,7 @@ TEST_F(CloudDeltaWriterTest, SameBookkeepingAsRowsetBuilder) {
         EXPECT_EQ(t->fetch_add_approximate_num_rowsets(0), 1) << t->tablet_id();
         EXPECT_EQ(t->fetch_add_approximate_cumu_num_rowsets(0), 1) << t->tablet_id();
         EXPECT_EQ(t->fetch_add_approximate_num_segments(0), 0) << t->tablet_id();
-        EXPECT_EQ(t->fetch_add_approximate_cumu_num_deltas(0), 0) << t->tablet_id();
+        EXPECT_EQ(t->fetch_add_approximate_cumu_num_deltas(0), 1) << t->tablet_id();
         EXPECT_EQ(t->fetch_add_approximate_data_size(0), 0) << t->tablet_id();
         EXPECT_EQ(t->write_count.load(), 1) << t->tablet_id();
         EXPECT_GT(t->last_load_time_ms, 0) << t->tablet_id();

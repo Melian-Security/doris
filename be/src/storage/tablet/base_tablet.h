@@ -19,6 +19,7 @@
 
 #include <gen_cpp/olap_common.pb.h>
 
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -297,10 +298,17 @@ public:
 
     virtual void clear_cache() = 0;
 
-    // Find the first consecutive empty rowsets. output->size() >= limit
-    void calc_consecutive_empty_rowsets(std::vector<RowsetSharedPtr>* empty_rowsets,
-                                        const std::vector<RowsetSharedPtr>& candidate_rowsets,
-                                        int64_t limit);
+    // Find the first run of consecutive empty rowsets (no segments, no delete predicate) in
+    // `candidate_rowsets`, which must be sorted by version, that holds at least `min_count`
+    // rowsets and is followed by another candidate. `min_count` is a lower bound only: the whole
+    // run is returned, so one compaction absorbs a run of any length. A run longer than
+    // `max_count` is returned as its first `max_count` rowsets, which keeps a single compaction
+    // job inside the meta-service transaction limits; the rest of the run is picked by the next
+    // compaction, together with the empty rowset that this one outputs.
+    static void calc_consecutive_empty_rowsets(
+            std::vector<RowsetSharedPtr>* empty_rowsets,
+            const std::vector<RowsetSharedPtr>& candidate_rowsets, int64_t min_count,
+            int64_t max_count = std::numeric_limits<int64_t>::max());
 
     void traverse_rowsets(std::function<void(const RowsetSharedPtr&)> visitor,
                           bool include_stale = false) {

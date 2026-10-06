@@ -22,9 +22,13 @@
 #include <gtest/gtest-test-part.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
+#include <random>
 #include <ranges>
+#include <set>
 
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_storage_engine.h"
@@ -1701,6 +1705,173 @@ TEST_F(CloudTabletDeleteRowsetsForSchemaChangeTest, TestNoStalePathConflictWithC
     ASSERT_TRUE(_tablet->rowset_map().count(Version(0, 1)));
     ASSERT_TRUE(_tablet->rowset_map().count(Version(2, 6)));
     ASSERT_FALSE(_tablet->has_stale_rowsets());
+}
+
+
+// Rowsets for the visible version index tests: version `v` gets `v % 3 + 1` overlapping
+// segments so cumulative delta counts differ between rowsets.
+class CloudTabletVisibleVersionIndexTest : public CloudTabletApplyVisiblePendingTest {
+protected:
+    RowsetSharedPtr make_rowset(Version version) {
+        auto rs = create_rowset_with_schema(version, static_cast<int>(version.first % 3 + 1));
+        rs->rowset_meta()->set_segments_overlap(version.first % 2 == 0 ? OVERLAPPING
+                                                                       : NONOVERLAPPING);
+        return rs;
+    }
+
+    std::set<std::pair<int64_t, int64_t>> meta_versions() {
+        std::set<std::pair<int64_t, int64_t>> result;
+        for (const auto& [v, _] : _tablet->tablet_meta()->all_rs_metas()) {
+            result.emplace(v.first, v.second);
+        }
+        return result;
+    }
+
+    std::set<std::pair<int64_t, int64_t>> index_versions() {
+        std::set<std::pair<int64_t, int64_t>> result;
+        _tablet->_visible_version_index.for_each_starting_before(
+                std::numeric_limits<int64_t>::max(),
+                [&](const Version& v) { result.emplace(v.first, v.second); });
+        return result;
+    }
+
+    // What `reset_approximate_stats` computed before it became incremental: a full walk of the
+    // rowset map.
+    std::pair<int64_t, int64_t> full_walk_cumu_stats(int64_t cp) {
+        int64_t deltas = 0;
+        int64_t rowsets = 0;
+        for (const auto& [v, r] : _tablet->rowset_map()) {
+            if (v.second < cp) {
+                continue;
+            }
+            deltas += r->is_segments_overlapping() ? r->num_segments() : 1;
+            ++rowsets;
+        }
+        return {deltas, rowsets};
+    }
+
+    void check_consistent(int64_t cp) {
+        ASSERT_EQ(index_versions(), meta_versions());
+        ASSERT_EQ(_tablet->_visible_rowset_deltas.size(), _tablet->rowset_map().size());
+        // Random points move backwards too, which set_cumulative_layer_point refuses.
+        _tablet->_cumulative_point.store(cp);
+        {
+            std::unique_lock wlock(_tablet->get_header_lock());
+            _tablet->reset_approximate_stats(0, 0, 0, 0);
+        }
+        auto [deltas, rowsets] = full_walk_cumu_stats(cp);
+        ASSERT_EQ(_tablet->_approximate_cumu_num_deltas.load(), deltas) << "cp=" << cp;
+        ASSERT_EQ(_tablet->_approximate_cumu_num_rowsets.load(), rowsets) << "cp=" << cp;
+    }
+};
+
+// Loads, local compactions (delete + add), compaction outputs synced from the meta service
+// (add with version overlap) and schema change deletes must all keep the index equal to the
+// tablet meta and the incremental cumulative stats equal to a full walk.
+TEST_F(CloudTabletVisibleVersionIndexTest, IndexAndStatsFollowEveryRowsetMutation) {
+    std::mt19937_64 rng(7);
+    add_initial_rowsets({make_rowset({0, 1})});
+    int64_t next_version = 2;
+    for (int op = 0; op < 600; ++op) {
+        switch (rng() % 5) {
+        case 0:
+        case 1: {
+            add_initial_rowsets({make_rowset({next_version, next_version})});
+            ++next_version;
+            break;
+        }
+        case 2: {
+            // Local cumulative compaction over a contiguous run of visible rowsets.
+            int64_t first = 2 + static_cast<int64_t>(rng() % next_version);
+            std::vector<RowsetSharedPtr> inputs;
+            for (const auto& v : _tablet->_visible_version_index.versions_contained_in(
+                         {first, first + static_cast<int64_t>(rng() % 10)})) {
+                inputs.push_back(_tablet->rowset_map().at(v));
+            }
+            if (inputs.size() < 2) {
+                break;
+            }
+            std::sort(inputs.begin(), inputs.end(), Rowset::comparator);
+            auto output = make_rowset(
+                    {inputs.front()->start_version(), inputs.back()->end_version()});
+            std::unique_lock wlock(_tablet->get_header_lock());
+            _tablet->delete_rowsets(inputs, wlock);
+            _tablet->add_rowsets({output}, false, wlock, false);
+            break;
+        }
+        case 3: {
+            // A compaction output from another BE arrives through sync_rowsets.
+            int64_t first = 2 + static_cast<int64_t>(rng() % next_version);
+            auto merged = _tablet->_visible_version_index.versions_contained_in(
+                    {first, first + static_cast<int64_t>(rng() % 10)});
+            if (merged.empty()) {
+                break;
+            }
+            auto output = make_rowset({merged.front().first, merged.back().second});
+            std::unique_lock wlock(_tablet->get_header_lock());
+            _tablet->add_rowsets({output}, true, wlock, false);
+            break;
+        }
+        case 4: {
+            // Schema change drops a random visible rowset (not [0-1]).
+            if (_tablet->rowset_map().size() <= 1) {
+                break;
+            }
+            auto it = _tablet->rowset_map().begin();
+            std::advance(it, static_cast<int64_t>(rng() % _tablet->rowset_map().size()));
+            if (it->first.first == 0) {
+                break;
+            }
+            std::unique_lock wlock(_tablet->get_header_lock());
+            _tablet->delete_rowsets_for_schema_change({it->second}, wlock, false);
+            break;
+        }
+        }
+        ASSERT_NO_FATAL_FAILURE(
+                check_consistent(static_cast<int64_t>(rng() % (next_version + 2))));
+    }
+}
+
+// The empty-rowset visible path takes its template from the rowset with the greatest start
+// version, without scanning every rowset meta.
+TEST_F(CloudTabletVisibleVersionIndexTest, EmptyPendingRowsetUsesLatestRowsetAsTemplate) {
+    std::vector<RowsetSharedPtr> rowsets {make_rowset({0, 1})};
+    for (int64_t v = 2; v <= 300; ++v) {
+        rowsets.push_back(make_rowset({v, v}));
+    }
+    rowsets.push_back(make_rowset({301, 310}));
+    add_initial_rowsets(rowsets);
+
+    {
+        std::unique_lock wlock(_tablet->get_header_lock());
+        auto template_meta = _tablet->rowset_meta_with_max_start_version_unlocked();
+        ASSERT_NE(template_meta, nullptr);
+        EXPECT_EQ(template_meta->version(), Version(301, 310));
+    }
+
+    add_pending_rowset(311, nullptr, INT64_MAX, true);
+    add_pending_rowset(312, nullptr, INT64_MAX, true);
+    _tablet->apply_visible_pending_rowsets();
+
+    EXPECT_EQ(_tablet->max_version_unlocked(), 312);
+    EXPECT_TRUE(_tablet->rowset_map().contains(Version(311, 311)));
+    EXPECT_TRUE(_tablet->rowset_map().contains(Version(312, 312)));
+    EXPECT_TRUE(_tablet->rowset_map().at(Version(311, 311))->is_hole_rowset());
+    EXPECT_EQ(pending_rs_count(), 0);
+    ASSERT_NO_FATAL_FAILURE(check_consistent(2));
+}
+
+// Rowset metas present in the tablet meta at construction (but not in the rowset map) are
+// part of the index, as they are part of what fill_version_holes sees.
+TEST_F(CloudTabletVisibleVersionIndexTest, IndexIncludesRowsetMetasFromConstruction) {
+    auto meta = std::make_shared<TabletMeta>(*_tablet_meta);
+    auto rs = create_rowset_with_schema(Version(0, 1));
+    ASSERT_TRUE(meta->add_rs_meta(rs->rowset_meta()).ok());
+    auto tablet = std::make_shared<CloudTablet>(_engine, meta);
+    EXPECT_TRUE(tablet->rowset_map().empty());
+    std::unique_lock wlock(tablet->get_header_lock());
+    EXPECT_EQ(tablet->visible_version_index_unlocked().size(), 1);
+    EXPECT_EQ(tablet->rowset_meta_with_max_start_version_unlocked(), rs->rowset_meta());
 }
 
 } // namespace doris

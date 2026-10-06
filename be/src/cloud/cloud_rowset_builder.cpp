@@ -17,6 +17,8 @@
 
 #include "cloud/cloud_rowset_builder.h"
 
+#include <algorithm>
+
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_tablet.h"
@@ -127,7 +129,9 @@ void CloudRowsetBuilder::add_rowset_to_tablet_stats(CloudTablet* tablet, const R
         tablet->fetch_add_approximate_num_segments(rowset->num_segments());
         tablet->fetch_add_approximate_num_rows(rowset->num_rows());
         tablet->fetch_add_approximate_data_size(rowset->total_disk_size());
-        tablet->fetch_add_approximate_cumu_num_deltas(rowset->num_segments());
+        tablet->fetch_add_approximate_cumu_num_deltas(std::max<int64_t>(rowset->num_segments(), 1));
+    } else {
+        tablet->fetch_add_approximate_cumu_num_deltas(1);
     }
     tablet->write_count.fetch_add(1, std::memory_order_relaxed);
 }

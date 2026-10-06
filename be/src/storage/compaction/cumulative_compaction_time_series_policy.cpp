@@ -161,9 +161,10 @@ uint32_t TimeSeriesCumulativeCompactionPolicy::calc_cumulative_compaction_score(
     std::vector<RowsetSharedPtr> input_rowsets;
     std::vector<RowsetSharedPtr> candidate_rowsets =
             tablet->pick_candidate_rowsets_to_cumulative_compaction_unlocked();
-    tablet->calc_consecutive_empty_rowsets(
+    BaseTablet::calc_consecutive_empty_rowsets(
             &input_rowsets, candidate_rowsets,
-            tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold());
+            tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold(),
+            config::compaction_max_rowset_count);
     if (!input_rowsets.empty()) {
         return score;
     }
@@ -273,6 +274,27 @@ int32_t TimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         return 0;
     }
     input_rowsets->clear();
+
+    if (config::time_series_compaction_prefer_empty_rowsets) {
+        // Same pick as condition 6 below, taken ahead of the data conditions. Only rowsets
+        // before the first delete version are considered, so the delete-version handling
+        // below sees the same versions it would without this branch. The run ends before
+        // the newest candidate and its merged output is empty, so the cumulative point does
+        // not move.
+        auto first_delete = std::find_if(candidate_rowsets.begin(), candidate_rowsets.end(),
+                                         [](const RowsetSharedPtr& rs) {
+                                             return rs->rowset_meta()->has_delete_predicate();
+                                         });
+        std::vector<RowsetSharedPtr> before_delete(candidate_rowsets.begin(), first_delete);
+        BaseTablet::calc_consecutive_empty_rowsets(
+                input_rowsets, before_delete,
+                tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold(),
+                config::compaction_max_rowset_count);
+        if (!input_rowsets->empty()) {
+            *compaction_score = input_rowsets->size();
+            return 0;
+        }
+    }
 
     int64_t compaction_level = tablet->tablet_meta()->time_series_compaction_level_threshold();
     int64_t compaction_goal_size_mbytes =
@@ -416,10 +438,14 @@ int32_t TimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
     }
 
     input_rowsets->clear();
-    // Condition 6: If their are many empty rowsets, maybe should be compacted
-    tablet->calc_consecutive_empty_rowsets(
+    // Condition 6: If their are many empty rowsets, maybe should be compacted.
+    // The threshold is the minimum run length; the run itself is taken whole, bounded by the
+    // same rowset count that bounds conditions 1 and 2 so the compaction job stays a bounded
+    // meta-service transaction.
+    BaseTablet::calc_consecutive_empty_rowsets(
             input_rowsets, candidate_rowsets,
-            tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold());
+            tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold(),
+            config::compaction_max_rowset_count);
     if (!input_rowsets->empty()) {
         VLOG_NOTICE << "tablet is " << tablet->tablet_id()
                     << ", there are too many consecutive empty rowsets, size is "
