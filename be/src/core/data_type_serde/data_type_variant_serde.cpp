@@ -29,6 +29,7 @@
 #include "core/assert_cast.h"
 #include "core/column/column.h"
 #include "core/column/column_variant.h"
+#include "core/data_type_serde/arrow_binary_values.h"
 #include "core/data_type_serde/data_type_serde.h"
 #include "core/field.h"
 #include "core/string_ref.h"
@@ -149,6 +150,26 @@ Status DataTypeVariantSerDe::deserialize_column_from_json_vector(
         IColumn& column, std::vector<Slice>& slices, uint64_t* num_deserialized,
         const FormatOptions& options) const {
     DESERIALIZE_COLUMN_FROM_JSON_VECTOR()
+    return Status::OK();
+}
+
+// Arrow carries Variant values the way write_column_to_arrow emits them: one JSON document per
+// row in a string or binary array. Each row is parsed exactly as a JSON load parses a cell. SQL
+// NULL is the nullable wrapper's null map; the nested row under it is the column default.
+Status DataTypeVariantSerDe::read_column_from_arrow(IColumn& column,
+                                                    const arrow::Array* arrow_array, int64_t start,
+                                                    int64_t end, const cctz::time_zone&) const {
+    if (arrow_array == nullptr) {
+        return Status::InvalidArgument("Variant Arrow input is null");
+    }
+    ParseConfig parse_config;
+    parse_config.check_duplicate_json_path = config::variant_enable_duplicate_json_path_check;
+    RETURN_IF_CATCH_EXCEPTION(RETURN_IF_ERROR(for_each_arrow_binary_value(
+            *arrow_array, start, end,
+            [&](StringRef json) {
+                variant_util::parse_json_to_variant(column, json, nullptr, parse_config);
+            },
+            [&] { column.insert_default(); })));
     return Status::OK();
 }
 
