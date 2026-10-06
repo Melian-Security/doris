@@ -47,9 +47,13 @@
 #include "parquet/benchmark_parquet_reader.hpp"
 #include "parquet/benchmark_parquet_selection.hpp"
 #include "runtime/exec_env.h"
+#include "runtime/memory/cache_manager.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/memory/thread_mem_tracker_mgr.h"
 #include "runtime/thread_context.h"
+#include "storage/tablet/tablet_column_object_pool.h"
+#include "storage/tablet/tablet_meta.h"
+#include "storage/tablet/tablet_schema_cache.h"
 
 namespace doris { // change if need
 
@@ -117,6 +121,18 @@ int main(int argc, char** argv) {
     auto bench_tracker = doris::MemTrackerLimiter::create_shared(
             doris::MemTrackerLimiter::Type::GLOBAL, "BE-BENCH");
     doris::thread_context()->thread_mem_tracker_mgr->attach_limiter_tracker(bench_tracker);
+    // Storage-engine benchmarks build tablets and rowsets, whose LRU caches register with the
+    // cache manager and whose schemas are interned in the tablet schema caches.
+    doris::ExecEnv::GetInstance()->set_cache_manager(doris::CacheManager::create_global_instance());
+    doris::ExecEnv::GetInstance()->set_tablet_schema_cache(
+            doris::TabletSchemaCache::create_global_schema_cache(
+                    doris::config::tablet_schema_cache_capacity));
+    doris::ExecEnv::GetInstance()->set_delete_bitmap_agg_cache(
+            doris::DeleteBitmapAggCache::create_instance(
+                    doris::config::delete_bitmap_agg_cache_capacity));
+    doris::ExecEnv::GetInstance()->set_tablet_column_object_pool(
+            doris::TabletColumnObjectPool::create_global_column_cache(
+                    doris::config::tablet_schema_cache_capacity));
     doris::ExecEnv::set_tracking_memory(false);
 
     ::benchmark::Initialize(&argc, argv);
