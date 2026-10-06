@@ -56,7 +56,8 @@ public:
 
     std::shared_ptr<CloudTablet> make_tablet(bool merge_on_write) {
         auto tablet_meta = std::make_shared<TabletMeta>(
-                1, 2, 15673, 15674, 4, 5, TTabletSchema(), 6, {{7, 8}}, UniqueId(9, 10),
+                1, 2, 15673, 15674, 4, 5, TTabletSchema(), 6,
+                std::unordered_map<uint32_t, uint32_t> {{7, 8}}, UniqueId(9, 10),
                 TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F, 0, merge_on_write);
         tablet_meta->set_tablet_state(TABLET_RUNNING);
         return std::make_shared<CloudTablet>(_engine, tablet_meta);
@@ -118,7 +119,7 @@ public:
     static void expect_all_versions_capturable(const CloudTablet& tablet) {
         // The visible version index and the delta counts follow the live rowsets only; stale
         // hole rowsets stay out of them.
-        const auto& rs_metas = tablet.tablet_meta()->all_rs_metas();
+        const auto& rs_metas = const_cast<CloudTablet&>(tablet).tablet_meta()->all_rs_metas();
         ASSERT_EQ(tablet._visible_version_index.size(), rs_metas.size());
         for (const auto& [v, _] : rs_metas) {
             ASSERT_TRUE(tablet._visible_version_index.contains(v)) << v.to_string();
@@ -128,7 +129,20 @@ public:
             ASSERT_FALSE(tablet._visible_version_index.contains(v) && !rs_metas.contains(v))
                     << v.to_string();
         }
+        // A version strictly inside a data rowset (a compaction output) is not readable on its
+        // own; only hole rowsets can end a read path in the middle of their range.
+        std::set<int64_t> inside_data_rowsets;
+        for (const auto& [version, rs] : tablet.rowset_map()) {
+            if (!rs->is_hole_rowset()) {
+                for (int64_t v = version.first; v < version.second; ++v) {
+                    inside_data_rowsets.insert(v);
+                }
+            }
+        }
         for (int64_t v = 1; v <= tablet.max_version_unlocked(); ++v) {
+            if (inside_data_rowsets.contains(v)) {
+                continue;
+            }
             auto path = tablet.capture_consistent_versions_unlocked(Version(0, v), {});
             ASSERT_TRUE(path.has_value()) << "version " << v << ": " << path.error();
             int64_t next = 0;

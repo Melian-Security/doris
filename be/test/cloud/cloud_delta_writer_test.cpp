@@ -94,6 +94,12 @@ protected:
 
     std::shared_ptr<CloudTablet> cache_tablet(int64_t tablet_id, bool mow = false) {
         auto tablet = make_tablet(tablet_id, mow);
+        // The approximate stats start unknown (-1) until a meta-service sync resets them; start
+        // from an empty synced tablet so the counters read as the deltas of the load.
+        {
+            std::unique_lock lock(tablet->get_header_lock());
+            tablet->reset_approximate_stats(0, 0, 0, 0);
+        }
         _engine->tablet_mgr().put_tablet_in_cache_for_UT(tablet);
         return tablet;
     }

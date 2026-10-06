@@ -138,7 +138,8 @@ TEST(CloudRowsetVersionIndexTest, CompactionReplacementKeepsContinuity) {
     expect_same_holes(index.holes(20), {{5, 12, {13, 13}}});
     index.insert({5, 12});
     EXPECT_TRUE(index.holes(20).empty());
-    EXPECT_EQ(index.size(), 2 + 3 + 1 + 8);
+    // [0-1], [2-2]..[4-4], [5-12], [13-13]..[20-20]
+    EXPECT_EQ(index.size(), 1 + 3 + 1 + 8);
 }
 
 TEST(CloudRowsetVersionIndexTest, DuplicateInsertAndMissingEraseAreNoops) {
