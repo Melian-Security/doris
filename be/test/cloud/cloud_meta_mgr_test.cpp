@@ -822,6 +822,126 @@ TEST_F(CloudMetaMgrTest, test_fill_version_holes_mixed_holes) {
     }
 }
 
+namespace {
+
+RowsetSharedPtr make_versioned_rowset(CloudStorageEngine& engine, const CloudTablet& tablet,
+                                      Version version) {
+    auto rs_meta = std::make_shared<RowsetMeta>();
+    rs_meta->set_tablet_id(tablet.tablet_id());
+    rs_meta->set_index_id(2);
+    rs_meta->set_partition_id(15673);
+    rs_meta->set_tablet_uid(UniqueId(9, 10));
+    rs_meta->set_version(version);
+    rs_meta->set_rowset_type(BETA_ROWSET);
+    rs_meta->set_rowset_id(engine.next_rowset_id());
+    rs_meta->set_num_rows(100);
+    rs_meta->set_empty(false);
+    rs_meta->set_tablet_schema(tablet.tablet_schema());
+    RowsetSharedPtr rowset;
+    EXPECT_TRUE(RowsetFactory::create_rowset(tablet.tablet_schema(), "", rs_meta, &rowset).ok());
+    return rowset;
+}
+
+std::set<std::pair<int64_t, int64_t>> rs_meta_versions(CloudTablet& tablet) {
+    std::set<std::pair<int64_t, int64_t>> versions;
+    for (const auto& [v, _] : tablet.tablet_meta()->all_rs_metas()) {
+        versions.emplace(v.first, v.second);
+    }
+    return versions;
+}
+
+} // namespace
+
+// Holes next to a merged compaction output are found from the ordered version index the same
+// way the sorted walk found them.
+TEST_F(CloudMetaMgrTest, test_fill_version_holes_after_compaction_merge) {
+    CloudStorageEngine engine(EngineOptions {});
+    CloudMetaMgr meta_mgr;
+    TabletMetaSharedPtr tablet_meta(
+            new TabletMeta(1007, 2, 15673, 15674, 4, 5, TTabletSchema(), 6, {{7, 8}},
+                           UniqueId(9, 10), TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F));
+    auto tablet = std::make_shared<CloudTablet>(engine, std::make_shared<TabletMeta>(*tablet_meta));
+    {
+        std::vector<RowsetSharedPtr> rowsets;
+        for (int64_t v = 0; v <= 7; ++v) {
+            rowsets.push_back(make_versioned_rowset(engine, *tablet, {v, v}));
+        }
+        rowsets.push_back(make_versioned_rowset(engine, *tablet, {9, 9}));
+        std::unique_lock lock(tablet->get_header_lock());
+        tablet->add_rowsets(rowsets, false, lock, false);
+        // A cumulative compaction merges [2-6].
+        std::vector<RowsetSharedPtr> inputs;
+        for (int64_t v = 2; v <= 6; ++v) {
+            inputs.push_back(tablet->get_rowset_by_version({v, v}));
+        }
+        tablet->delete_rowsets(inputs, lock);
+        tablet->add_rowsets({make_versioned_rowset(engine, *tablet, {2, 6})}, false, lock, false);
+    }
+
+    std::unique_lock wlock(tablet->get_header_lock());
+    ASSERT_TRUE(meta_mgr.fill_version_holes(tablet.get(), 11, wlock).ok());
+    std::set<std::pair<int64_t, int64_t>> expected = {{0, 0}, {1, 1}, {2, 6},  {7, 7},
+                                                      {8, 8}, {9, 9}, {10, 10}, {11, 11}};
+    EXPECT_EQ(rs_meta_versions(*tablet), expected);
+    for (int64_t v : {8, 10, 11}) {
+        auto rs = tablet->get_rowset_by_version({v, v});
+        ASSERT_NE(rs, nullptr) << v;
+        EXPECT_TRUE(rs->is_hole_rowset()) << v;
+    }
+    EXPECT_FALSE(tablet->get_rowset_by_version({2, 6})->is_hole_rowset());
+
+    // Nothing left to fill: the second call is a no-op.
+    ASSERT_TRUE(meta_mgr.fill_version_holes(tablet.get(), 11, wlock).ok());
+    EXPECT_EQ(rs_meta_versions(*tablet), expected);
+}
+
+// A schema change tablet keeps its holes at or below alter_version; the ones above are filled.
+TEST_F(CloudMetaMgrTest, test_fill_version_holes_schema_change_tablet_above_alter_version) {
+    CloudStorageEngine engine(EngineOptions {});
+    CloudMetaMgr meta_mgr;
+    TabletMetaSharedPtr tablet_meta(
+            new TabletMeta(1008, 2, 15673, 15674, 4, 5, TTabletSchema(), 6, {{7, 8}},
+                           UniqueId(9, 10), TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F));
+    auto tablet = std::make_shared<CloudTablet>(engine, std::make_shared<TabletMeta>(*tablet_meta));
+    ASSERT_TRUE(tablet->set_tablet_state(TABLET_NOTREADY).ok());
+    tablet->set_alter_version(5);
+    {
+        std::unique_lock lock(tablet->get_header_lock());
+        tablet->add_rowsets({make_versioned_rowset(engine, *tablet, {0, 1}),
+                             make_versioned_rowset(engine, *tablet, {8, 8})},
+                            false, lock, false);
+    }
+
+    std::unique_lock wlock(tablet->get_header_lock());
+    ASSERT_TRUE(meta_mgr.fill_version_holes(tablet.get(), 9, wlock).ok());
+    std::set<std::pair<int64_t, int64_t>> expected = {{0, 1}, {6, 6}, {7, 7}, {8, 8}, {9, 9}};
+    EXPECT_EQ(rs_meta_versions(*tablet), expected);
+    // The hole [2-5] stays, so the index still reports it on the next sync.
+    EXPECT_EQ(tablet->visible_version_index_unlocked().num_inner_holes(), 1);
+}
+
+// Rowset metas the tablet was constructed with are not in the rowset map; they still anchor the
+// hole rowsets created after them.
+TEST_F(CloudMetaMgrTest, test_fill_version_holes_with_rowset_metas_from_construction) {
+    CloudStorageEngine engine(EngineOptions {});
+    CloudMetaMgr meta_mgr;
+    TabletMetaSharedPtr tablet_meta(
+            new TabletMeta(1009, 2, 15673, 15674, 4, 5, TTabletSchema(), 6, {{7, 8}},
+                           UniqueId(9, 10), TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F));
+    auto template_tablet = std::make_shared<CloudTablet>(engine, tablet_meta);
+    auto meta = std::make_shared<TabletMeta>(*tablet_meta);
+    ASSERT_TRUE(
+            meta->add_rs_meta(make_versioned_rowset(engine, *template_tablet, {0, 1})->rowset_meta())
+                    .ok());
+    auto tablet = std::make_shared<CloudTablet>(engine, meta);
+    ASSERT_TRUE(tablet->rowset_map().empty());
+
+    std::unique_lock wlock(tablet->get_header_lock());
+    ASSERT_TRUE(meta_mgr.fill_version_holes(tablet.get(), 3, wlock).ok());
+    std::set<std::pair<int64_t, int64_t>> expected = {{0, 1}, {2, 2}, {3, 3}};
+    EXPECT_EQ(rs_meta_versions(*tablet), expected);
+}
+
 // Helper class to access private methods for testing
 class CloudMetaMgrTestHelper {
 public:

@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "cloud/cloud_rowset_version_index.h"
 #include "storage/partial_update_info.h"
 #include "storage/rowset/rowset.h"
 #include "storage/tablet/base_tablet.h"
@@ -359,6 +360,15 @@ public:
 
     const auto& rowset_map() const { return _rs_version_map; }
 
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    // Ordered view of the versions in `_tablet_meta->all_rs_metas()`, used to find version holes
+    // and the latest rowset without scanning every rowset.
+    const CloudRowsetVersionIndex& visible_version_index_unlocked();
+
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    // Meta of the visible rowset with the greatest start version, or nullptr if there is none.
+    RowsetMetaSharedPtr rowset_meta_with_max_start_version_unlocked();
+
     int64_t last_sync_time_s = 0;
     int64_t last_load_time_ms = 0;
     int64_t last_base_compaction_success_time_ms = 0;
@@ -486,6 +496,16 @@ private:
     void _split_hole_rowsets_overlapped_by(const std::vector<RowsetSharedPtr>& to_add,
                                            std::unique_lock<BthreadSharedMutex>& meta_lock);
 
+    // Removes a live rowset from the rowset map, the visible version index, the delta counts,
+    // the version graph and the tablet meta without moving it to the stale path.
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    void _drop_live_rowset(const Version& version);
+
+    // MUST hold EXCLUSIVE `_meta_lock`. Keep `_visible_rowset_deltas` in step with
+    // `_rs_version_map`; call right after the map gains, replaces or loses `version`.
+    void _track_visible_rowset_delta(const RowsetSharedPtr& rs);
+    void _untrack_visible_rowset_delta(const Version& version);
+
     CloudStorageEngine& _engine;
 
     // this mutex MUST ONLY be used when sync meta
@@ -530,6 +550,14 @@ private:
     int64_t _max_version = -1;
     // Version of the last hole rowset `add_hole_rowsets` put at the tail; validated on use.
     Version _tail_hole_version {-1, -1};
+    // Mirrors the version keys of `_tablet_meta->all_rs_metas()`. Every mutation of those rowset
+    // metas in this class updates it under the exclusive `_meta_lock`.
+    CloudRowsetVersionIndex _visible_version_index;
+    // Cumulative delta count (see `reset_approximate_stats`) of every rowset in `_rs_version_map`,
+    // captured when the rowset enters the map, and their sum. They let
+    // `reset_approximate_stats` count only the rowsets below the cumulative point.
+    std::unordered_map<Version, int64_t, HashOfVersion> _visible_rowset_deltas;
+    int64_t _visible_rowset_deltas_sum = 0;
     int64_t _base_size = 0;
     int64_t _alter_version = -1;
 

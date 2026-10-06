@@ -2442,23 +2442,15 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
         return Status::OK();
     }
 
-    Versions existing_versions;
-    for (const auto& [_, rs] : tablet->tablet_meta()->all_rs_metas()) {
-        existing_versions.emplace_back(rs->version());
-    }
+    // The index keeps the visible versions ordered and their holes current, so this runs in
+    // O(log N + filled versions) under the exclusive meta lock instead of sorting every rowset
+    // version of the tablet on each sync.
+    const auto& version_index = tablet->visible_version_index_unlocked();
 
     // If there are no existing versions, it may be a new tablet for restore, so skip filling holes.
-    if (existing_versions.empty()) {
+    if (version_index.empty()) {
         return Status::OK();
     }
-
-    std::vector<RowsetSharedPtr> hole_rowsets;
-    // sort the existing versions in ascending order
-    std::sort(existing_versions.begin(), existing_versions.end(),
-              [](const Version& a, const Version& b) {
-                  // simple because 2 versions are certainly not overlapping
-                  return a.first < b.first;
-              });
 
     // During schema change, get_tablet operations on new tablets trigger sync_tablet_rowsets which calls
     // fill_version_holes. For schema change tablets (TABLET_NOTREADY state), we selectively skip hole
@@ -2474,69 +2466,58 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
         return Status::OK();
     }
 
-    // A non-MoW RUNNING tablet fills each run of missing versions with one hole rowset covering
-    // the run (see CloudTablet::add_hole_rowsets); other tablets keep one hole rowset per version.
-    const bool use_version_range = tablet->can_use_hole_rowset_version_range();
-    std::vector<std::pair<Version, RowsetMetaSharedPtr>> hole_ranges;
-    int64_t hole_version_count = 0;
-    auto fill_hole = [&](int64_t start, int64_t end, const RowsetMetaSharedPtr& template_meta) {
-        // Skip hole filling for versions <= alter_version during schema change
-        if (is_schema_change_tablet) {
-            start = std::max(start, tablet->alter_version() + 1);
-        }
-        if (start > end) {
-            return Status::OK();
-        }
-        hole_version_count += end - start + 1;
-        if (use_version_range) {
-            hole_ranges.emplace_back(Version(start, end), template_meta);
-            return Status::OK();
-        }
-        for (int64_t ver = start; ver <= end; ++ver) {
-            RowsetSharedPtr hole_rowset;
-            RETURN_IF_ERROR(create_empty_rowset_for_hole(tablet, ver, template_meta, &hole_rowset));
-            hole_rowsets.push_back(hole_rowset);
-        }
+    auto holes = version_index.holes(max_version);
+    if (holes.empty()) {
         return Status::OK();
-    };
-
-    int64_t last_version = -1;
-    for (const Version& version : existing_versions) {
-        VLOG_NOTICE << "Existing version for tablet " << tablet->tablet_id() << ": ["
-                    << version.first << ", " << version.second << "]";
-        // missing versions are those that are not in the existing_versions
-        if (version.first > last_version + 1) {
-            // there is a hole between versions
-            auto prev_non_hole_rowset = tablet->get_rowset_by_version(version);
-            RETURN_IF_ERROR(fill_hole(last_version + 1, version.first - 1,
-                                      prev_non_hole_rowset->rowset_meta()));
-            LOG(INFO) << "Created empty rowset for version hole, from " << last_version + 1
-                      << " to " << version.first - 1 << " for tablet " << tablet->tablet_id()
-                      << (is_schema_change_tablet
-                                  ? (", schema change tablet skipped filling versions <= " +
-                                     std::to_string(tablet->alter_version()))
-                                  : "");
-        }
-        last_version = version.second;
     }
 
-    if (last_version + 1 <= max_version) {
-        LOG(INFO) << "Created empty rowset for version hole, from " << last_version + 1 << " to "
-                  << max_version << " for tablet " << tablet->tablet_id()
+    // A non-MoW RUNNING tablet fills each hole with hole rowsets covering version ranges (see
+    // CloudTablet::add_hole_rowsets); other tablets keep one hole rowset per version.
+    const bool use_version_range = tablet->can_use_hole_rowset_version_range();
+    const auto& rs_metas = tablet->tablet_meta()->all_rs_metas();
+    std::vector<RowsetSharedPtr> hole_rowsets;
+    std::vector<std::pair<Version, RowsetMetaSharedPtr>> hole_ranges;
+    int64_t hole_version_count = 0;
+    for (const auto& hole : holes) {
+        auto anchor_it = rs_metas.find(hole.anchor);
+        if (anchor_it == rs_metas.end()) [[unlikely]] {
+            return Status::InternalError(
+                    "rowset meta of version {} not found when filling version hole [{}-{}], "
+                    "tablet_id={}",
+                    hole.anchor.to_string(), hole.first, hole.last, tablet->tablet_id());
+        }
+        // Skip hole filling for versions <= alter_version during schema change
+        int64_t first_to_fill = is_schema_change_tablet
+                                        ? std::max(hole.first, tablet->alter_version() + 1)
+                                        : hole.first;
+        if (first_to_fill <= hole.last) {
+            hole_version_count += hole.last - first_to_fill + 1;
+        }
+        if (use_version_range) {
+            // Filled after the walk: adding rowsets changes the index `holes` came from.
+            if (first_to_fill <= hole.last) {
+                hole_ranges.emplace_back(Version(first_to_fill, hole.last), anchor_it->second);
+            }
+        } else {
+            for (int64_t ver = first_to_fill; ver <= hole.last; ++ver) {
+                RowsetSharedPtr hole_rowset;
+                RETURN_IF_ERROR(create_empty_rowset_for_hole(tablet, ver, anchor_it->second,
+                                                             &hole_rowset));
+                hole_rowsets.push_back(hole_rowset);
+            }
+        }
+        LOG(INFO) << "Created empty rowset for version hole, from " << hole.first << " to "
+                  << hole.last << " for tablet " << tablet->tablet_id()
                   << (is_schema_change_tablet
                               ? (", schema change tablet skipped filling versions <= " +
                                  std::to_string(tablet->alter_version()))
                               : "");
-        // there is a hole after the last existing version
-        auto prev_non_hole_rowset = tablet->get_rowset_by_version(existing_versions.back());
-        RETURN_IF_ERROR(
-                fill_hole(last_version + 1, max_version, prev_non_hole_rowset->rowset_meta()));
     }
 
     if (!hole_rowsets.empty()) {
         tablet->add_rowsets(std::move(hole_rowsets), false, wlock, false);
     }
-    // Ranges are in ascending version order, so only the last one can extend the tablet's
+    // Holes are in ascending version order, so only the last one can extend the tablet's
     // trailing hole rowset.
     for (const auto& [versions, template_meta] : hole_ranges) {
         RETURN_IF_ERROR(tablet->add_hole_rowsets(versions, template_meta, wlock));

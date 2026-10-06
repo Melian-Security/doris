@@ -26,6 +26,7 @@ namespace doris {
 
 class CloudStorageEngine;
 class CloudRowsetBuilder;
+class CloudTablet;
 
 class CloudDeltaWriter final : public BaseDeltaWriter {
 public:
@@ -44,6 +45,10 @@ public:
 
     Status build_rowset() override;
 
+    Status submit_calc_delete_bitmap_task() override;
+
+    Status wait_calc_delete_bitmap() override;
+
     void update_tablet_stats();
 
     const RowsetMetaSharedPtr& rowset_meta();
@@ -57,6 +62,10 @@ public:
     Status set_txn_related_info();
     std::shared_ptr<ResourceContext> resource_context() { return _resource_ctx; }
 
+    // Whether this writer committed the empty rowset of a tablet that received no rows without
+    // building a rowset writer (see `config::skip_rowset_writer_for_empty_tablet`).
+    bool committed_without_rowset_writer() const { return _empty_rowset_tablet != nullptr; }
+
 private:
     // Convert `_rowset_builder` from `BaseRowsetBuilder` to `CloudRowsetBuilder`
     CloudRowsetBuilder* rowset_builder();
@@ -67,6 +76,9 @@ private:
     bthread::Mutex _mtx;
     CloudStorageEngine& _engine;
     std::shared_ptr<ResourceContext> _resource_ctx;
+    // Set iff the empty rowset was committed without a rowset writer; `_rowset_builder` is then
+    // never initialized, and this is the tablet the load's bookkeeping applies to.
+    std::shared_ptr<CloudTablet> _empty_rowset_tablet;
 };
 
 } // namespace doris

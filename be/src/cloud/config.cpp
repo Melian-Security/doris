@@ -123,6 +123,8 @@ DEFINE_mInt64(hole_rowset_max_versions, "128");
 DEFINE_Validator(hole_rowset_max_versions,
                  [](const int64_t config) -> bool { return config >= 1; });
 
+DEFINE_mBool(skip_rowset_writer_for_empty_tablet, "true");
+
 DEFINE_mInt64(cloud_index_change_task_timeout_second, "3600");
 
 DEFINE_mInt64(warmup_tablet_replica_info_cache_ttl_sec, "600");

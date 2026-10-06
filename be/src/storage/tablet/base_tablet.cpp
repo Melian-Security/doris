@@ -2199,39 +2199,38 @@ std::vector<RowsetSharedPtr> BaseTablet::get_snapshot_rowset(bool include_stale_
 
 void BaseTablet::calc_consecutive_empty_rowsets(
         std::vector<RowsetSharedPtr>* empty_rowsets,
-        const std::vector<RowsetSharedPtr>& candidate_rowsets, int64_t limit) {
-    int len = cast_set<int>(candidate_rowsets.size());
-    for (int i = 0; i < len - 1; ++i) {
-        auto rowset = candidate_rowsets[i];
-        auto next_rowset = candidate_rowsets[i + 1];
-
-        // identify two consecutive rowsets that are empty
-        if (rowset->num_segments() == 0 && next_rowset->num_segments() == 0 &&
-            !rowset->rowset_meta()->has_delete_predicate() &&
-            !next_rowset->rowset_meta()->has_delete_predicate() &&
-            rowset->end_version() == next_rowset->start_version() - 1) {
-            empty_rowsets->emplace_back(rowset);
-            empty_rowsets->emplace_back(next_rowset);
-            rowset = next_rowset;
-            int next_index = i + 2;
-
-            // keep searching for consecutive empty rowsets
-            while (next_index < len && candidate_rowsets[next_index]->num_segments() == 0 &&
-                   !candidate_rowsets[next_index]->rowset_meta()->has_delete_predicate() &&
-                   rowset->end_version() == candidate_rowsets[next_index]->start_version() - 1) {
-                empty_rowsets->emplace_back(candidate_rowsets[next_index]);
-                rowset = candidate_rowsets[next_index++];
-            }
-            // if the number of consecutive empty rowset reach the limit,
-            // and there are still rowsets following them
-            if (empty_rowsets->size() >= limit && next_index < len) {
-                return;
-            } else {
-                // current rowset is not empty, start searching from that rowset in the next
-                i = next_index - 1;
-                empty_rowsets->clear();
-            }
+        const std::vector<RowsetSharedPtr>& candidate_rowsets, int64_t min_count,
+        int64_t max_count) {
+    empty_rowsets->clear();
+    // Merging needs at least two input rowsets.
+    max_count = std::max<int64_t>(max_count, 2);
+    auto is_mergeable_empty = [](const RowsetSharedPtr& rs) {
+        return rs->num_segments() == 0 && !rs->rowset_meta()->has_delete_predicate();
+    };
+    const size_t num_candidates = candidate_rowsets.size();
+    size_t run_begin = 0;
+    while (run_begin + 1 < num_candidates) {
+        if (!is_mergeable_empty(candidate_rowsets[run_begin])) {
+            ++run_begin;
+            continue;
         }
+        // Extend the run over the following empty rowsets whose versions are contiguous.
+        size_t run_end = run_begin + 1;
+        while (run_end < num_candidates && static_cast<int64_t>(run_end - run_begin) < max_count &&
+               is_mergeable_empty(candidate_rowsets[run_end]) &&
+               candidate_rowsets[run_end - 1]->end_version() + 1 ==
+                       candidate_rowsets[run_end]->start_version()) {
+            ++run_end;
+        }
+        const auto run_len = static_cast<int64_t>(run_end - run_begin);
+        // A run that reaches the newest candidate is left alone: it is still growing, and
+        // merging it now would only be repeated after the next load.
+        if (run_len >= 2 && run_len >= min_count && run_end < num_candidates) {
+            empty_rowsets->assign(candidate_rowsets.begin() + run_begin,
+                                  candidate_rowsets.begin() + run_end);
+            return;
+        }
+        run_begin = run_end;
     }
 }
 

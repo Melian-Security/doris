@@ -17,6 +17,8 @@
 
 #include "cloud/cloud_rowset_builder.h"
 
+#include <algorithm>
+
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_tablet.h"
@@ -115,16 +117,35 @@ Status CloudRowsetBuilder::check_tablet_version_count() {
 }
 
 void CloudRowsetBuilder::update_tablet_stats() {
-    auto* tablet = cloud_tablet();
-    DCHECK(tablet);
+    DCHECK(cloud_tablet());
     DCHECK(_rowset);
+    add_rowset_to_tablet_stats(cloud_tablet(), _rowset.get());
+}
+
+void CloudRowsetBuilder::add_rowset_to_tablet_stats(CloudTablet* tablet, const Rowset* rowset) {
     tablet->fetch_add_approximate_num_rowsets(1);
-    tablet->fetch_add_approximate_num_segments(_rowset->num_segments());
-    tablet->fetch_add_approximate_num_rows(_rowset->num_rows());
-    tablet->fetch_add_approximate_data_size(_rowset->total_disk_size());
     tablet->fetch_add_approximate_cumu_num_rowsets(1);
-    tablet->fetch_add_approximate_cumu_num_deltas(_rowset->num_segments());
+    if (rowset != nullptr) {
+        tablet->fetch_add_approximate_num_segments(rowset->num_segments());
+        tablet->fetch_add_approximate_num_rows(rowset->num_rows());
+        tablet->fetch_add_approximate_data_size(rowset->total_disk_size());
+        tablet->fetch_add_approximate_cumu_num_deltas(std::max<int64_t>(rowset->num_segments(), 1));
+    } else {
+        tablet->fetch_add_approximate_cumu_num_deltas(1);
+    }
     tablet->write_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CloudRowsetBuilder::mark_empty_rowset(CloudStorageEngine& engine, const BaseTablet& tablet,
+                                           int64_t txn_id, int64_t txn_expiration) {
+    if (tablet.enable_unique_key_merge_on_write()) {
+        // A lightweight marker instead of the full rowset info: CalcDeleteBitmapTask detects it
+        // and skips the tablet, using ~16 bytes per entry.
+        engine.txn_delete_bitmap_cache().mark_empty_rowset(txn_id, tablet.tablet_id(),
+                                                           txn_expiration);
+    } else if (config::enable_cloud_make_rs_visible_on_be) {
+        engine.committed_rs_mgr().mark_empty_rowset(txn_id, tablet.tablet_id(), txn_expiration);
+    }
 }
 
 CloudTablet* CloudRowsetBuilder::cloud_tablet() {
@@ -136,16 +157,11 @@ const RowsetMetaSharedPtr& CloudRowsetBuilder::rowset_meta() {
 }
 
 Status CloudRowsetBuilder::set_txn_related_info() {
+    if (_skip_writing_rowset_metadata) {
+        mark_empty_rowset(_engine, *_tablet, _req.txn_id, _req.txn_expiration);
+        return Status::OK();
+    }
     if (_tablet->enable_unique_key_merge_on_write()) {
-        // For empty rowsets when skip_writing_empty_rowset_metadata=true,
-        // store only a lightweight marker instead of full rowset info.
-        // This allows CalcDeleteBitmapTask to detect and skip gracefully,
-        // while using minimal memory (~16 bytes per entry).
-        if (_skip_writing_rowset_metadata) {
-            _engine.txn_delete_bitmap_cache().mark_empty_rowset(_req.txn_id, _tablet->tablet_id(),
-                                                                _req.txn_expiration);
-            return Status::OK();
-        }
         if (config::enable_merge_on_write_correctness_check && _rowset->num_rows() != 0) {
             auto st = _tablet->check_delete_bitmap_correctness(
                     _delete_bitmap, _rowset->end_version() - 1, _req.txn_id, *_rowset_ids);
@@ -161,15 +177,8 @@ Status CloudRowsetBuilder::set_txn_related_info() {
         _engine.txn_delete_bitmap_cache().set_tablet_txn_info(
                 _req.txn_id, _tablet->tablet_id(), _delete_bitmap, *_rowset_ids, _rowset,
                 _req.txn_expiration, _partial_update_info);
-    } else {
-        if (config::enable_cloud_make_rs_visible_on_be) {
-            if (_skip_writing_rowset_metadata) {
-                _engine.committed_rs_mgr().mark_empty_rowset(_req.txn_id, _tablet->tablet_id(),
-                                                             _req.txn_expiration);
-            } else {
-                _engine.meta_mgr().cache_committed_rowset(rowset_meta(), _req.txn_expiration);
-            }
-        }
+    } else if (config::enable_cloud_make_rs_visible_on_be) {
+        _engine.meta_mgr().cache_committed_rowset(rowset_meta(), _req.txn_expiration);
     }
     return Status::OK();
 }

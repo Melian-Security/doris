@@ -17,9 +17,13 @@
 
 #include "cloud/cloud_delta_writer.h"
 
+#include <chrono>
+
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_rowset_builder.h"
 #include "cloud/cloud_storage_engine.h"
+#include "cloud/cloud_tablet.h"
+#include "cloud/cloud_tablet_mgr.h"
 #include "cloud/config.h"
 #include "load/delta_writer/delta_writer.h"
 #include "load/memtable/memtable_memory_limiter.h"
@@ -30,6 +34,8 @@ namespace doris {
 
 bvar::Adder<int64_t> g_cloud_commit_rowset_count("cloud_commit_rowset_count");
 bvar::Adder<int64_t> g_cloud_commit_empty_rowset_count("cloud_commit_empty_rowset_count");
+bvar::Adder<int64_t> g_cloud_commit_empty_rowset_without_writer_count(
+        "cloud_commit_empty_rowset_without_writer_count");
 
 CloudDeltaWriter::CloudDeltaWriter(CloudStorageEngine& engine, const WriteRequest& req,
                                    RuntimeProfile* profile, const UniqueId& load_id)
@@ -116,11 +122,29 @@ Status CloudDeltaWriter::build_rowset() {
     return BaseDeltaWriter::build_rowset();
 }
 
+Status CloudDeltaWriter::submit_calc_delete_bitmap_task() {
+    if (_empty_rowset_tablet != nullptr) {
+        return Status::OK();
+    }
+    return BaseDeltaWriter::submit_calc_delete_bitmap_task();
+}
+
+Status CloudDeltaWriter::wait_calc_delete_bitmap() {
+    if (_empty_rowset_tablet != nullptr) {
+        return Status::OK();
+    }
+    return BaseDeltaWriter::wait_calc_delete_bitmap();
+}
+
 CloudRowsetBuilder* CloudDeltaWriter::rowset_builder() {
     return static_cast<CloudRowsetBuilder*>(_rowset_builder.get());
 }
 
 void CloudDeltaWriter::update_tablet_stats() {
+    if (_empty_rowset_tablet != nullptr) {
+        CloudRowsetBuilder::add_rowset_to_tablet_stats(_empty_rowset_tablet.get(), nullptr);
+        return;
+    }
     rowset_builder()->update_tablet_stats();
 }
 
@@ -144,6 +168,29 @@ Status CloudDeltaWriter::commit_rowset() {
 }
 
 Status CloudDeltaWriter::_commit_empty_rowset() {
+    if (config::skip_writing_empty_rowset_metadata &&
+        config::skip_rowset_writer_for_empty_tablet) {
+        // With skip_writing_empty_rowset_metadata, an empty rowset leaves no trace in the meta
+        // service: commit_txn bumps the partition version and the tablet's missing version is
+        // filled with an empty rowset when the tablet syncs (or is made visible) on a BE. A rowset
+        // writer built here would be closed and dropped unused, and FE still gets this tablet's
+        // commit info from the tablets channel. So only the per-tablet BE bookkeeping is needed,
+        // and that requires the tablet object; when it is not cached on this BE, fall back to
+        // the rowset builder, which loads it.
+        auto tablet = _engine.tablet_mgr().get_tablet(tablet_id(), /*warmup_data=*/false,
+                                                      /*sync_delete_bitmap=*/false,
+                                                      /*sync_stats=*/nullptr,
+                                                      /*force_use_only_cached=*/true);
+        if (tablet.has_value()) {
+            _empty_rowset_tablet = tablet.value();
+            using namespace std::chrono;
+            _empty_rowset_tablet->last_load_time_ms =
+                    duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            g_cloud_commit_empty_rowset_without_writer_count << 1;
+            return Status::OK();
+        }
+    }
+
     // If skip writing empty rowset metadata is enabled,
     // we do not prepare rowset to meta service.
     if (config::skip_writing_empty_rowset_metadata) {
@@ -163,6 +210,11 @@ Status CloudDeltaWriter::_commit_empty_rowset() {
 }
 
 Status CloudDeltaWriter::set_txn_related_info() {
+    if (_empty_rowset_tablet != nullptr) {
+        CloudRowsetBuilder::mark_empty_rowset(_engine, *_empty_rowset_tablet, _req.txn_id,
+                                              _req.txn_expiration);
+        return Status::OK();
+    }
     return rowset_builder()->set_txn_related_info();
 }
 

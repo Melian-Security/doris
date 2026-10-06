@@ -918,6 +918,8 @@ DEFINE_mInt32(max_tablet_version_num, "2000");
 
 DEFINE_mInt32(time_series_max_tablet_version_num, "20000");
 
+DEFINE_mBool(time_series_compaction_prefer_empty_rowsets, "false");
+
 // the max sleep time when meeting high pressure load task
 DEFINE_mInt64(max_load_back_pressure_version_wait_time_ms, "3000");
 // the threshold of rowset number gap that triggers back pressure
@@ -2316,6 +2318,8 @@ Status set_fuzzy_configs() {
     fuzzy_field_and_value["string_overflow_size"] =
             ((distribution(*generator) % 2) == 0) ? "10" : "4294967295";
     fuzzy_field_and_value["skip_writing_empty_rowset_metadata"] =
+            ((distribution(*generator) % 2) == 0) ? "true" : "false";
+    fuzzy_field_and_value["skip_rowset_writer_for_empty_tablet"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";
     fuzzy_field_and_value["enable_packed_file"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";

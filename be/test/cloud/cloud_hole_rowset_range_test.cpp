@@ -116,6 +116,18 @@ public:
     // Every version in [1, max_version] must be readable through the version graph, and the
     // rowsets on the captured path must cover [0, v] exactly.
     static void expect_all_versions_capturable(const CloudTablet& tablet) {
+        // The visible version index and the delta counts follow the live rowsets only; stale
+        // hole rowsets stay out of them.
+        const auto& rs_metas = tablet.tablet_meta()->all_rs_metas();
+        ASSERT_EQ(tablet._visible_version_index.size(), rs_metas.size());
+        for (const auto& [v, _] : rs_metas) {
+            ASSERT_TRUE(tablet._visible_version_index.contains(v)) << v.to_string();
+        }
+        ASSERT_EQ(tablet._visible_rowset_deltas.size(), tablet.rowset_map().size());
+        for (const auto& [v, _] : tablet._stale_rs_version_map) {
+            ASSERT_FALSE(tablet._visible_version_index.contains(v) && !rs_metas.contains(v))
+                    << v.to_string();
+        }
         for (int64_t v = 1; v <= tablet.max_version_unlocked(); ++v) {
             auto path = tablet.capture_consistent_versions_unlocked(Version(0, v), {});
             ASSERT_TRUE(path.has_value()) << "version " << v << ": " << path.error();
