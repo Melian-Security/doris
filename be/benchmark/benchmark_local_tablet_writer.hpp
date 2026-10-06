@@ -109,6 +109,11 @@ static void LocalTabletWriter_BrpcRoundTrip(benchmark::State& state) {
     size_t wire_bytes = 0;
     for (auto _ : state) {
         PTabletWriterAddBlockRequest request;
+        // The required header fields of a real request; parsing rejects a request without them.
+        request.mutable_id()->set_hi(1);
+        request.mutable_id()->set_lo(1);
+        request.set_index_id(1);
+        request.set_sender_id(0);
         size_t uncompressed_bytes = 0;
         size_t compressed_bytes = 0;
         int64_t compress_time = 0;
