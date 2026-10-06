@@ -26,6 +26,7 @@
 
 #include "cctz/time_zone.h"
 #include "common/status.h"
+#include "core/data_type/data_type.h"
 #include "format/arrow/arrow_pip_input_stream.h"
 #include "format/file_reader/new_plain_text_line_reader.h"
 #include "format/generic_reader.h"
@@ -59,6 +60,10 @@ public:
 
     Status get_columns(std::unordered_map<std::string, DataTypePtr>* name_to_type,
                        std::unordered_set<std::string>* missing_cols) override;
+
+    // The type the reader reads a load column's Arrow data into; the scanner then casts it to
+    // the slot type.
+    static DataTypePtr load_source_type(const DataTypePtr& slot_type);
 
 private:
     RuntimeState* _state;
