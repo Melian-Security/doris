@@ -1484,6 +1484,11 @@ DECLARE_mBool(variant_enable_duplicate_json_path_check);
 // stable scalar leaves straight into the typed path column. The output is identical either way;
 // false selects the general per-value path, kept for A/B measurement and as a fallback.
 DECLARE_mBool(variant_v2_shredder_fast_path);
+// Variant V2 JSON encoder (Stream Load, Arrow, CAST): skip the second UTF-8 scan of strings the
+// JSON parser already validated, and seed object key hints from the same path in the previous row
+// instead of the same pre-order ordinal. The encoded bytes are identical either way; false selects
+// the general path, kept for A/B measurement and as a fallback. Read when an encoder is created.
+DECLARE_mBool(variant_v2_json_encoder_fast_path);
 // Controls storage-layer parse target for plain non-doc VARIANT columns:
 // 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
 DECLARE_mInt32(variant_storage_parse_mode);

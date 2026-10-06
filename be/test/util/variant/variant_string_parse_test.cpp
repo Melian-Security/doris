@@ -522,6 +522,7 @@ TEST(VariantJsonTest, CurrentConfigIsSnapshottedAndExplicitOptionsAreValidated) 
               static_cast<uint32_t>(config::variant_max_json_key_length));
     EXPECT_EQ(options.throw_on_invalid_json, config::variant_throw_exeception_on_invalid_json);
     EXPECT_EQ(options.check_duplicate_json_path, config::variant_enable_duplicate_json_path_check);
+    EXPECT_EQ(options.fast_path, config::variant_v2_json_encoder_fast_path);
 
     JsonToVariantOptions invalid;
     invalid.max_json_key_length = 0;
@@ -537,6 +538,203 @@ TEST(VariantJsonTest, StaticDispatchWritesDirectlyToBufferWritable) {
     writer.commit();
     ASSERT_EQ(column->size(), 1);
     EXPECT_EQ(column->get_data_at(0), string_ref(R"({"a":1,"b":[true,"x"]})"));
+}
+
+// OCSF-shaped event. Row-dependent choices cover optional members that shift object ordinals,
+// variable-length arrays of objects whose elements gain and lose keys, two key orders, unicode
+// keys and values (escaped and raw), every integer width, uint64 and doubles, strings around the
+// inline and short-string limits, empty and nested containers, and row-unique keys.
+std::string fast_path_identity_row(size_t row) {
+    const std::string r = std::to_string(row);
+    std::string json = "{";
+    if (row % 5 == 3) {
+        json += R"("time":)" + std::to_string(1700000000000 + row) + R"(,"class_uid":3002)";
+    } else {
+        json += R"("class_uid":3002,"time":)" + std::to_string(1700000000000 + row);
+    }
+    json += R"(,"message":"login \u00e9v\u00e9nement )" + r + R"( \ud83d\ude00 日本\u2028")";
+    json += R"(,"metadata":{"product":{"name":"p)" + std::to_string(row % 3) +
+            R"(","vendor_name":"v","feature":{"name":"f"}})";
+    if (row % 4 == 1) {
+        json += R"(,"correlation_uid":"c)" + r + R"(")";
+    }
+    json += R"(,"version":"1.1.0","labels":["a","bb","ccc","dddd"]})";
+    if (row % 6 == 1) {
+        json += R"(,"actor":null)";
+    } else if (row % 6 != 0) {
+        json += R"(,"actor":{"user":{"name":"u)" + r + R"(","groups":[)";
+        for (size_t group = 0; group < row % 4; ++group) {
+            json += (group == 0 ? "" : ",");
+            json += R"({"name":"g)" + std::to_string(group) + R"("})";
+        }
+        json += R"(]},"session":{"uid":"s","is_remote":)" +
+                std::string(row % 2 == 0 ? "true" : "false") + "}}";
+    }
+    json += R"(,"observables":[)";
+    for (size_t index = 0; index < row % 5; ++index) {
+        json += (index == 0 ? "" : ",");
+        json += R"({"name":"n)" + std::to_string(index) + R"(","type_id":)" +
+                std::to_string(index + 1);
+        if (index == 2) {
+            json += R"(,"reputation":{"score_id":3,"provider":"x"})";
+        }
+        json += R"(,"value":"v"})";
+    }
+    json += "]";
+    json += R"(,"n":{"i8":)" + std::to_string(row % 100) + R"(,"i16":)" + std::to_string(300 + row) +
+            R"(,"i32":)" + std::to_string(70000 + row) + R"(,"i64":)" +
+            std::to_string(5000000000 + row) + R"(,"neg":-)" + r +
+            R"(,"min":-9223372036854775808,"max":9223372036854775807)" +
+            R"(,"u64":18446744073709551615,"over":9223372036854775808,"d":)" + r +
+            R"(.5,"e":1e300,"z":-0.0,"tiny":5e-324})";
+    json += R"(,"s":{"e":"","a":"x","b":"abc","c":"abcd","l63":")" + std::string(63, 'q') +
+            R"(","l64":")" + std::string(64, 'q') + R"(","long":")" + std::string(300, 'z') +
+            R"(","esc":"tab\there \"q\" \\ \/"})";
+    json += R"(,"ключ":1,"キー":{"値":true},"line\u2028key":"x")";
+    json += R"(,"eo":{},"ea":[],"nested":[[],[{}],[[1,2],["a"]],[1,"two",null,{"k":1},[true]]])";
+    if (row % 7 == 0) {
+        json += R"(,"extra_)" + r + R"(":)" + r;
+    }
+    json += "}";
+    return json;
+}
+
+std::vector<std::string> fast_path_identity_inputs() {
+    std::vector<std::string> inputs;
+    for (size_t row = 0; row < 48; ++row) {
+        inputs.push_back(fast_path_identity_row(row));
+        switch (row % 12) {
+        case 2:
+            inputs.emplace_back("null");
+            break;
+        case 4:
+            inputs.emplace_back(R"([{"a":1,"b":2},{"a":3,"b":4},{"b":5,"a":6},{"a":7}])");
+            break;
+        case 5:
+            inputs.emplace_back(R"({"a":1,"b":{"c":1,"c":2},"a":2})");
+            break;
+        case 6:
+            inputs.emplace_back("{");
+            break;
+        case 7:
+            inputs.emplace_back(R"({"a":"\udc00"})");
+            break;
+        case 8:
+            inputs.emplace_back(std::string(1, static_cast<char>(0xFF)));
+            break;
+        case 9:
+            inputs.emplace_back("");
+            break;
+        case 10:
+            inputs.emplace_back(R"({"class_uid":3002,"time":1,"time":2})");
+            break;
+        case 11:
+            inputs.emplace_back(R"("scalar root")");
+            inputs.emplace_back("42");
+            inputs.emplace_back("{}");
+            inputs.emplace_back("[]");
+            break;
+        default:
+            break;
+        }
+    }
+    inputs.push_back(nested_array_json(VARIANT_MAX_NESTING_DEPTH));
+    inputs.push_back(nested_array_json(VARIANT_MAX_NESTING_DEPTH + 1));
+    return inputs;
+}
+
+struct EncoderOutcome {
+    std::vector<std::string> row_results;
+    std::string error;
+    std::string metadata;
+    std::string values;
+    std::vector<uint32_t> offsets;
+
+    bool operator==(const EncoderOutcome&) const = default;
+};
+
+EncoderOutcome encode_outcome(const std::vector<std::string>& inputs, JsonToVariantOptions options,
+                              bool recoverable) {
+    EncoderOutcome outcome;
+    try {
+        JsonStringToVariantEncoder encoder(options);
+        for (const std::string& json : inputs) {
+            if (recoverable) {
+                const Status status = encoder.try_add_json(StringRef(json));
+                outcome.row_results.push_back(status.ok() ? "OK"
+                                                          : std::to_string(status.code()) + ":" +
+                                                                    std::string(status.msg()));
+            } else {
+                encoder.add_json(StringRef(json));
+            }
+        }
+        VariantBatchBuilder block = encoder.finish_batch();
+        const VariantMetadataRef metadata = block.metadata_ref();
+        outcome.metadata.assign(metadata.data, metadata.size);
+        outcome.values = block_value_bytes(block);
+        outcome.offsets = block_value_offsets(block);
+    } catch (const Exception& exception) {
+        outcome.error = std::to_string(exception.code()) + ":" + exception.message();
+    }
+    return outcome;
+}
+
+// The fast path must not change a single byte, key id or error: run every input set through both
+// paths under every option combination, as one recoverable batch, as one strict batch, and one
+// row per batch.
+// NOLINTNEXTLINE(readability-function-cognitive-complexity): GTest macros inflate the option matrix.
+TEST(VariantJsonTest, FastPathEncodesIdenticalBatchesAndErrors) {
+    const std::vector<std::string> inputs = fast_path_identity_inputs();
+    std::vector<std::string> valid_rows;
+    for (size_t row = 0; row < 64; ++row) {
+        valid_rows.push_back(fast_path_identity_row(row));
+        if (row % 9 == 4) {
+            valid_rows.emplace_back("null");
+        }
+    }
+
+    size_t compared_rows = 0;
+    for (const bool check_duplicates : {false, true}) {
+        for (const bool throw_on_invalid : {false, true}) {
+            JsonToVariantOptions general;
+            general.check_duplicate_json_path = check_duplicates;
+            general.throw_on_invalid_json = throw_on_invalid;
+            general.fast_path = false;
+            JsonToVariantOptions fast = general;
+            fast.fast_path = true;
+            const std::string label = "check_duplicates=" + std::to_string(check_duplicates) +
+                                      " throw_on_invalid=" + std::to_string(throw_on_invalid);
+
+            const EncoderOutcome general_batch = encode_outcome(inputs, general, true);
+            ASSERT_TRUE(general_batch.error.empty()) << label << " " << general_batch.error;
+            ASSERT_FALSE(general_batch.values.empty()) << label;
+            EXPECT_EQ(encode_outcome(inputs, fast, true), general_batch) << label;
+            EXPECT_EQ(encode_outcome(inputs, fast, false), encode_outcome(inputs, general, false))
+                    << label;
+
+            const EncoderOutcome general_valid = encode_outcome(valid_rows, general, false);
+            ASSERT_TRUE(general_valid.error.empty()) << label << " " << general_valid.error;
+            EXPECT_EQ(encode_outcome(valid_rows, fast, false), general_valid) << label;
+
+            for (const std::string& json : inputs) {
+                EXPECT_EQ(encode_outcome({json}, fast, false), encode_outcome({json}, general, false))
+                        << label << " input=" << json;
+                ++compared_rows;
+            }
+        }
+    }
+    EXPECT_GT(compared_rows, 0);
+
+    // The fixture does exercise each policy branch.
+    JsonToVariantOptions strict;
+    strict.throw_on_invalid_json = true;
+    EXPECT_FALSE(encode_outcome({"{"}, strict, false).error.empty());
+    EXPECT_FALSE(encode_outcome({R"({"a":1,"a":2})"}, strict, false).error.empty());
+    JsonToVariantOptions permissive;
+    const EncoderOutcome lone_surrogate = encode_outcome({R"({"a":"\udc00"})"}, permissive, false);
+    ASSERT_TRUE(lone_surrogate.error.empty()) << lone_surrogate.error;
+    VariantBatchBuilder fallback = encode_jsons({R"({"a":"\udc00"})"}, permissive);
+    EXPECT_EQ(print_json(fallback.value_at(0)), R"("{\"a\":\"\\udc00\"}")");
 }
 
 TEST(VariantJsonTest, ExternalMalformedValueReturnsExplicitErrors) {

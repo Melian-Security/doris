@@ -35,6 +35,7 @@
 #include "benchmark_local_tablet_writer.hpp"
 #include "benchmark_time_series_empty_run.hpp"
 #include "benchmark_variant_v2_deserialize.hpp"
+#include "benchmark_variant_v2_json_encode.hpp"
 #include "benchmark_variant_v2_shredder.hpp"
 #include "benchmark_zone_map_index.hpp"
 #include "binary_cast_benchmark.hpp"

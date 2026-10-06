@@ -152,7 +152,13 @@ public:
         } else if (element.isDouble()) {
             _builder.add_double(element.getDouble());
         } else if (element.isString()) {
-            _builder.add_string(to_string_ref(element.getString()));
+            // The DOM parser validates the whole document as UTF-8 and rejects escapes that do not
+            // decode to UTF-8 (lone surrogates), so its strings need no second scan.
+            if (_options.fast_path) {
+                _builder.add_valid_utf8_string(to_string_ref(element.getString()));
+            } else {
+                _builder.add_string(to_string_ref(element.getString()));
+            }
         } else if (element.isArray()) {
             collect_array(element.getArray(), depth);
         } else if (element.isObject()) {
@@ -387,13 +393,18 @@ FormattedScalar format_json_uuid(const std::array<uint8_t, 16>& value) {
 JsonToVariantOptions JsonToVariantOptions::current_config() {
     return {.max_json_key_length = static_cast<uint32_t>(config::variant_max_json_key_length),
             .throw_on_invalid_json = config::variant_throw_exeception_on_invalid_json,
-            .check_duplicate_json_path = config::variant_enable_duplicate_json_path_check};
+            .check_duplicate_json_path = config::variant_enable_duplicate_json_path_check,
+            .fast_path = config::variant_v2_json_encoder_fast_path};
 }
 
 struct JsonStringToVariantEncoder::Impl {
     enum class State : uint8_t { COLLECTING, FINISHED, FAILED };
 
-    explicit Impl(JsonToVariantOptions options_) : options(options_) {
+    explicit Impl(JsonToVariantOptions options_)
+            : options(options_),
+              builder(VariantBatchBuilder::ReserveHint {},
+                      VariantBatchBuilder::Options {.path_aligned_object_hints =
+                                                            options_.fast_path}) {
         if (options.max_json_key_length == 0) {
             throw Exception(ErrorCode::INVALID_ARGUMENT,
                             "Variant maximum JSON key length must be positive");
