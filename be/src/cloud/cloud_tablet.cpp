@@ -149,7 +149,9 @@ bvar::LatencyRecorder g_file_cache_warm_up_rowset_all_segments_latency(
         "file_cache_warm_up_rowset_all_segments_latency");
 
 CloudTablet::CloudTablet(CloudStorageEngine& engine, TabletMetaSharedPtr tablet_meta)
-        : BaseTablet(std::move(tablet_meta)), _engine(engine) {}
+        : BaseTablet(std::move(tablet_meta)), _engine(engine) {
+    _visible_version_index.rebuild(_tablet_meta->all_rs_metas() | std::views::keys);
+}
 
 CloudTablet::~CloudTablet() = default;
 
@@ -408,6 +410,9 @@ Status CloudTablet::sync_if_not_running(SyncRowsetStats* stats) {
         std::swap(_timestamped_version_tracker, empty_tracker);
         _tablet_meta->clear_rowsets();
         _tablet_meta->clear_stale_rowset();
+        _visible_version_index.clear();
+        _visible_rowset_deltas.clear();
+        _visible_rowset_deltas_sum = 0;
         _max_version = -1;
     }
 
@@ -469,7 +474,9 @@ void CloudTablet::add_rowsets(std::vector<RowsetSharedPtr> to_add, bool version_
 
                 _tablet_meta->delete_rs_meta_by_version(rs->version(), nullptr);
                 _rs_version_map[rs->version()] = rs;
+                _track_visible_rowset_delta(rs);
                 _tablet_meta->add_rowsets_unchecked({rs});
+                _visible_version_index.insert(rs->version());
                 update_base_size(*rs);
                 return true;
             });
@@ -488,9 +495,11 @@ void CloudTablet::add_rowsets(std::vector<RowsetSharedPtr> to_add, bool version_
             to_add_directly.push_back(to_add_rs);
         } else {
             to_add_directly.push_back(to_add_rs);
-            for (auto& [v, rs] : _rs_version_map) {
-                if (to_add_v.contains(v)) {
-                    to_delete.push_back(rs);
+            // The index holds every key of `_rs_version_map` (both mirror the tablet meta), so
+            // the ordered range lookup finds the same contained versions as a full map scan.
+            for (const auto& v : _visible_version_index.versions_contained_in(to_add_v)) {
+                if (auto it = _rs_version_map.find(v); it != _rs_version_map.end()) {
+                    to_delete.push_back(it->second);
                 }
             }
             delete_rowsets(to_delete, meta_lock);
@@ -516,6 +525,8 @@ void CloudTablet::delete_rowsets(const std::vector<RowsetSharedPtr>& to_delete,
     _timestamped_version_tracker.add_stale_path_version(rs_metas);
     for (auto&& rs : to_delete) {
         _rs_version_map.erase(rs->version());
+        _untrack_visible_rowset_delta(rs->version());
+        _visible_version_index.erase(rs->version());
     }
 
     _tablet_meta->modify_rs_metas({}, rs_metas, false);
@@ -532,6 +543,8 @@ void CloudTablet::delete_rowsets_for_schema_change(const std::vector<RowsetShare
     for (auto&& rs : to_delete) {
         rs_metas.push_back(rs->rowset_meta());
         _rs_version_map.erase(rs->version());
+        _untrack_visible_rowset_delta(rs->version());
+        _visible_version_index.erase(rs->version());
         // Remove edge from version graph so that the greedy capture algorithm
         // won't prefer the wider stale compaction rowset over individual SC
         // output rowsets (e.g. [818-822] vs [818],[819],...,[822]).
@@ -810,16 +823,25 @@ void CloudTablet::reset_approximate_stats(int64_t num_rowsets, int64_t num_segme
     _approximate_num_segments.store(num_segments, std::memory_order_relaxed);
     _approximate_num_rows.store(num_rows, std::memory_order_relaxed);
     _approximate_data_size.store(data_size, std::memory_order_relaxed);
-    int64_t cumu_num_deltas = 0;
-    int64_t cumu_num_rowsets = 0;
     auto cp = _cumulative_point.load(std::memory_order_relaxed);
-    for (auto& [v, r] : _rs_version_map) {
-        if (v.second < cp) {
-            continue;
+    // Count the rowsets with `v.second >= cp` as all rowsets minus those below the cumulative
+    // point, walking only the versions that start below it. A load-heavy tablet keeps most of
+    // its rowsets above the cumulative point, so this avoids a full map walk under the
+    // exclusive meta lock on every sync and compaction commit.
+    int64_t below_cp_deltas = 0;
+    int64_t below_cp_rowsets = 0;
+    _visible_version_index.for_each_starting_before(cp, [&](const Version& v) {
+        if (v.second >= cp) {
+            return;
         }
-        cumu_num_deltas += r->is_segments_overlapping() ? r->num_segments() : 1;
-        ++cumu_num_rowsets;
-    }
+        if (auto it = _visible_rowset_deltas.find(v); it != _visible_rowset_deltas.end()) {
+            below_cp_deltas += it->second;
+            ++below_cp_rowsets;
+        }
+    });
+    int64_t cumu_num_deltas = _visible_rowset_deltas_sum - below_cp_deltas;
+    int64_t cumu_num_rowsets =
+            static_cast<int64_t>(_visible_rowset_deltas.size()) - below_cp_rowsets;
     // num_rowsets may be less than the size of _rs_version_map when there are some hole rowsets
     // in the version map, so we use the max value to ensure that the approximate number
     // of rowsets is at least the size of _rs_version_map.
@@ -1949,7 +1971,10 @@ void CloudTablet::_add_rowsets_directly(std::vector<RowsetSharedPtr>& rowsets,
                 }
             }
         }
-        _rs_version_map.emplace(rs->version(), rs);
+        if (_rs_version_map.emplace(rs->version(), rs).second) {
+            _track_visible_rowset_delta(rs);
+        }
+        _visible_version_index.insert(rs->version());
         _timestamped_version_tracker.add_version(rs->version());
         _max_version = std::max(rs->end_version(), _max_version);
         update_base_size(*rs);
@@ -1957,8 +1982,60 @@ void CloudTablet::_add_rowsets_directly(std::vector<RowsetSharedPtr>& rowsets,
     _tablet_meta->add_rowsets_unchecked(rowsets);
 }
 
+static int64_t cumulative_delta_count(const Rowset& rs) {
+    return rs.is_segments_overlapping() ? rs.num_segments() : 1;
+}
+
+void CloudTablet::_track_visible_rowset_delta(const RowsetSharedPtr& rs) {
+    int64_t delta = cumulative_delta_count(*rs);
+    auto [it, inserted] = _visible_rowset_deltas.try_emplace(rs->version(), delta);
+    if (!inserted) {
+        _visible_rowset_deltas_sum -= it->second;
+        it->second = delta;
+    }
+    _visible_rowset_deltas_sum += delta;
+}
+
+void CloudTablet::_untrack_visible_rowset_delta(const Version& version) {
+    if (auto it = _visible_rowset_deltas.find(version); it != _visible_rowset_deltas.end()) {
+        _visible_rowset_deltas_sum -= it->second;
+        _visible_rowset_deltas.erase(it);
+    }
+}
+
+const CloudRowsetVersionIndex& CloudTablet::visible_version_index_unlocked() {
+    const auto& rs_metas = _tablet_meta->all_rs_metas();
+    if (_visible_version_index.size() != rs_metas.size()) [[unlikely]] {
+        // Only reachable when rowset metas were changed behind this class (tests do this);
+        // fall back to the source of truth once.
+        LOG_EVERY_N(WARNING, 100) << "rebuild visible version index, tablet_id=" << tablet_id()
+                                  << ", index_size=" << _visible_version_index.size()
+                                  << ", rs_metas_size=" << rs_metas.size();
+        _visible_version_index.rebuild(rs_metas | std::views::keys);
+    }
+    return _visible_version_index;
+}
+
+RowsetMetaSharedPtr CloudTablet::rowset_meta_with_max_start_version_unlocked() {
+    auto last = visible_version_index_unlocked().last();
+    if (!last.has_value()) {
+        return nullptr;
+    }
+    const auto& rs_metas = _tablet_meta->all_rs_metas();
+    auto it = rs_metas.find(*last);
+    return it == rs_metas.end() ? nullptr : it->second;
+}
+
 void CloudTablet::clear_unused_visible_pending_rowsets() {
-    int64_t cur_max_version = max_version().second;
+    int64_t cur_max_version = 0;
+    {
+        // Same value as `max_version().second` for non-overlapping visible versions, without
+        // scanning every rowset meta under the meta lock on each load.
+        std::shared_lock rlock(_meta_lock);
+        if (auto last = _visible_version_index.last(); last.has_value()) {
+            cur_max_version = std::max<int64_t>(last->second, 0);
+        }
+    }
     int32_t max_version_count = max_version_config();
     int64_t current_time = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -2025,17 +2102,12 @@ void CloudTablet::try_make_committed_rs_visible_for_mow(int64_t txn_id, int64_t 
             return;
         }
         if (is_empty_rowset) {
-            Versions existing_versions;
-            for (const auto& [_, rs] : tablet_meta()->all_rs_metas()) {
-                existing_versions.emplace_back(rs->version());
-            }
-            if (existing_versions.empty()) {
+            auto prev_rs_meta = rowset_meta_with_max_start_version_unlocked();
+            if (prev_rs_meta == nullptr) {
                 return;
             }
-            auto max_version = std::ranges::max(existing_versions, {}, &Version::first);
-            auto prev_rowset = get_rowset_by_version(max_version);
-            auto st = _engine.meta_mgr().create_empty_rowset_for_hole(
-                    this, visible_version, prev_rowset->rowset_meta(), &rowset);
+            auto st = _engine.meta_mgr().create_empty_rowset_for_hole(this, visible_version,
+                                                                      prev_rs_meta, &rowset);
             if (!st.ok()) {
                 return;
             }
@@ -2074,23 +2146,15 @@ void CloudTablet::apply_visible_pending_rowsets() {
 
         auto& pending_rs = it->second;
         if (pending_rs.is_empty_rowset) {
-            RowsetSharedPtr prev_rowset {nullptr};
-            if (!to_add.empty()) {
-                prev_rowset = to_add.back();
-            } else {
-                Versions existing_versions;
-                for (const auto& [_, rs] : tablet_meta()->all_rs_metas()) {
-                    existing_versions.emplace_back(rs->version());
-                }
-                if (existing_versions.empty()) {
-                    break;
-                }
-                auto max_version = std::ranges::max(existing_versions, {}, &Version::first);
-                prev_rowset = get_rowset_by_version(max_version);
+            RowsetMetaSharedPtr prev_rs_meta = to_add.empty()
+                                                       ? rowset_meta_with_max_start_version_unlocked()
+                                                       : to_add.back()->rowset_meta();
+            if (prev_rs_meta == nullptr) {
+                break;
             }
             RowsetSharedPtr rowset;
-            auto st = _engine.meta_mgr().create_empty_rowset_for_hole(
-                    this, version, prev_rowset->rowset_meta(), &rowset);
+            auto st = _engine.meta_mgr().create_empty_rowset_for_hole(this, version, prev_rs_meta,
+                                                                      &rowset);
             if (!st.ok()) {
                 return;
             }
