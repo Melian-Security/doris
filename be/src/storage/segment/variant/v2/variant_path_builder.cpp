@@ -27,6 +27,7 @@
 #include <string_view>
 #include <utility>
 
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/assert_cast.h"
 #include "core/block/column_with_type_and_name.h"
@@ -274,9 +275,10 @@ DataTypePtr infer_type(VariantRef value, const DataTypePtr& reusable_type = null
     }
 
     DataTypePtr element_type;
-    const uint32_t element_count = value.num_elements();
+    const VariantRef::ArrayView elements = value.array_view();
+    const uint32_t element_count = elements.size();
     for (uint32_t index = 0; index < element_count; ++index) {
-        const VariantRef element = value.array_at(index);
+        const VariantRef element = elements.value_at(index);
         const ValueKind element_kind = value_kind(element);
         if (element_kind == ValueKind::ARRAY ||
             (element_kind == ValueKind::JSONB_REF &&
@@ -460,9 +462,10 @@ bool value_is_representable(VariantRef value, const DataTypePtr& target_type) {
         }
         const DataTypePtr element_type =
                 remove_nullable(assert_cast<const DataTypeArray&>(*target_type).get_nested_type());
-        const uint32_t count = value.num_elements();
+        const VariantRef::ArrayView elements = value.array_view();
+        const uint32_t count = elements.size();
         for (uint32_t index = 0; index < count; ++index) {
-            const VariantRef element = value.array_at(index);
+            const VariantRef element = elements.value_at(index);
             if (!element.is_null() && !value_is_representable(element, element_type)) {
                 return false;
             }
@@ -482,7 +485,9 @@ void require_jsonb_write(bool ok, std::string_view description) {
     }
 }
 
-void write_path_jsonb(VariantRef value, JsonbWriter* writer) {
+// nested is scratch for complete leaf subtrees. It must differ from writer; each use is finished
+// and copied into writer before the next one starts, so one scratch serves a whole array.
+void write_path_jsonb(VariantRef value, JsonbWriter* writer, JsonbWriter* nested) {
     switch (value_kind(value)) {
     case ValueKind::INT64:
         // Preserve the previous path-builder fallback format: integer widths are canonicalized to
@@ -507,9 +512,10 @@ void write_path_jsonb(VariantRef value, JsonbWriter* writer) {
     }
     case ValueKind::ARRAY: {
         require_jsonb_write(writer->writeStartArray(), "array start");
-        const uint32_t count = value.num_elements();
+        const VariantRef::ArrayView elements = value.array_view();
+        const uint32_t count = elements.size();
         for (uint32_t index = 0; index < count; ++index) {
-            write_path_jsonb(value.array_at(index), writer);
+            write_path_jsonb(elements.value_at(index), writer, nested);
         }
         require_jsonb_write(writer->writeEndArray(), "array end");
         return;
@@ -521,18 +527,43 @@ void write_path_jsonb(VariantRef value, JsonbWriter* writer) {
     case ValueKind::TIMESTAMP_TZ:
     case ValueKind::STRING:
     case ValueKind::JSONB_REF: {
-        JsonbWriter nested;
-        variant_to_jsonb(value, nested);
-        const JsonbValue* nested_value = JsonbDocument::createValue(nested.getOutput()->getBuffer(),
-                                                                    nested.getOutput()->getSize());
+        variant_to_jsonb(value, *nested);
+        const JsonbValue* nested_value = JsonbDocument::createValue(
+                nested->getOutput()->getBuffer(), nested->getOutput()->getSize());
         require_jsonb_write(writer->writeValue(nested_value), "Variant subtree");
         return;
     }
     }
 }
 
-void append_jsonb(VariantRef value, ColumnString* column) {
-    JsonbWriter writer;
+// Per-path scratch writers. A fresh JsonbWriter allocates its output stream, and JSONB-typed paths
+// (arrays of objects, mixed scalars) append one document per present value. Created on first use
+// so paths that never write JSONB carry no stream.
+class JsonbScratch {
+public:
+    JsonbWriter& writer() { return get(&_writer); }
+    JsonbWriter& nested() { return get(&_nested); }
+    size_t allocated_bytes() const {
+        return (_writer ? sizeof(JsonbWriter) + _writer->getOutput()->allocated_bytes() : 0) +
+               (_nested ? sizeof(JsonbWriter) + _nested->getOutput()->allocated_bytes() : 0);
+    }
+
+private:
+    static JsonbWriter& get(std::unique_ptr<JsonbWriter>* writer) {
+        if (*writer == nullptr) {
+            *writer = std::make_unique<JsonbWriter>();
+        }
+        return **writer;
+    }
+
+    std::unique_ptr<JsonbWriter> _writer;
+    std::unique_ptr<JsonbWriter> _nested;
+};
+
+void append_jsonb(VariantRef value, ColumnString* column, JsonbScratch* scratch) {
+    JsonbWriter& writer = scratch->writer();
+    // A fresh writer and a reset writer are in the same state; variant_to_jsonb() resets too.
+    writer.reset();
     switch (value_kind(value)) {
     case ValueKind::NULL_VALUE:
     case ValueKind::BOOL:
@@ -552,7 +583,7 @@ void append_jsonb(VariantRef value, ColumnString* column) {
     case ValueKind::DOUBLE:
     case ValueKind::DECIMAL:
     case ValueKind::ARRAY:
-        write_path_jsonb(value, &writer);
+        write_path_jsonb(value, &writer, &scratch->nested());
         break;
     }
     column->insert_data(writer.getOutput()->getBuffer(), writer.getOutput()->getSize());
@@ -693,10 +724,11 @@ void append_timestamp(VariantRef value, PrimitiveType target_type, IColumn* targ
     assert_cast<ColumnTimeStampTz&>(*target).insert_value(converted);
 }
 
+// target_primitive is target_type->get_primitive_type(), cached by the caller because this runs
+// once per present value.
 template <typename Value>
 bool stable_scalar_matches_type(const Value& value, const ScalarPhysical& physical,
-                                const DataTypePtr& target_type) {
-    const PrimitiveType target_primitive = target_type->get_primitive_type();
+                                const DataTypePtr& target_type, PrimitiveType target_primitive) {
     if (target_primitive == TYPE_JSONB) {
         return physical.kind == ScalarPhysicalKind::SHORT_STRING ||
                physical.kind == ScalarPhysicalKind::PRIMITIVE;
@@ -759,9 +791,11 @@ bool stable_scalar_matches_type(const Value& value, const ScalarPhysical& physic
     throw Exception(ErrorCode::CORRUPTION, "Unknown Variant primitive id");
 }
 
-void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* target);
+void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* target,
+                  JsonbScratch* scratch);
 
-void append_array(VariantRef value, const DataTypePtr& target_type, IColumn* target) {
+void append_array(VariantRef value, const DataTypePtr& target_type, IColumn* target,
+                  JsonbScratch* scratch) {
     if (value_kind(value) != ValueKind::ARRAY) {
         throw Exception(ErrorCode::INVALID_ARGUMENT,
                         "Cannot append scalar Variant value to ARRAY path builder");
@@ -772,21 +806,23 @@ void append_array(VariantRef value, const DataTypePtr& target_type, IColumn* tar
     const DataTypePtr element_type = remove_nullable(array_type.get_nested_type());
     // infer_type() made the first borrowed pass. Revisit the encoded children only after path type
     // promotion is complete, appending directly without an owning recursive scratch tree.
-    const uint32_t count = value.num_elements();
+    const VariantRef::ArrayView values = value.array_view();
+    const uint32_t count = values.size();
     for (uint32_t index = 0; index < count; ++index) {
-        const VariantRef element = value.array_at(index);
+        const VariantRef element = values.value_at(index);
         if (element.is_null()) {
             elements.get_nested_column().insert_default();
             elements.get_null_map_data().push_back(1);
         } else {
-            append_value(element, element_type, &elements.get_nested_column());
+            append_value(element, element_type, &elements.get_nested_column(), scratch);
             elements.get_null_map_data().push_back(0);
         }
     }
     array.get_offsets().push_back(elements.size());
 }
 
-void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* target) {
+void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* target,
+                  JsonbScratch* scratch) {
     const ValueKind kind = value_kind(value);
     switch (target_type->get_primitive_type()) {
     case TYPE_BOOLEAN:
@@ -829,10 +865,10 @@ void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* tar
         return;
     }
     case TYPE_JSONB:
-        append_jsonb(value, &assert_cast<ColumnString&>(*target));
+        append_jsonb(value, &assert_cast<ColumnString&>(*target), scratch);
         return;
     case TYPE_ARRAY:
-        append_array(value, target_type, target);
+        append_array(value, target_type, target, scratch);
         return;
     case INVALID_TYPE:
         if (kind != ValueKind::NULL_VALUE) {
@@ -845,6 +881,39 @@ void append_value(VariantRef value, const DataTypePtr& target_type, IColumn* tar
         throw Exception(ErrorCode::INVALID_ARGUMENT,
                         "Variant path builder does not support target type {}",
                         target_type->get_name());
+    }
+}
+
+// Appends a value that stable_scalar_matches_type() accepted for target_primitive, writing the
+// same bytes append_value() writes for it while skipping its re-classification and virtual type
+// dispatch. Returns false, having appended nothing, for target types it leaves to append_value().
+// Accessors may throw before anything is appended; the caller then retries through the general
+// path so failure handling is unchanged.
+bool append_stable_scalar(VariantRef value, PrimitiveType target_primitive, IColumn* target,
+                          JsonbScratch* scratch) {
+    switch (target_primitive) {
+    case TYPE_STRING: {
+        const StringRef string = value.get_string();
+        static_cast<ColumnString*>(target)->insert_data(string.data, string.size);
+        return true;
+    }
+    case TYPE_BIGINT:
+        static_cast<ColumnInt64*>(target)->insert_value(value.get_int());
+        return true;
+    case TYPE_DOUBLE:
+        static_cast<ColumnFloat64*>(target)->insert_value(value.get_double());
+        return true;
+    case TYPE_FLOAT:
+        static_cast<ColumnFloat32*>(target)->insert_value(value.get_float());
+        return true;
+    case TYPE_BOOLEAN:
+        static_cast<ColumnUInt8*>(target)->insert_value(value.get_bool());
+        return true;
+    case TYPE_JSONB:
+        append_jsonb(value, static_cast<ColumnString*>(target), scratch);
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -993,14 +1062,25 @@ bool variant_path_type_contains_nothing(const DataTypePtr& type) {
 
 struct VariantPathBuilder::Impl {
     explicit Impl(PathInData path_, size_t prefix_rows_)
-            : path(path_), logical_rows(prefix_rows_) {}
+            : path(path_),
+              logical_rows(prefix_rows_),
+              fast_path(config::variant_v2_shredder_fast_path) {}
 
     Status initialize(const DataTypePtr& initial_type) {
         type = remove_nullable(initial_type);
         nullable_type = make_nullable(type);
         column = nullable_type->create_column();
         binary_serde.reset();
+        refresh_column_cache();
         return Status::OK();
+    }
+
+    // type and column change only in initialize() and promote(); both refresh these.
+    void refresh_column_cache() {
+        primitive = type->get_primitive_type();
+        auto& nullable = assert_cast<ColumnNullable&>(*column);
+        nested = &nullable.get_nested_column();
+        null_map = &nullable.get_null_map_data();
     }
 
     Status promote(const DataTypePtr& target_type, bool filter_cast_nulls) {
@@ -1058,6 +1138,7 @@ struct VariantPathBuilder::Impl {
         type = std::move(target);
         nullable_type = make_nullable(type);
         binary_serde.reset();
+        refresh_column_cache();
 #ifdef BE_TEST
         ++promotions;
 #endif
@@ -1069,8 +1150,13 @@ struct VariantPathBuilder::Impl {
     DataTypePtr nullable_type;
     DataTypeSerDeSPtr binary_serde;
     MutableColumnPtr column;
+    PrimitiveType primitive = INVALID_TYPE;
+    IColumn* nested = nullptr;
+    NullMap* null_map = nullptr;
+    JsonbScratch scratch;
     DorisVector<uint32_t> rowids;
     size_t logical_rows = 0;
+    const bool fast_path;
 #ifdef BE_TEST
     size_t promotions = 0;
 #endif
@@ -1103,7 +1189,26 @@ Status VariantPathBuilder::append(VariantRef value, size_t row) {
         _impl->logical_rows = row;
 
         const bool stable_scalar =
-                _impl->column && stable_scalar_matches_type(value, physical, _impl->type);
+                _impl->column &&
+                stable_scalar_matches_type(value, physical, _impl->type, _impl->primitive);
+        if (stable_scalar && _impl->fast_path) {
+            bool appended = false;
+            try {
+                appended = append_stable_scalar(value, _impl->primitive, _impl->nested,
+                                                &_impl->scratch);
+            } catch (const Exception&) {
+                // Nothing was appended; the general path below reproduces the original handling.
+            }
+            if (appended) {
+                _impl->null_map->push_back(0);
+                _impl->rowids.push_back(static_cast<uint32_t>(row));
+                _impl->logical_rows = row + 1;
+#if defined(BE_TEST) && !defined(BE_BENCHMARK)
+                ++_impl->stable_scalar_appends;
+#endif
+                return Status::OK();
+            }
+        }
         if (!stable_scalar) {
             if (!_impl->column) {
                 RETURN_IF_ERROR(_impl->initialize(infer_type(value)));
@@ -1126,7 +1231,7 @@ Status VariantPathBuilder::append(VariantRef value, size_t row) {
 
         try {
             auto& nullable = assert_cast<ColumnNullable&>(*_impl->column);
-            append_value(value, _impl->type, &nullable.get_nested_column());
+            append_value(value, _impl->type, &nullable.get_nested_column(), &_impl->scratch);
             nullable.get_null_map_data().push_back(0);
         } catch (const Exception&) {
             if (is_array || _impl->type->get_primitive_type() == TYPE_JSONB) {
@@ -1134,7 +1239,7 @@ Status VariantPathBuilder::append(VariantRef value, size_t row) {
             }
             RETURN_IF_ERROR(_impl->promote(jsonb_type(), false));
             auto& nullable = assert_cast<ColumnNullable&>(*_impl->column);
-            append_value(value, _impl->type, &nullable.get_nested_column());
+            append_value(value, _impl->type, &nullable.get_nested_column(), &_impl->scratch);
             nullable.get_null_map_data().push_back(0);
         }
         _impl->rowids.push_back(static_cast<uint32_t>(row));
@@ -1203,7 +1308,7 @@ size_t VariantPathBuilder::stable_scalar_append_count() const {
 
 size_t VariantPathBuilder::byte_size() const {
     return sizeof(Impl) + path_allocated_bytes(_impl->path) +
-           _impl->rowids.capacity() * sizeof(uint32_t) +
+           _impl->rowids.capacity() * sizeof(uint32_t) + _impl->scratch.allocated_bytes() +
            (_impl->column ? _impl->column->allocated_bytes() : 0);
 }
 

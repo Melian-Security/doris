@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/assert_cast.h"
 #include "core/column/column_map.h"
@@ -102,7 +103,8 @@ struct VariantShredder::Impl {
         size_t candidate_index = 0;
     };
 
-    explicit Impl(VariantShredderOptions options_) : options(std::move(options_)) {
+    explicit Impl(VariantShredderOptions options_)
+            : options(std::move(options_)), fast_path(config::variant_v2_shredder_fast_path) {
         paths.emplace_back(PathInData());
         if (options.physical_layout == VariantShredderPhysicalLayout::ORDINARY &&
             options.sparse_bucket_count == 0) {
@@ -229,6 +231,33 @@ struct VariantShredder::Impl {
             RETURN_IF_ERROR(visit(child, metadata_cache, child_path, row));
         }
         return Status::OK();
+    }
+
+    // Equivalent to visit() on an OBJECT value: the same children in the same order reach the
+    // same append_leaf() calls. Each nested object's header is decoded once, when its parent
+    // sizes it, instead of again by object_view(), and leaves skip visit()'s re-classification.
+    Status visit_object(const VariantRef::ObjectView& object, MetadataPathCache& metadata_cache,
+                        PathIndex path_index, size_t row) {
+        std::optional<VariantRef::ObjectView> child_object;
+        for (uint32_t index = 0; index < object.size(); ++index) {
+            uint32_t field = 0;
+            const VariantRef child = object.value_at(index, &field, &child_object);
+            const PathIndex child_path = resolve_child_path(metadata_cache, path_index, field);
+            RETURN_IF_ERROR(validate_doc_path(child_path));
+            if (child_object.has_value()) {
+                RETURN_IF_ERROR(visit_object(*child_object, metadata_cache, child_path, row));
+            } else if (!child.is_null() || options.check_duplicate_json_path) {
+                RETURN_IF_ERROR(append_leaf(child, child_path, row));
+            }
+        }
+        return Status::OK();
+    }
+
+    Status visit_root_object(VariantRef value, MetadataPathCache& metadata_cache, size_t row) {
+        if (fast_path) {
+            return visit_object(value.object_view(), metadata_cache, 0, row);
+        }
+        return visit(value, metadata_cache, 0, row);
     }
 
     Status complete_builder_rows(size_t completed_rows) {
@@ -644,6 +673,7 @@ struct VariantShredder::Impl {
     }
 
     VariantShredderOptions options;
+    const bool fast_path;
     State state = State::COLLECTING;
     Status failure;
     size_t rows = 0;
@@ -714,7 +744,8 @@ Status VariantShredder::append(const ColumnVariantV2::ReadView& view, size_t beg
                 return _impl->fail(std::move(status));
             }
             if (value.basic_type() == VariantBasicType::OBJECT) {
-                status = _impl->visit(value, metadata_caches[metadata_index], 0, _impl->rows);
+                status = _impl->visit_root_object(value, metadata_caches[metadata_index],
+                                                  _impl->rows);
                 if (!status.ok()) {
                     return _impl->fail(std::move(status));
                 }
