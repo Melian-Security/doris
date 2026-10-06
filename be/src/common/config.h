@@ -979,6 +979,13 @@ DECLARE_mInt32(max_tablet_version_num);
 
 DECLARE_mInt32(time_series_max_tablet_version_num);
 
+// Time-series cumulative compaction: merge an eligible run of consecutive empty rowsets
+// before considering data compaction. An empty-run merge reads no data and takes
+// milliseconds, while a data compaction holds the tablet for the time it takes to rewrite
+// its input, so under sustained ingest that leaves an empty rowset on most tablets per load
+// the tablet's rowset count otherwise grows at the load rate.
+DECLARE_mBool(time_series_compaction_prefer_empty_rowsets);
+
 // the max sleep time when meeting high pressure load task
 DECLARE_mInt64(max_load_back_pressure_version_wait_time_ms);
 // the threshold of rowset number gap that triggers back pressure

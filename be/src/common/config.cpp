@@ -918,6 +918,8 @@ DEFINE_mInt32(max_tablet_version_num, "2000");
 
 DEFINE_mInt32(time_series_max_tablet_version_num, "20000");
 
+DEFINE_mBool(time_series_compaction_prefer_empty_rowsets, "false");
+
 // the max sleep time when meeting high pressure load task
 DEFINE_mInt64(max_load_back_pressure_version_wait_time_ms, "3000");
 // the threshold of rowset number gap that triggers back pressure
