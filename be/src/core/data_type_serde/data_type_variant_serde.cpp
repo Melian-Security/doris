@@ -164,12 +164,20 @@ Status DataTypeVariantSerDe::read_column_from_arrow(IColumn& column,
     }
     ParseConfig parse_config;
     parse_config.check_duplicate_json_path = config::variant_enable_duplicate_json_path_check;
-    RETURN_IF_CATCH_EXCEPTION(RETURN_IF_ERROR(for_each_arrow_binary_value(
-            *arrow_array, start, end,
-            [&](StringRef json) {
-                variant_util::parse_json_to_variant(column, json, nullptr, parse_config);
-            },
-            [&] { column.insert_default(); })));
+    variant_util::JsonParser parser;
+    RETURN_IF_CATCH_EXCEPTION({
+        RETURN_IF_ERROR(for_each_arrow_binary_value(
+                *arrow_array, start, end,
+                [&](StringRef json) {
+                    variant_util::parse_json_to_variant(column, json, &parser, parse_config);
+                },
+                [&] { column.insert_default(); }));
+        // Row-by-row parsing leaves subcolumns short of the column's row count (pending
+        // defaults for paths a row lacks) until finalize. Nothing downstream of the Arrow
+        // reader finalizes, and the tablet sink's insert_indices_from reads every subcolumn
+        // at the selected row indices, so the column must leave here finalized.
+        column.finalize();
+    });
     return Status::OK();
 }
 
