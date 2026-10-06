@@ -1858,8 +1858,9 @@ TEST_F(CloudTabletVisibleVersionIndexTest, EmptyPendingRowsetUsesLatestRowsetAsT
     // (enable_hole_rowset_version_range, on by default).
     EXPECT_TRUE(_tablet->rowset_map().contains(Version(311, 312)));
     EXPECT_TRUE(_tablet->rowset_map().at(Version(311, 312))->is_hole_rowset());
-    EXPECT_EQ(_tablet->rowset_map().at(Version(311, 312))->rowset_meta()->tablet_schema(),
-              _tablet->rowset_map().at(Version(301, 310))->rowset_meta()->tablet_schema());
+    // RowsetMeta interns its schema through TabletSchemaCache, so compare schemas by value.
+    EXPECT_TRUE(*_tablet->rowset_map().at(Version(311, 312))->rowset_meta()->tablet_schema() ==
+                *_tablet->rowset_map().at(Version(301, 310))->rowset_meta()->tablet_schema());
     EXPECT_EQ(pending_rs_count(), 0);
     ASSERT_NO_FATAL_FAILURE(check_consistent(2));
 }

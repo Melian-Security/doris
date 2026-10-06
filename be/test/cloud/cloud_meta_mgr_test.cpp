@@ -867,6 +867,9 @@ TEST_F(CloudMetaMgrTest, test_fill_version_holes_after_compaction_merge) {
             rowsets.push_back(make_versioned_rowset(engine, *tablet, {v, v}));
         }
         rowsets.push_back(make_versioned_rowset(engine, *tablet, {9, 9}));
+        // make_versioned_rowset reads the tablet schema under the meta lock, so build the
+        // compaction output before taking the lock.
+        auto merged = make_versioned_rowset(engine, *tablet, {2, 6});
         std::unique_lock lock(tablet->get_header_lock());
         tablet->add_rowsets(rowsets, false, lock, false);
         // A cumulative compaction merges [2-6].
@@ -875,7 +878,7 @@ TEST_F(CloudMetaMgrTest, test_fill_version_holes_after_compaction_merge) {
             inputs.push_back(tablet->get_rowset_by_version({v, v}));
         }
         tablet->delete_rowsets(inputs, lock);
-        tablet->add_rowsets({make_versioned_rowset(engine, *tablet, {2, 6})}, false, lock, false);
+        tablet->add_rowsets({merged}, false, lock, false);
     }
 
     std::unique_lock wlock(tablet->get_header_lock());
@@ -906,10 +909,10 @@ TEST_F(CloudMetaMgrTest, test_fill_version_holes_schema_change_tablet_above_alte
     ASSERT_TRUE(tablet->set_tablet_state(TABLET_NOTREADY).ok());
     tablet->set_alter_version(5);
     {
+        std::vector<RowsetSharedPtr> rowsets {make_versioned_rowset(engine, *tablet, {0, 1}),
+                                              make_versioned_rowset(engine, *tablet, {8, 8})};
         std::unique_lock lock(tablet->get_header_lock());
-        tablet->add_rowsets({make_versioned_rowset(engine, *tablet, {0, 1}),
-                             make_versioned_rowset(engine, *tablet, {8, 8})},
-                            false, lock, false);
+        tablet->add_rowsets(rowsets, false, lock, false);
     }
 
     std::unique_lock wlock(tablet->get_header_lock());

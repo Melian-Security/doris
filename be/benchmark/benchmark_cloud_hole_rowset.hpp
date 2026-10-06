@@ -80,7 +80,8 @@ public:
         _schema->init_from_pb(schema_pb);
 
         auto tablet_meta = std::make_shared<TabletMeta>(
-                1, 2, 15673, 15674, 4, 5, TTabletSchema(), 6, {{7, 8}}, UniqueId(9, 10),
+                1, 2, 15673, 15674, 4, 5, TTabletSchema(), 6,
+                std::unordered_map<uint32_t, uint32_t> {{7, 8}}, UniqueId(9, 10),
                 TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F);
         tablet_meta->set_tablet_state(TABLET_RUNNING);
         _tablet = std::make_shared<CloudTablet>(_engine, tablet_meta);
