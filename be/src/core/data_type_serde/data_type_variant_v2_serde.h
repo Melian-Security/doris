@@ -21,6 +21,25 @@
 
 namespace doris {
 
+// While alive, DataTypeVariantV2SerDe::deserialize on this thread treats encoded Variant payloads
+// as bytes that a peer Doris BE built and validated before sending them. It keeps the structural
+// checks (row counts, string offsets, metadata ids, metadata dictionaries, root payload framing)
+// and skips only the recursive per-row payload walk. Open it on a pthread, and only around
+// Block::deserialize of an internal BE-to-BE RPC. Files, WAL, spill, external formats and user
+// input must decode without it so that they keep the full validation.
+class TrustedPeerVariantBlockScope {
+public:
+    explicit TrustedPeerVariantBlockScope(bool trusted) noexcept;
+    ~TrustedPeerVariantBlockScope();
+    TrustedPeerVariantBlockScope(const TrustedPeerVariantBlockScope&) = delete;
+    TrustedPeerVariantBlockScope& operator=(const TrustedPeerVariantBlockScope&) = delete;
+
+    static bool active() noexcept;
+
+private:
+    bool _previous;
+};
+
 // Direct SerDe used when the logical Variant type carries a ColumnVariantV2 physical column.
 class DataTypeVariantV2SerDe final : public DataTypeSerDe {
 public:

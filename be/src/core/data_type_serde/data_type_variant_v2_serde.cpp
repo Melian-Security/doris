@@ -366,7 +366,22 @@ Status write_arrow_variant_storage(const IColumn& column, const NullMap* null_ma
     return status;
 }
 
+thread_local bool trusted_peer_variant_block = false;
+
 } // namespace
+
+TrustedPeerVariantBlockScope::TrustedPeerVariantBlockScope(bool trusted) noexcept
+        : _previous(trusted_peer_variant_block) {
+    trusted_peer_variant_block = trusted;
+}
+
+TrustedPeerVariantBlockScope::~TrustedPeerVariantBlockScope() {
+    trusted_peer_variant_block = _previous;
+}
+
+bool TrustedPeerVariantBlockScope::active() noexcept {
+    return trusted_peer_variant_block;
+}
 
 DataTypeVariantV2SerDe::DataTypeVariantV2SerDe(int nesting_level) : DataTypeSerDe(nesting_level) {}
 
@@ -445,7 +460,7 @@ const char* DataTypeVariantV2SerDe::deserialize(const char* buf, MutableColumnPt
         static_cast<IColumn::Ptr&>(decoded->_metadatas) = std::move(metadatas);
         static_cast<IColumn::Ptr&>(decoded->_meta_ids) = std::move(meta_ids);
         static_cast<IColumn::Ptr&>(decoded->_values) = std::move(values);
-        decoded->sanity_check();
+        decoded->_sanity_check(!TrustedPeerVariantBlockScope::active());
     }
     if (decoded->size() != saved_rows) {
         throw Exception(Status::Corruption(
