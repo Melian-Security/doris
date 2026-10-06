@@ -41,6 +41,7 @@
 
 namespace doris {
 
+class Block;
 class PTabletWriterCancelRequest;
 class PTabletWriterOpenRequest;
 class Thread;
@@ -56,8 +57,17 @@ public:
     // open a new load channel if not exist
     Status open(const PTabletWriterOpenRequest& request);
 
+    // `local_block` carries the rows when a tablet sink on this BE hands them over in-process;
+    // the request then has no serialized block.
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response);
+                     PTabletWriterAddBlockResult* response, const Block* local_block = nullptr);
+
+    // In-process counterpart of PInternalService::tablet_writer_add_block for a sender on this
+    // BE: runs add_batch on the calling thread and fills the result exactly as the RPC handler
+    // does, including the status and execution time. `block` is only read, and only for the
+    // duration of the call.
+    void add_batch_local(const PTabletWriterAddBlockRequest& request, const Block& block,
+                         PTabletWriterAddBlockResult* response);
 
     // cancel all tablet stream for 'load_id' load
     Status cancel(const PTabletWriterCancelRequest& request);

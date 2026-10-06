@@ -42,7 +42,8 @@ std::unique_ptr<BaseDeltaWriter> CloudTabletsChannel::create_delta_writer(
 }
 
 Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& request,
-                                      PTabletWriterAddBlockResult* response) {
+                                      PTabletWriterAddBlockResult* response,
+                                      const Block* local_block) {
     // FIXME(plat1ko): Too many duplicate code with `TabletsChannel`
     SCOPED_TIMER(_add_batch_timer);
     int64_t cur_seq = 0;
@@ -75,7 +76,7 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
             }
         }
         return _write_block_data_for_adaptive_random_bucket(request, cur_seq, partition_to_rowidxs,
-                                                            response);
+                                                            response, local_block);
     }
 
     std::unordered_map<int64_t, DorisVector<uint32_t>> tablet_to_rowidxs;
@@ -102,7 +103,7 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
         }
     }
 
-    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response);
+    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response, local_block);
 }
 
 Status CloudTabletsChannel::_prepare_adaptive_random_bucket_writer(BaseDeltaWriter* writer) {

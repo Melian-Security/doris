@@ -47,6 +47,7 @@ class RepeatedPtrField;
 } // namespace google::protobuf
 
 namespace doris {
+class Block;
 class PSlaveTabletNodes;
 class PSuccessSlaveTabletNodeIds;
 class PTabletError;
@@ -97,9 +98,11 @@ public:
 
     virtual std::unique_ptr<BaseDeltaWriter> create_delta_writer(const WriteRequest& request) = 0;
 
-    // no-op when this channel has been closed or cancelled
+    // no-op when this channel has been closed or cancelled.
+    // `local_block` is non-null when a tablet sink on this BE handed the rows over in-process;
+    // the request then carries no serialized block and only describes the rows.
     virtual Status add_batch(const PTabletWriterAddBlockRequest& request,
-                             PTabletWriterAddBlockResult* response) = 0;
+                             PTabletWriterAddBlockResult* response, const Block* local_block) = 0;
 
     // Mark sender with 'sender_id' as closed.
     // If all senders are closed, close this channel, set '*finished' to true, update 'tablet_vec'
@@ -122,15 +125,22 @@ public:
 
     bool is_finished() const { return _state == kFinished; }
 
+    // Picks the rows of an add-block request: `local_block` when it is set, otherwise the
+    // request's serialized block deserialized into `deserialized`. A request carrying both is
+    // rejected, since the two sources could disagree.
+    static Status resolve_send_block(const PTabletWriterAddBlockRequest& request,
+                                     const Block* local_block, Block* deserialized,
+                                     const Block** send_data);
+
 protected:
     Status _init_adaptive_random_bucket_state(const PTabletWriterOpenRequest& request);
     Status _write_block_data(const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
                              std::unordered_map<int64_t, DorisVector<uint32_t>>& tablet_to_rowidxs,
-                             PTabletWriterAddBlockResult* response);
+                             PTabletWriterAddBlockResult* response, const Block* local_block);
     Status _write_block_data_for_adaptive_random_bucket(
             const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
             std::unordered_map<int64_t, DorisVector<uint32_t>>& partition_to_rowidxs,
-            PTabletWriterAddBlockResult* response);
+            PTabletWriterAddBlockResult* response, const Block* local_block);
     virtual Status _prepare_adaptive_random_bucket_writer(BaseDeltaWriter* writer);
     Status _build_partition_to_rowidxs_for_adaptive_random_bucket(
             const PTabletWriterAddBlockRequest& request,
@@ -237,7 +247,7 @@ public:
     std::unique_ptr<BaseDeltaWriter> create_delta_writer(const WriteRequest& request) override;
 
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response) override;
+                     PTabletWriterAddBlockResult* response, const Block* local_block) override;
 
     Status close(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
                  PTabletWriterAddBlockResult* res, bool* finished) override;

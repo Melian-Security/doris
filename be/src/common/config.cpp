@@ -880,6 +880,8 @@ DEFINE_mBool(brpc_usercode_in_pthread, "false");
 // is greater than 1.8G. This is to avoid the error of Request length overflow (2G).
 DEFINE_mBool(transfer_large_data_by_brpc, "true");
 
+DEFINE_mBool(enable_local_tablet_writer_shortcut, "true");
+
 // max number of txns for every txn_partition_map in txn manager
 // this is a self protection to avoid too many txns saving in manager
 DEFINE_mInt64(max_runnings_transactions_per_txn_map, "2000");
