@@ -138,7 +138,15 @@ TEST(LocalTabletWriterShortcutTest, LocalBlockMatchesTheSerializedRoundTrip) {
                 << local_data->get_by_position(i).name;
         EXPECT_EQ(local_data->get_by_position(i).name, remote_data->get_by_position(i).name);
     }
-    EXPECT_EQ(local_data->dump_data(0, kRows), remote_data->dump_data(0, kRows));
+    // A deserialized Variant type renders its properties in its name, so dump both blocks under
+    // the local types and compare the values only.
+    Block remote_as_local;
+    for (size_t i = 0; i < remote_data->columns(); ++i) {
+        remote_as_local.insert({remote_data->get_by_position(i).column,
+                                local_data->get_by_position(i).type,
+                                remote_data->get_by_position(i).name});
+    }
+    EXPECT_EQ(local_data->dump_data(0, kRows), remote_as_local.dump_data(0, kRows));
 }
 
 PTabletWriterAddBlockRequest make_add_block_request() {
