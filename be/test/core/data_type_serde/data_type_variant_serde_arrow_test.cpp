@@ -22,8 +22,11 @@
 #include <cctz/time_zone.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -211,6 +214,82 @@ TEST(DataTypeVariantSerdeArrowTest, ArrowWriteThenReadRoundTrips) {
     ASSERT_EQ(column->size(), source->size());
     for (size_t row = 0; row < source->size(); ++row) {
         EXPECT_EQ(json_at(serde, *column, row), json_at(serde, *source, row));
+    }
+}
+
+// The tablet sink distributes a loaded block across tablets with insert_indices_from on the
+// nullable Variant column, so a multi-batch Arrow read must leave a column every row of which
+// can be selected in any order. The documents vary their paths and value types row by row.
+TEST(DataTypeVariantSerdeArrowTest, MultiBatchArrowReadSurvivesSinkRowSelection) {
+    DataTypeVariantSerDe serde;
+    DataTypeNullableSerDe nullable_serde(std::make_shared<DataTypeVariantSerDe>());
+    constexpr size_t num_rows = 10000;
+    constexpr size_t batch_rows = 4096;
+    std::vector<std::optional<std::string>> documents;
+    documents.reserve(num_rows);
+    for (size_t i = 0; i < num_rows; ++i) {
+        if (i % 11 == 0) {
+            documents.emplace_back(std::nullopt);
+            continue;
+        }
+        std::string doc = "{";
+        doc += i % 7 == 0 ? "\"a\":\"text_" + std::to_string(i) + "\""
+                          : "\"a\":" + std::to_string(i);
+        if (i % 3 == 0) {
+            doc += ",\"s\":\"" + std::string(i % 50, 'x') + "\"";
+        }
+        if (i % 5 == 0) {
+            doc += ",\"n\":{\"x\":" + std::to_string(i) + ",\"y\":\"v" + std::to_string(i) + "\"}";
+        }
+        if (i > 8000) {
+            doc += ",\"late\":true";
+        }
+        doc += "}";
+        documents.emplace_back(std::move(doc));
+    }
+
+    MutableColumnPtr nested = ColumnVariant::create(0, false);
+    auto outer = ColumnNullable::create(std::move(nested), ColumnUInt8::create());
+    for (size_t begin = 0; begin < num_rows; begin += batch_rows) {
+        const size_t end = std::min(num_rows, begin + batch_rows);
+        std::vector<std::optional<std::string>> batch(documents.begin() + begin,
+                                                      documents.begin() + end);
+        auto array = make_arrow_strings(arrow::utf8(), batch);
+        ASSERT_TRUE(nullable_serde
+                            .read_column_from_arrow(*outer, array.get(), 0, end - begin,
+                                                    cctz::utc_time_zone())
+                            .ok());
+    }
+    ASSERT_EQ(outer->size(), num_rows);
+    ASSERT_EQ(outer->get_nested_column().size(), num_rows);
+
+    std::vector<std::string> present;
+    for (const auto& document : documents) {
+        present.push_back(document.value_or("{}"));
+    }
+    auto reference = load_through_json(serde, present);
+    reference->finalize();
+    std::vector<std::string> expected(num_rows);
+    for (size_t row = 0; row < num_rows; ++row) {
+        if (documents[row].has_value()) {
+            expected[row] = json_at(serde, *reference, row);
+        }
+    }
+
+    std::vector<uint32_t> selector(num_rows);
+    std::iota(selector.begin(), selector.end(), 0);
+    std::mt19937 rng(42);
+    std::shuffle(selector.begin(), selector.end(), rng);
+    auto target = outer->clone_empty();
+    target->insert_indices_from(*outer, selector.data(), selector.data() + selector.size());
+    ASSERT_EQ(target->size(), num_rows);
+    const auto& target_nullable = assert_cast<const ColumnNullable&>(*target);
+    for (size_t k = 0; k < num_rows; ++k) {
+        const size_t row = selector[k];
+        ASSERT_EQ(target_nullable.is_null_at(k), !documents[row].has_value()) << row;
+        if (documents[row].has_value()) {
+            ASSERT_EQ(json_at(serde, target_nullable.get_nested_column(), k), expected[row]) << row;
+        }
     }
 }
 
