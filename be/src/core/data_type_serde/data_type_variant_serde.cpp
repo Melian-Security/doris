@@ -164,7 +164,7 @@ Status DataTypeVariantSerDe::read_column_from_arrow(IColumn& column,
     }
     ParseConfig parse_config;
     parse_config.check_duplicate_json_path = config::variant_enable_duplicate_json_path_check;
-    variant_util::JsonParser parser;
+    JsonParser parser;
     RETURN_IF_CATCH_EXCEPTION({
         RETURN_IF_ERROR(for_each_arrow_binary_value(
                 *arrow_array, start, end,
