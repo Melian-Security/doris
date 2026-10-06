@@ -25,6 +25,7 @@
 #include <limits>
 #include <memory>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1451,6 +1452,148 @@ TEST(VariantBatchBuilderTest, PreviousObjectSchemaCacheAllowsSameSchemaAtShifted
     EXPECT_EQ(counters.object_schema_fallbacks, 2);
     EXPECT_EQ(counters.object_plan_reuses, 1);
     EXPECT_EQ(counters.object_plan_fallbacks, 2);
+}
+
+struct EncodedBatchBytes {
+    std::string metadata;
+    std::string values;
+    std::vector<uint32_t> offsets;
+
+    bool operator==(const EncodedBatchBytes&) const = default;
+};
+
+EncodedBatchBytes encoded_batch_bytes(const VariantBatchBuilder& block) {
+    const VariantMetadataRef metadata = block.metadata_ref();
+    const StringRef values = block.value_bytes();
+    const std::span<const uint32_t> offsets = block.value_offsets();
+    return {.metadata = std::string(metadata.data, metadata.size),
+            .values = std::string(values.data, values.size),
+            .offsets = {offsets.begin(), offsets.end()}};
+}
+
+TEST(VariantBatchBuilderTest, ValidUtf8StringMatchesCheckedStringEncoding) {
+    std::vector<std::string> strings;
+    for (size_t size : {0, 1, 2, 3, 4, 5, 62, 63, 64, 65, 255, 256, 70000}) {
+        std::string value;
+        for (size_t index = 0; index < size; ++index) {
+            value.push_back(static_cast<char>('a' + index % 26));
+        }
+        strings.push_back(std::move(value));
+    }
+    strings.emplace_back("\xC3\xA9");
+    strings.emplace_back("\xF0\x9F\x98\x80 \xE6\x97\xA5\xE6\x9C\xAC");
+
+    const auto encode = [&strings](bool trusted) {
+        VariantBatchBuilder builder;
+        for (const std::string& value : strings) {
+            auto row = builder.begin_row();
+            if (trusted) {
+                row.add_valid_utf8_string(StringRef(value));
+            } else {
+                row.add_string(StringRef(value));
+            }
+            row.finish();
+        }
+        auto row = builder.begin_row();
+        auto array = row.start_array();
+        for (const std::string& value : strings) {
+            if (trusted) {
+                row.add_valid_utf8_string(StringRef(value));
+            } else {
+                row.add_string(StringRef(value));
+            }
+        }
+        array.finish();
+        row.finish();
+        return encoded_batch_bytes(builder.finish_batch());
+    };
+    EXPECT_EQ(encode(true), encode(false));
+
+    VariantBatchBuilder builder;
+    auto row = builder.begin_row();
+    expect_builder_exception_code(ErrorCode::INVALID_ARGUMENT, [&] {
+        row.add_valid_utf8_string({static_cast<const char*>(nullptr), 1});
+    });
+}
+
+// An optional member ahead of other objects shifts their pre-order ordinals. Path-aligned hints
+// follow the matching key instead, so the shifted objects stay schema hits, and both modes encode
+// the same batch.
+// NOLINTNEXTLINE(readability-function-cognitive-complexity): GTest macros inflate the mode matrix.
+TEST(VariantBatchBuilderTest, PathAlignedObjectHintsSurviveShiftedOrdinals) {
+    const auto encode = [](bool path_aligned, VariantBatchBuilder::TestCounters* counters) {
+        VariantBatchBuilder builder(
+                VariantBatchBuilder::ReserveHint {},
+                VariantBatchBuilder::Options {.path_aligned_object_hints = path_aligned});
+        const auto add_row = [&builder](bool with_optional) {
+            auto row = builder.begin_row();
+            auto root = row.start_object();
+            if (with_optional) {
+                root.add_key(string_ref("opt"));
+                auto optional = row.start_object();
+                optional.add_key(string_ref("z"));
+                row.add_int(0);
+                optional.finish();
+            }
+            root.add_key(string_ref("a"));
+            {
+                auto a = row.start_object();
+                a.add_key(string_ref("x"));
+                row.add_int(1);
+                a.finish();
+            }
+            root.add_key(string_ref("b"));
+            {
+                auto b = row.start_object();
+                b.add_key(string_ref("y"));
+                row.add_string(string_ref("two"));
+                b.finish();
+            }
+            root.finish();
+            row.finish();
+        };
+        add_row(false);
+        add_row(true);
+        add_row(false);
+        add_row(true);
+        // A failed row must not become a hint source.
+        {
+            auto row = builder.begin_row();
+            auto root = row.start_object();
+            root.add_key(string_ref("a"));
+            auto a = row.start_object();
+            a.add_key(string_ref("x"));
+            row.add_int(1);
+            a.add_key(string_ref("x"));
+            row.add_int(2);
+            expect_builder_exception_code(ErrorCode::INVALID_ARGUMENT, [&] { a.finish(); });
+            row.abort();
+        }
+        {
+            auto row = builder.begin_row();
+            row.add_null();
+            row.finish();
+        }
+        add_row(false);
+        VariantBatchBuilder block = builder.finish_batch();
+        std::vector<VariantRef> rows;
+        for (size_t index = 0; index < block.num_rows(); ++index) {
+            rows.push_back(block.value_at(index));
+        }
+        validate_canonical(block.metadata_ref(), rows);
+        *counters = builder.test_counters();
+        return encoded_batch_bytes(block);
+    };
+
+    VariantBatchBuilder::TestCounters ordinal {};
+    VariantBatchBuilder::TestCounters path_aligned {};
+    EXPECT_EQ(encode(false, &ordinal), encode(true, &path_aligned));
+    EXPECT_EQ(ordinal.object_schema_hits + ordinal.object_schema_fallbacks,
+              path_aligned.object_schema_hits + path_aligned.object_schema_fallbacks);
+    EXPECT_EQ(path_aligned.object_schema_hits, 8);
+    EXPECT_EQ(path_aligned.object_schema_fallbacks, 9);
+    EXPECT_EQ(path_aligned.object_plan_reuses, path_aligned.object_schema_hits);
+    EXPECT_LT(ordinal.object_schema_hits, path_aligned.object_schema_hits);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity): GTest macros inflate the boundary matrix.

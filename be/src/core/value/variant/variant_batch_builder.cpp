@@ -44,6 +44,8 @@ constexpr uint64_t FINISHED_ROW_GENERATION = std::numeric_limits<uint64_t>::max(
 constexpr uint64_t ABORTED_ROW_GENERATION = FINISHED_ROW_GENERATION - 1;
 constexpr size_t INLINE_SCALAR_CAPACITY = sizeof(uint32_t);
 constexpr size_t SMALL_OBJECT_SORT_THRESHOLD = 16;
+// Keys a path-aligned object hint scans past before treating the current key as an insertion.
+constexpr uint32_t PATH_HINT_KEY_LOOKAHEAD = 4;
 
 template <typename Container, typename Less>
 void sort_object_entries(Container& entries, size_t begin, size_t count, Less less) {
@@ -393,6 +395,10 @@ public:
         uint32_t pending_field_id = 0;
         uint32_t previous_or_source_token = INVALID_INDEX;
         uint32_t previous_child_cursor = INVALID_INDEX;
+        // Path-aligned mode only: the finished container this one is aligned with, and the hint
+        // child matched by the pending key. Both always point at earlier containers and children.
+        uint32_t hint_token = INVALID_INDEX;
+        uint32_t matched_hint_child = INVALID_INDEX;
         bool has_pending_field = false;
     };
 
@@ -495,6 +501,13 @@ public:
     }
 
     void publish_object_links() noexcept {
+        if (path_aligned_hints) {
+            DCHECK_NE(root_node, INVALID_INDEX);
+            const Node& root = nodes[root_node];
+            if (root.kind == NodeKind::OBJECT || root.kind == NodeKind::ARRAY) {
+                previous_root_container = root.payload_index;
+            }
+        }
         if (pending_object_tokens == nullptr) {
             return;
         }
@@ -580,6 +593,46 @@ public:
     void add_bool(bool value) { add_scalar(VariantScalarRef::boolean(value)); }
 
     void add_int(int64_t value) { add_scalar(VariantScalarRef::integer(value)); }
+
+    // Writes the bytes add_scalar(VariantScalarRef::string(value)) writes, without the UTF-8 scan
+    // and the scalar view round trip. The caller guarantees value is valid UTF-8.
+    void add_valid_utf8_string(StringRef value) {
+        validate_string_ref(value, "string");
+        if (value.size > std::numeric_limits<uint32_t>::max()) {
+            throw Exception(ErrorCode::INVALID_ARGUMENT,
+                            "Variant string exceeds the uint32 byte limit");
+        }
+        if (value.size <= VARIANT_MAX_SHORT_STRING_SIZE) {
+            const auto header =
+                    static_cast<char>((value.size << VARIANT_VALUE_HEADER_SHIFT) |
+                                      static_cast<uint8_t>(VariantBasicType::SHORT_STRING));
+            const size_t encoded_size = 1 + value.size;
+            if (encoded_size <= INLINE_SCALAR_CAPACITY) {
+                std::array<char, INLINE_SCALAR_CAPACITY> inline_bytes {};
+                inline_bytes[0] = header;
+                if (value.size != 0) {
+                    std::memcpy(inline_bytes.data() + 1, value.data, value.size);
+                }
+                add_inline_scalar(inline_bytes, encoded_size);
+                return;
+            }
+            const uint32_t offset = prepare_arena_scalar(encoded_size);
+            scalar_bytes.push_back(header);
+            scalar_bytes.insert(scalar_bytes.end(), value.data, value.data + value.size);
+            complete_scalar(offset);
+            return;
+        }
+
+        std::array<char, 1 + sizeof(uint32_t)> header {};
+        char* header_output = header.data();
+        *header_output++ = static_cast<char>(static_cast<uint8_t>(VariantPrimitiveId::STRING)
+                                             << VARIANT_VALUE_HEADER_SHIFT);
+        write_unsigned(header_output, value.size, sizeof(uint32_t));
+        const uint32_t offset = prepare_arena_scalar(header.size() + value.size);
+        scalar_bytes.insert(scalar_bytes.end(), header.begin(), header.end());
+        scalar_bytes.insert(scalar_bytes.end(), value.data, value.data + value.size);
+        complete_scalar(offset);
+    }
 
     void add_value(VariantRef value) {
         ensure_can_add_value();
@@ -838,7 +891,14 @@ public:
         const auto token = static_cast<uint32_t>(containers.size());
         uint32_t previous_token = INVALID_INDEX;
         uint32_t previous_child_cursor = INVALID_INDEX;
-        if (kind == NodeKind::OBJECT && pending_object_tokens != nullptr) {
+        uint32_t hint_token = INVALID_INDEX;
+        if (path_aligned_hints) {
+            hint_token = path_aligned_hint(kind);
+            if (kind == NodeKind::OBJECT && hint_token != INVALID_INDEX) {
+                previous_token = hint_token;
+                previous_child_cursor = containers[hint_token].first_child;
+            }
+        } else if (kind == NodeKind::OBJECT && pending_object_tokens != nullptr) {
             DCHECK(previous_object_tokens != nullptr);
             const size_t object_ordinal = pending_object_tokens->size();
             if (object_ordinal < previous_object_tokens->size()) {
@@ -864,6 +924,7 @@ public:
             containers.emplace_back(kind);
             containers.back().previous_or_source_token = previous_token;
             containers.back().previous_child_cursor = previous_child_cursor;
+            containers.back().hint_token = hint_token;
             const auto node_index = static_cast<uint32_t>(nodes.size());
             nodes.emplace_back(kind, token, 0);
             attach_node(node_index);
@@ -875,7 +936,7 @@ public:
                 DCHECK_EQ(pending_object_tokens->back(), token);
                 pending_object_tokens->pop_back();
             }
-            if (pending_object_tokens != nullptr) {
+            if (pending_object_tokens != nullptr || path_aligned_hints) {
                 // The active block row owns rollback; keep the state aborted so it releases its
                 // metadata references before the next row begins.
                 state = State::ABORTED;
@@ -883,6 +944,37 @@ public:
             throw;
         }
         return token;
+    }
+
+    // The finished container of the same kind at this container's path: for a root, the last
+    // container root; under an object, the value of the hint child its pending key matched; in an
+    // array, the previous element, or the first element of the array's own hint. Pass 2 plans each
+    // of these before the new container (earlier rows first, array elements in order), which is
+    // what object plan reuse requires of its source.
+    uint32_t path_aligned_hint(NodeKind kind) const noexcept {
+        uint32_t hint_node = INVALID_INDEX;
+        if (active_container == INVALID_INDEX) {
+            if (previous_root_container != INVALID_INDEX &&
+                containers[previous_root_container].kind == kind) {
+                return previous_root_container;
+            }
+            return INVALID_INDEX;
+        }
+        const Container& parent = containers[active_container];
+        if (parent.kind == NodeKind::OBJECT) {
+            if (parent.matched_hint_child != INVALID_INDEX) {
+                hint_node = children[parent.matched_hint_child].node_index;
+            }
+        } else if (parent.last_child != INVALID_INDEX) {
+            hint_node = children[parent.last_child].node_index;
+        } else if (parent.hint_token != INVALID_INDEX &&
+                   containers[parent.hint_token].first_child != INVALID_INDEX) {
+            hint_node = children[containers[parent.hint_token].first_child].node_index;
+        }
+        if (hint_node == INVALID_INDEX || nodes[hint_node].kind != kind) {
+            return INVALID_INDEX;
+        }
+        return nodes[hint_node].payload_index;
     }
 
     void ensure_can_add_key(uint32_t token) const {
@@ -906,9 +998,45 @@ public:
         object.has_pending_field = true;
     }
 
+    // Looks the key up among the next few keys of the hint object. A match reuses its temporary
+    // id, which is the id register_key() returns for the same bytes. The object stays an exact
+    // schema hit only while every key matches the very next hint key.
+    void add_key_with_path_hint(uint32_t token, StringRef key) {
+        uint32_t cursor = containers[token].previous_child_cursor;
+        uint32_t matched = INVALID_INDEX;
+        uint32_t distance = 0;
+        for (; distance < PATH_HINT_KEY_LOOKAHEAD && cursor != INVALID_INDEX; ++distance) {
+            const Child& candidate = children[cursor];
+            const StringRef candidate_key = metadata._temporary_key(candidate.temporary_field_id);
+            if (candidate_key.size == key.size &&
+                (key.size == 0 || std::memcmp(candidate_key.data, key.data, key.size) == 0)) {
+                matched = cursor;
+                break;
+            }
+            cursor = candidate.next;
+        }
+        const uint32_t temporary_id = matched != INVALID_INDEX
+                                              ? children[matched].temporary_field_id
+                                              : metadata.register_key(key);
+
+        commit_key(token, temporary_id);
+        Container& object = containers[token];
+        object.matched_hint_child = matched;
+        if (matched != INVALID_INDEX) {
+            object.previous_child_cursor = children[matched].next;
+        }
+        if (matched == INVALID_INDEX || distance != 0) {
+            object.previous_or_source_token = INVALID_INDEX;
+        }
+    }
+
     void add_key(uint32_t token, StringRef key) {
         ensure_can_add_key(token);
         validate_string_ref(key, "metadata key");
+        if (path_aligned_hints) {
+            add_key_with_path_hint(token, key);
+            return;
+        }
         Container& object = containers[token];
 
         bool key_hit = false;
@@ -1247,6 +1375,7 @@ public:
         release_batch_container(planned_object_children);
         previous_object_tokens = nullptr;
         pending_object_tokens = nullptr;
+        previous_root_container = INVALID_INDEX;
         active_container = INVALID_INDEX;
         root_node = INVALID_INDEX;
     }
@@ -1271,6 +1400,10 @@ public:
 #endif
     uint32_t active_container = INVALID_INDEX;
     uint32_t root_node = INVALID_INDEX;
+    // Path-aligned mode only: the root container of the last finished row that had one. Scalar
+    // rows (SQL NULL arrives as JSON null) keep it, and rollback never removes it.
+    uint32_t previous_root_container = INVALID_INDEX;
+    bool path_aligned_hints = false;
     State state = State::COLLECTING;
 };
 
@@ -1354,6 +1487,7 @@ struct VariantBatchBuilder::Impl {
     VariantCollectionCore::Checkpoint row_start {};
     uint64_t current_generation = 0;
     uint64_t active_generation = 0;
+    bool path_aligned_object_hints = false;
     bool row_active = false;
     bool terminal = false;
 #ifdef BE_TEST
@@ -1363,7 +1497,13 @@ struct VariantBatchBuilder::Impl {
 
 VariantBatchBuilder::VariantBatchBuilder() : VariantBatchBuilder(ReserveHint {}) {}
 
-VariantBatchBuilder::VariantBatchBuilder(ReserveHint hint) : _impl(std::make_unique<Impl>()) {
+VariantBatchBuilder::VariantBatchBuilder(ReserveHint hint)
+        : VariantBatchBuilder(hint, Options {}) {}
+
+VariantBatchBuilder::VariantBatchBuilder(ReserveHint hint, Options options)
+        : _impl(std::make_unique<Impl>()) {
+    _impl->path_aligned_object_hints = options.path_aligned_object_hints;
+    _impl->collection.path_aligned_hints = options.path_aligned_object_hints;
     _impl->metadata._reserve_keys(hint.metadata_keys);
     _impl->reserve(hint);
 #ifdef BE_TEST
@@ -1435,6 +1575,11 @@ void VariantBatchBuilder::_add_bool(uint64_t generation, bool value) {
 void VariantBatchBuilder::_add_int(uint64_t generation, int64_t value) {
     _impl->ensure_active(generation);
     _impl->collection.add_int(value);
+}
+
+void VariantBatchBuilder::_add_valid_utf8_string(uint64_t generation, StringRef value) {
+    _impl->ensure_active(generation);
+    _impl->collection.add_valid_utf8_string(value);
 }
 
 void VariantBatchBuilder::_add_value(uint64_t generation, VariantRef value) {
@@ -1517,8 +1662,12 @@ VariantBatchBuilder::Row VariantBatchBuilder::begin_row() {
 #ifdef BE_TEST
     _impl->row_capacity_start = _impl->collection.capacity_snapshot();
 #endif
-    _impl->collection.begin_collection(&_impl->previous_object_tokens,
-                                       &_impl->pending_object_tokens);
+    if (_impl->path_aligned_object_hints) {
+        _impl->collection.begin_collection();
+    } else {
+        _impl->collection.begin_collection(&_impl->previous_object_tokens,
+                                           &_impl->pending_object_tokens);
+    }
     _impl->row_start = _impl->collection.checkpoint();
     _impl->metadata._begin_row();
     _impl->active_generation = _impl->current_generation;
@@ -1710,6 +1859,13 @@ void VariantBatchBuilder::Row::add_binary(StringRef value) {
 
 void VariantBatchBuilder::Row::add_string(StringRef value) {
     _add_scalar(VariantScalarRef::string(value));
+}
+
+void VariantBatchBuilder::Row::add_valid_utf8_string(StringRef value) {
+    if (_builder == nullptr) {
+        throw Exception(ErrorCode::INVALID_ARGUMENT, "Variant block row handle is moved-from");
+    }
+    _builder->_add_valid_utf8_string(_generation, value);
 }
 
 void VariantBatchBuilder::Row::add_uuid(const std::array<uint8_t, 16>& value) {

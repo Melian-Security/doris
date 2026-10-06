@@ -43,6 +43,9 @@ struct JsonToVariantOptions {
     uint32_t max_json_key_length = 255;
     bool throw_on_invalid_json = false;
     bool check_duplicate_json_path = false;
+    // Encode parser-validated strings without a second UTF-8 scan and align object key hints by
+    // path instead of by pre-order ordinal. The encoded batch is identical either way.
+    bool fast_path = true;
 
     // Takes a value snapshot. Later changes to mutable config do not affect an encoder.
     static JsonToVariantOptions current_config();

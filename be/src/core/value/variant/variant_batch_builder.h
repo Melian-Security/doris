@@ -87,6 +87,16 @@ public:
         size_t children = 0;
     };
 
+    struct Options {
+        // Seed each object's key and schema hints from the container at the same path in the
+        // previous row (or from the previous element of the same array) instead of from the object
+        // with the same pre-order ordinal in the previous row. A hint only short-circuits key
+        // lookups and the duplicate-key check, so the encoded batch is identical either way;
+        // path alignment keeps hitting when optional members or variable-length arrays shift the
+        // ordinals of the remaining objects.
+        bool path_aligned_object_hints = false;
+    };
+
 #ifdef BE_TEST
     struct TestCounters {
         size_t metadata_capacity_growths = 0;
@@ -188,6 +198,9 @@ public:
         void add_time_ntz_micros(int64_t value);
         void add_binary(StringRef value);
         void add_string(StringRef value);
+        // Same encoding as add_string() without the UTF-8 scan. The caller guarantees value is
+        // valid UTF-8, for example a string produced by a validating JSON parser.
+        void add_valid_utf8_string(StringRef value);
         void add_uuid(const std::array<uint8_t, 16>& value);
         void add_largeint(__int128 value);
         void add_scalar(const VariantScalarRef& scalar);
@@ -214,6 +227,7 @@ public:
 
     VariantBatchBuilder();
     explicit VariantBatchBuilder(ReserveHint hint);
+    VariantBatchBuilder(ReserveHint hint, Options options);
     ~VariantBatchBuilder();
 
     VariantBatchBuilder(const VariantBatchBuilder&) = delete;
@@ -248,6 +262,7 @@ private:
     void _add_null(uint64_t generation);
     void _add_bool(uint64_t generation, bool value);
     void _add_int(uint64_t generation, int64_t value);
+    void _add_valid_utf8_string(uint64_t generation, StringRef value);
     void _add_value(uint64_t generation, VariantRef value);
     uint32_t _start_container(uint64_t generation, bool object);
     void _add_key(uint64_t generation, uint32_t token, StringRef key);
