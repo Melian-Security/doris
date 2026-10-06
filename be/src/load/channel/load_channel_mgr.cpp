@@ -24,18 +24,21 @@
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <ctime>
+#include <exception>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
 #include "common/config.h"
+#include "common/exception.h"
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
 #include "load/channel/load_channel.h"
 #include "runtime/exec_env.h"
 #include "util/thread.h"
+#include "util/time.h"
 
 namespace doris {
 
@@ -149,7 +152,7 @@ Status LoadChannelMgr::_get_load_channel(std::shared_ptr<LoadChannel>& channel, 
 }
 
 Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
-                                 PTabletWriterAddBlockResult* response) {
+                                 PTabletWriterAddBlockResult* response, const Block* local_block) {
     UniqueId load_id(request.id());
     // 1. get load channel
     std::shared_ptr<LoadChannel> channel;
@@ -175,7 +178,7 @@ Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
     // 3. add batch to load channel
     // batch may not exist in request(eg: eos request without batch),
     // this case will be handled in load channel's add batch method.
-    Status st = channel->add_batch(request, response);
+    Status st = channel->add_batch(request, response, local_block);
     if (UNLIKELY(!st.ok())) {
         RETURN_IF_ERROR(channel->cancel());
         return st;
@@ -186,6 +189,32 @@ Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
         _finish_load_channel(load_id);
     }
     return Status::OK();
+}
+
+void LoadChannelMgr::add_batch_local(const PTabletWriterAddBlockRequest& request,
+                                    const Block& block, PTabletWriterAddBlockResult* response) {
+    int64_t execution_time_ns = 0;
+    {
+        SCOPED_RAW_TIMER(&execution_time_ns);
+        Status st;
+        try {
+            st = add_batch(request, response, &block);
+        } catch (const Exception& e) {
+            st = e.to_status();
+        } catch (const std::exception& e) {
+            st = Status::InternalError("local tablet writer add block failed: {}", e.what());
+        }
+        if (!st.ok()) {
+            LOG(WARNING) << "local tablet writer add block failed, message=" << st
+                         << ", id=" << request.id() << ", index_id=" << request.index_id()
+                         << ", sender_id=" << request.sender_id()
+                         << ", backend id=" << request.backend_id();
+        }
+        st.to_protobuf(response->mutable_status());
+    }
+    response->set_execution_time_us(execution_time_ns / NANOS_PER_MICRO);
+    // No queue sits between the sender and this call.
+    response->set_wait_execution_time_us(0);
 }
 
 void LoadChannelMgr::_finish_load_channel(const UniqueId load_id) {

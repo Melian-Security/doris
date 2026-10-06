@@ -35,7 +35,7 @@ public:
     std::unique_ptr<BaseDeltaWriter> create_delta_writer(const WriteRequest& request) override;
 
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response) override;
+                     PTabletWriterAddBlockResult* response, const Block* local_block) override;
 
     Status close(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
                  PTabletWriterAddBlockResult* res, bool* finished) override;

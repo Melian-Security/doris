@@ -20,6 +20,8 @@
 #include <gen_cpp/internal_service.pb.h>
 #include <glog/logging.h>
 
+#include <optional>
+
 #include "cloud/cloud_tablets_channel.h"
 #include "cloud/config.h"
 #include "common/logging.h"
@@ -175,12 +177,20 @@ Status LoadChannel::_get_tablets_channel(std::shared_ptr<BaseTabletsChannel>& ch
 }
 
 Status LoadChannel::add_batch(const PTabletWriterAddBlockRequest& request,
-                              PTabletWriterAddBlockResult* response) {
+                              PTabletWriterAddBlockResult* response, const Block* local_block) {
     DBUG_EXECUTE_IF("LoadChannel.add_batch.failed",
                     { return Status::InternalError("fault injection"); });
     SCOPED_TIMER(_add_batch_timer);
     COUNTER_UPDATE(_add_batch_times, 1);
-    SCOPED_ATTACH_TASK(_resource_ctx);
+    // An in-process batch runs on the thread of a tablet sink on this BE, which is already
+    // attached to the sink's task, and attach cannot nest.
+    std::optional<AttachTask> attach_task;
+    std::optional<SwitchResourceContext> switch_resource_context;
+    if (local_block != nullptr) {
+        switch_resource_context.emplace(_resource_ctx);
+    } else {
+        attach_task.emplace(_resource_ctx);
+    }
     int64_t index_id = request.index_id();
     // 1. get tablets channel
     std::shared_ptr<BaseTabletsChannel> channel;
@@ -191,8 +201,8 @@ Status LoadChannel::add_batch(const PTabletWriterAddBlockRequest& request,
     }
 
     // 2. add block to tablets channel
-    if (request.has_block()) {
-        RETURN_IF_ERROR(channel->add_batch(request, response));
+    if (request.has_block() || local_block != nullptr) {
+        RETURN_IF_ERROR(channel->add_batch(request, response, local_block));
         _add_batch_number_counter->update(1);
     }
 

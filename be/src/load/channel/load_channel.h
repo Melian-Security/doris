@@ -34,6 +34,7 @@
 
 namespace doris {
 
+class Block;
 class PTabletWriterOpenRequest;
 class PTabletWriterAddBlockRequest;
 class PTabletWriterAddBlockResult;
@@ -51,9 +52,10 @@ public:
     // open a new load channel if not exist
     Status open(const PTabletWriterOpenRequest& request);
 
-    // this batch must belong to a index in one transaction
+    // this batch must belong to a index in one transaction.
+    // `local_block` carries the rows when a tablet sink on this BE hands them over in-process.
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response);
+                     PTabletWriterAddBlockResult* response, const Block* local_block = nullptr);
 
     // return true if this load channel has been opened and all tablets channels are closed then.
     bool is_finished();

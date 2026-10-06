@@ -615,28 +615,48 @@ Status deserialize_peer_block(const PTabletWriterAddBlockRequest& request, Block
 
 } // namespace
 
+Status BaseTabletsChannel::resolve_send_block(const PTabletWriterAddBlockRequest& request,
+                                              const Block* local_block, Block* deserialized,
+                                              const Block** send_data) {
+    if (local_block != nullptr) {
+        if (request.has_block()) {
+            return Status::InternalError(
+                    "add block request carries both a serialized and an in-process block, "
+                    "packet_seq={}",
+                    request.packet_seq());
+        }
+        *send_data = local_block;
+        return Status::OK();
+    }
+    [[maybe_unused]] size_t uncompressed_size = 0;
+    [[maybe_unused]] int64_t uncompressed_time = 0;
+    RETURN_IF_ERROR(
+            deserialize_peer_block(request, deserialized, &uncompressed_size, &uncompressed_time));
+    *send_data = deserialized;
+    return Status::OK();
+}
+
 Status BaseTabletsChannel::_write_block_data(
         const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
         std::unordered_map<int64_t, DorisVector<uint32_t>>& tablet_to_rowidxs,
-        PTabletWriterAddBlockResult* response) {
-    Block send_data;
-    [[maybe_unused]] size_t uncompressed_size = 0;
-    [[maybe_unused]] int64_t uncompressed_time = 0;
-    RETURN_IF_ERROR(deserialize_peer_block(request, &send_data, &uncompressed_size,
-                                           &uncompressed_time));
+        PTabletWriterAddBlockResult* response, const Block* local_block) {
+    Block deserialized;
+    const Block* send_data = nullptr;
+    RETURN_IF_ERROR(resolve_send_block(request, local_block, &deserialized, &send_data));
     int request_rows = request.is_adaptive_random_bucket() ? request.partition_ids_size()
                                                            : request.tablet_ids_size();
-    if (send_data.rows() != request_rows) {
+    if (send_data->rows() != request_rows) {
         return Status::InternalError(
                 "invalid add block request row count, load_id={}, index_id={}, packet_seq={}, "
                 "block_rows={}, request_rows={}",
-                print_id(_load_id), _index_id, request.packet_seq(), send_data.rows(),
+                print_id(_load_id), _index_id, request.packet_seq(), send_data->rows(),
                 request_rows);
     }
 
-    g_tablets_channel_send_data_allocated_size << send_data.allocated_bytes();
+    const auto send_data_allocated_bytes = send_data->allocated_bytes();
+    g_tablets_channel_send_data_allocated_size << send_data_allocated_bytes;
     Defer defer {
-            [&]() { g_tablets_channel_send_data_allocated_size << -send_data.allocated_bytes(); }};
+            [&]() { g_tablets_channel_send_data_allocated_size << -send_data_allocated_bytes; }};
 
     auto write_tablet_data = [&](int64_t tablet_id,
                                  std::function<Status(BaseDeltaWriter * writer)> write_func) {
@@ -677,7 +697,7 @@ Status BaseTabletsChannel::_write_block_data(
     for (const auto& tablet_to_rowidxs_it : tablet_to_rowidxs) {
         bool memtable_flushed = false;
         RETURN_IF_ERROR(write_tablet_data(tablet_to_rowidxs_it.first, [&](BaseDeltaWriter* writer) {
-            return writer->write(&send_data, tablet_to_rowidxs_it.second, &memtable_flushed);
+            return writer->write(send_data, tablet_to_rowidxs_it.second, &memtable_flushed);
         }));
 
         BaseDeltaWriter* tablet_writer = nullptr;
@@ -712,17 +732,15 @@ std::shared_ptr<std::mutex> BaseTabletsChannel::_get_partition_route_lock(int64_
 Status BaseTabletsChannel::_write_block_data_for_adaptive_random_bucket(
         const PTabletWriterAddBlockRequest& request, int64_t cur_seq,
         std::unordered_map<int64_t, DorisVector<uint32_t>>& partition_to_rowidxs,
-        PTabletWriterAddBlockResult* response) {
-    Block send_data;
-    [[maybe_unused]] size_t uncompressed_size = 0;
-    [[maybe_unused]] int64_t uncompressed_time = 0;
-    RETURN_IF_ERROR(deserialize_peer_block(request, &send_data, &uncompressed_size,
-                                           &uncompressed_time));
-    if (send_data.rows() != request.partition_ids_size()) {
+        PTabletWriterAddBlockResult* response, const Block* local_block) {
+    Block deserialized;
+    const Block* send_data = nullptr;
+    RETURN_IF_ERROR(resolve_send_block(request, local_block, &deserialized, &send_data));
+    if (send_data->rows() != request.partition_ids_size()) {
         return Status::InternalError(
                 "invalid adaptive random bucket add block request row count, load_id={}, "
                 "index_id={}, packet_seq={}, block_rows={}, partition_ids_size={}",
-                print_id(_load_id), _index_id, request.packet_seq(), send_data.rows(),
+                print_id(_load_id), _index_id, request.packet_seq(), send_data->rows(),
                 request.partition_ids_size());
     }
 
@@ -733,9 +751,10 @@ Status BaseTabletsChannel::_write_block_data_for_adaptive_random_bucket(
         }
     }
 
-    g_tablets_channel_send_data_allocated_size << send_data.allocated_bytes();
+    const auto send_data_allocated_bytes = send_data->allocated_bytes();
+    g_tablets_channel_send_data_allocated_size << send_data_allocated_bytes;
     Defer defer {
-            [&]() { g_tablets_channel_send_data_allocated_size << -send_data.allocated_bytes(); }};
+            [&]() { g_tablets_channel_send_data_allocated_size << -send_data_allocated_bytes; }};
 
     auto* tablet_errors = response->mutable_tablet_errors();
     auto* tablet_load_infos = response->mutable_tablet_load_rowset_num_infos();
@@ -788,7 +807,7 @@ Status BaseTabletsChannel::_write_block_data_for_adaptive_random_bucket(
         RETURN_IF_ERROR(_prepare_adaptive_random_bucket_writer(tablet_writer));
 
         bool memtable_flushed = false;
-        Status st = tablet_writer->write(&send_data, row_idxs, &memtable_flushed);
+        Status st = tablet_writer->write(send_data, row_idxs, &memtable_flushed);
         if (!st.ok()) {
             auto err_msg =
                     fmt::format("tablet writer write failed, tablet_id={}, txn_id={}, err={}",
@@ -859,7 +878,7 @@ Status BaseTabletsChannel::_build_partition_to_rowidxs_for_adaptive_random_bucke
 }
 
 Status TabletsChannel::add_batch(const PTabletWriterAddBlockRequest& request,
-                                 PTabletWriterAddBlockResult* response) {
+                                 PTabletWriterAddBlockResult* response, const Block* local_block) {
     SCOPED_TIMER(_add_batch_timer);
     int64_t cur_seq = 0;
     _add_batch_number_counter->update(1);
@@ -883,13 +902,13 @@ Status TabletsChannel::add_batch(const PTabletWriterAddBlockRequest& request,
         RETURN_IF_ERROR(_build_partition_to_rowidxs_for_adaptive_random_bucket(
                 request, &partition_to_rowidxs));
         return _write_block_data_for_adaptive_random_bucket(request, cur_seq, partition_to_rowidxs,
-                                                            response);
+                                                            response, local_block);
     }
 
     std::unordered_map<int64_t /* tablet_id */, DorisVector<uint32_t> /* row index */>
             tablet_to_rowidxs;
     _build_tablet_to_rowidxs(request, &tablet_to_rowidxs);
-    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response);
+    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response, local_block);
 }
 
 void BaseTabletsChannel::_add_broken_tablet(int64_t tablet_id) {
