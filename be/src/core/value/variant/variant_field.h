@@ -39,6 +39,12 @@ void validate_variant_metadata(VariantMetadataRef metadata);
 // passed validate_variant_metadata().
 void validate_variant_payload(VariantRef value);
 
+// Check only the root framing of one payload: a readable header whose encoded size spans exactly
+// value.size bytes. Children are not visited, so nesting depth, key order, UTF-8 and decimal range
+// are left unchecked; VariantRef accessors still bounds-check every later read. Use this only for
+// payloads that a Doris BE already validated with validate_variant_payload().
+void validate_variant_payload_framing(VariantRef value);
+
 // Holds the legacy V1 path map or owns one encoded V2 row. The encoded byte layout is
 // [u32 little-endian metadata_size][metadata][exactly one value].
 class VariantField {

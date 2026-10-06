@@ -282,6 +282,16 @@ void validate_variant_payload(VariantRef value) {
     require_exact_value(value, 0);
 }
 
+void validate_variant_payload_framing(VariantRef value) {
+    require_non_null(value.value, "value");
+    const size_t encoded_size = value.value_size();
+    if (encoded_size != value.value.size) {
+        throw Exception(ErrorCode::CORRUPTION,
+                        "VariantField value has {} trailing bytes after its {} byte root",
+                        value.value.size - encoded_size, encoded_size);
+    }
+}
+
 VariantField::VariantField(std::unique_ptr<char[]> data, size_t size) noexcept
         : _data(std::move(data)), _size(size) {}
 

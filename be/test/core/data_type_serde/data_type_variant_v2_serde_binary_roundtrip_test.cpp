@@ -20,12 +20,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "common/exception.h"
@@ -50,9 +53,11 @@
 #include "core/data_type/data_type_timestamptz.h"
 #include "core/data_type/data_type_variant.h"
 #include "core/data_type/data_type_variant_v2.h"
+#include "core/data_type_serde/data_type_variant_v2_serde.h"
 #include "core/value/decimalv2_value.h"
 #include "core/value/variant/variant_batch_builder.h"
 #include "core/value/variant/variant_canonical.h"
+#include "core/value/variant/variant_field.h"
 #include "core/value/variant/variant_parquet_encoding.h"
 #include "exprs/function/parse/variant_jsonb_parse.h"
 #include "exprs/function/parse/variant_string_parse.h"
@@ -521,6 +526,101 @@ TEST(DataTypeVariantV2SerDeBinaryRoundTripTest, EncodedAndTypedDecodeToCanonical
     ASSERT_FALSE(decoded_typed->is_typed());
     EXPECT_TRUE(canonical_equals(decoded_encoded->read_view().value_at(0),
                                  decoded_typed->read_view().value_at(0)));
+}
+
+namespace {
+
+// Replaces the only occurrence of `needle` in the serialized column bytes.
+void patch_serialized(std::vector<char>& bytes, std::string_view needle, std::string_view patch) {
+    ASSERT_EQ(needle.size(), patch.size());
+    const std::string_view haystack(bytes.data(), bytes.size());
+    const size_t position = haystack.find(needle);
+    ASSERT_NE(position, std::string_view::npos);
+    ASSERT_EQ(haystack.find(needle, position + 1), std::string_view::npos);
+    std::copy(patch.begin(), patch.end(), bytes.begin() + static_cast<std::ptrdiff_t>(position));
+}
+
+int decode_error(const std::vector<char>& bytes) {
+    const DataTypeVariantV2 type;
+    MutableColumnPtr destination = type.create_column();
+    try {
+        EXPECT_EQ(type.deserialize(bytes.data(), &destination, 10), bytes.data() + bytes.size());
+    } catch (const Exception& e) {
+        return e.code();
+    }
+    return ErrorCode::OK;
+}
+
+} // namespace
+
+TEST(DataTypeVariantV2SerDeBinaryRoundTripTest, TrustedPeerScopeIsThreadLocalAndNests) {
+    EXPECT_FALSE(TrustedPeerVariantBlockScope::active());
+    {
+        TrustedPeerVariantBlockScope trusted(true);
+        EXPECT_TRUE(TrustedPeerVariantBlockScope::active());
+        {
+            TrustedPeerVariantBlockScope untrusted(false);
+            EXPECT_FALSE(TrustedPeerVariantBlockScope::active());
+        }
+        EXPECT_TRUE(TrustedPeerVariantBlockScope::active());
+        bool other_thread_active = true;
+        std::thread([&] { other_thread_active = TrustedPeerVariantBlockScope::active(); }).join();
+        EXPECT_FALSE(other_thread_active);
+    }
+    EXPECT_FALSE(TrustedPeerVariantBlockScope::active());
+}
+
+TEST(DataTypeVariantV2SerDeBinaryRoundTripTest, TrustedPeerSkipsOnlyRecursivePayloadValidation) {
+    auto source = ColumnVariantV2::create();
+    insert_encoded_field(*source, encode_json(R"({"k":"zqzq","n":[1,2]})"));
+    insert_encoded_field(*source, encode_json(R"({"k":"ok"})"));
+    std::vector<char> bytes = serialize(*source);
+    // A nested short string becomes invalid UTF-8; the root object framing stays intact.
+    patch_serialized(bytes, "zqzq", "\xff\xfe\xfd\xfc");
+
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+    {
+        TrustedPeerVariantBlockScope untrusted(false);
+        EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+    }
+    {
+        TrustedPeerVariantBlockScope trusted(true);
+        const DataTypeVariantV2 type;
+        MutableColumnPtr destination = type.create_column();
+        ASSERT_EQ(type.deserialize(bytes.data(), &destination, 10), bytes.data() + bytes.size());
+        const auto& decoded = assert_cast<const ColumnVariantV2&>(*destination);
+        ASSERT_EQ(decoded.size(), 2);
+        EXPECT_TRUE(canonical_equals(decoded.read_view().value_at(1),
+                                     source->read_view().value_at(1)));
+        // Accessors still bounds-check the skipped child; the full walk still rejects it.
+        EXPECT_THROW(validate_variant_payload(decoded.read_view().value_at(0)), Exception);
+    }
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+}
+
+TEST(DataTypeVariantV2SerDeBinaryRoundTripTest, TrustedPeerKeepsRootFramingCheck) {
+    auto source = encoded(R"("zqzq")");
+    std::vector<char> bytes = serialize(*source);
+    // Short-string header claiming 3 bytes leaves one trailing byte after the root value.
+    const char header_4 = static_cast<char>((4U << VARIANT_VALUE_HEADER_SHIFT) |
+                                            static_cast<uint8_t>(VariantBasicType::SHORT_STRING));
+    const char header_3 = static_cast<char>((3U << VARIANT_VALUE_HEADER_SHIFT) |
+                                            static_cast<uint8_t>(VariantBasicType::SHORT_STRING));
+    patch_serialized(bytes, std::string {header_4} + "zqzq", std::string {header_3} + "zqzq");
+
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+    TrustedPeerVariantBlockScope trusted(true);
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+}
+
+TEST(DataTypeVariantV2SerDeBinaryRoundTripTest, TrustedPeerKeepsMetadataDictionaryCheck) {
+    auto source = encoded(R"({"zqzq":1})");
+    std::vector<char> bytes = serialize(*source);
+    patch_serialized(bytes, "zqzq", "\xff\xfe\xfd\xfc");
+
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
+    TrustedPeerVariantBlockScope trusted(true);
+    EXPECT_EQ(decode_error(bytes), ErrorCode::CORRUPTION);
 }
 
 } // namespace doris

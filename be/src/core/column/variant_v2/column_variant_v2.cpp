@@ -829,6 +829,10 @@ bool ColumnVariantV2::structure_equals(const IColumn& rhs) const {
 }
 
 void ColumnVariantV2::sanity_check() const {
+    _sanity_check(true);
+}
+
+void ColumnVariantV2::_sanity_check(bool validate_payloads) const {
     if (_shredded) {
         _shredded->sanity_check();
         _check_invariants();
@@ -854,8 +858,13 @@ void ColumnVariantV2::sanity_check() const {
             const uint32_t id = metadata_ids[row];
             DORIS_CHECK_LT(id, metadatas.size()) << "ColumnVariantV2 metadata id is out of range";
             const StringRef metadata = metadatas.get_data_at(id);
-            validate_variant_payload({.metadata = {.data = metadata.data, .size = metadata.size},
-                                      .value = values.get_data_at(row)});
+            const VariantRef value {.metadata = {.data = metadata.data, .size = metadata.size},
+                                    .value = values.get_data_at(row)};
+            if (validate_payloads) {
+                validate_variant_payload(value);
+            } else {
+                validate_variant_payload_framing(value);
+            }
         }
     }
 }

@@ -289,6 +289,9 @@ private:
     void _adopt_state_from(ColumnVariantV2& replacement);
     void _detach_metadata_for_write();
     void _check_invariants() const;
+    // validate_payloads=false keeps every structural check (subcolumn offsets, metadata ids,
+    // metadata dictionaries, root payload framing) and skips the recursive payload walk.
+    void _sanity_check(bool validate_payloads) const;
     static void mutate_subcolumn(IColumn::WrappedPtr& subcolumn) {
         static_cast<IColumn::Ptr&>(subcolumn) =
                 std::move(*static_cast<const IColumn::Ptr&>(subcolumn)).mutate();

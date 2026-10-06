@@ -1202,6 +1202,7 @@ DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
 // Deeper arrays will be stored as JSONB
 DEFINE_mInt32(variant_nested_group_max_depth, "10");
 DEFINE_mBool(variant_nested_group_discard_scalar_on_conflict, "true");
+DEFINE_mBool(variant_v2_validate_internal_block, "false");
 
 DEFINE_Validator(variant_max_json_key_length,
                  [](const int config) -> bool { return config > 0 && config <= 65535; });

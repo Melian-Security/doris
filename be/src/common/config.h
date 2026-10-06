@@ -1487,6 +1487,11 @@ DECLARE_mInt32(variant_nested_group_max_depth);
 // data at the same path. This simplifies compaction by always prioritizing
 // nested structure over scalar. When false, report an error on conflict.
 DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
+// When false, blocks received from another BE on the load channel (tablet_writer_add_block)
+// skip the recursive VARIANT V2 payload walk in deserialization; the sender already validated
+// every payload when it built the column, and structural checks still run. Set to true to
+// re-validate every payload on receipt.
+DECLARE_mBool(variant_v2_validate_internal_block);
 
 DECLARE_mBool(enable_merge_on_write_correctness_check);
 // USED FOR DEBUGING
