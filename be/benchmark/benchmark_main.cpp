@@ -32,6 +32,7 @@
 #include "benchmark_fastunion.hpp"
 #include "benchmark_fmod.hpp"
 #include "benchmark_hll_merge.hpp"
+#include "benchmark_local_tablet_writer.hpp"
 #include "benchmark_time_series_empty_run.hpp"
 #include "benchmark_variant_v2_deserialize.hpp"
 #include "benchmark_zone_map_index.hpp"
