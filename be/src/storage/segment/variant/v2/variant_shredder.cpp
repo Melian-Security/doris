@@ -18,9 +18,11 @@
 #include "storage/segment/variant/v2/variant_shredder.h"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -87,6 +89,9 @@ struct VariantShredder::Impl {
         PathInData path;
         std::optional<VariantPathBuilder> builder;
         size_t last_row_marker = 0;
+        // Child path by object key, shared by every metadata dictionary. Keys point into
+        // Impl::child_keys.
+        doris::flat_hash_map<std::string_view, PathIndex> children_by_key;
     };
 
     struct SparsePlan {
@@ -189,9 +194,21 @@ struct VariantShredder::Impl {
             return found->second;
         }
 
+        const std::string_view key = metadata_cache.metadata.key_at(field).to_string_view();
+        // A memtable block carries one dictionary per load batch, and the per-dictionary cache
+        // starts cold for each of them on every append. The canonical child is a function of the
+        // parent path and the key alone, so resolve it by key before building and hashing the
+        // full child path.
+        if (fast_path) {
+            const auto& children = paths[parent].children_by_key;
+            if (const auto found = children.find(key); found != children.end()) {
+                metadata_cache.child_paths.emplace(cache_key, found->second);
+                return found->second;
+            }
+        }
+
         PathInDataBuilder builder;
-        builder.append(paths[parent].path.get_parts(), false)
-                .append(metadata_cache.metadata.key_at(field).to_string_view(), false);
+        builder.append(paths[parent].path.get_parts(), false).append(key, false);
         PathInData child = builder.build();
         // V2 object traversal keeps arrays as leaves. Canonicalizing into the dotted on-disk
         // namespace also makes {"a.b": 1} and {"a": {"b": 1}} share one path.
@@ -208,6 +225,10 @@ struct VariantShredder::Impl {
             child_index = static_cast<PathIndex>(paths.size());
             path_indices.emplace(child, child_index);
             paths.emplace_back(child);
+        }
+        if (fast_path) {
+            const std::string& owned_key = child_keys.emplace_back(key);
+            paths[parent].children_by_key.emplace(owned_key, child_index);
         }
         metadata_cache.child_paths.emplace(cache_key, child_index);
         return child_index;
@@ -352,8 +373,15 @@ struct VariantShredder::Impl {
                     options.physical_layout == VariantShredderPhysicalLayout::DOC
                             ? normalize_doc_publication_path(raw_path)
                             : raw_path;
-            const std::span<const uint32_t> compact_rowids = builder.rowids();
-            DorisVector<uint32_t> rowids(compact_rowids.begin(), compact_rowids.end());
+            // Each builder is published once, after every reader of its row ids (path selection,
+            // statistics, the binary maps) has run, so the ids can move instead of being copied.
+            DorisVector<uint32_t> rowids;
+            if (fast_path) {
+                rowids = builder.take_rowids();
+            } else {
+                const std::span<const uint32_t> compact_rowids = builder.rowids();
+                rowids.assign(compact_rowids.begin(), compact_rowids.end());
+            }
             result->materialized.push_back({.path = publication_path,
                                             .type = builder.type(),
                                             .column = builder.column(),
@@ -679,6 +707,7 @@ struct VariantShredder::Impl {
     size_t rows = 0;
     std::unordered_map<PathInData, PathIndex, PathInData::Hash> path_indices = {{PathInData(), 0}};
     DorisVector<PathState> paths;
+    std::deque<std::string> child_keys;
     ColumnString::MutablePtr root_values = ColumnString::create();
     JsonbWriter root_writer;
 #if defined(BE_TEST) && !defined(BE_BENCHMARK)
@@ -786,8 +815,13 @@ size_t VariantShredder::byte_size() const {
         size += sizeof(std::pair<const PathInData, Impl::PathIndex>) + path_allocated_bytes(path);
     }
     size += _impl->paths.capacity() * sizeof(Impl::PathState);
+    for (const std::string& key : _impl->child_keys) {
+        size += sizeof(std::string) + key.capacity();
+    }
     for (const Impl::PathState& path : _impl->paths) {
         size += path_allocated_bytes(path.path);
+        size += path.children_by_key.capacity() *
+                (sizeof(std::pair<std::string_view, Impl::PathIndex>) + 1);
         if (path.builder.has_value()) {
             size += path.builder->byte_size();
         }

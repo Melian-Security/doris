@@ -70,6 +70,8 @@ public:
     const DataTypePtr& type() const;
     ColumnPtr column() const;
     std::span<const uint32_t> rowids() const;
+    // Moves the row ids out for publication. The builder must not be read for rows afterwards.
+    DorisVector<uint32_t> take_rowids();
     uint32_t non_null_rows() const;
 #ifdef BE_TEST
     size_t rows() const;

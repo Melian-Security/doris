@@ -1128,9 +1128,10 @@ private:
 };
 
 // Synthetic OCSF-shaped event. Row-dependent choices cover nested objects, arrays of scalars,
-// arrays of objects, nested arrays, JSON nulls, empty containers, per-path type changes
-// (int -> double -> string, bool -> int), dotted keys that collide with nested paths, and a
-// long tail of row-unique paths that pushes the column past its subcolumn budget.
+// arrays of objects, nested arrays, arrays with nulls or only nulls, JSON nulls, empty containers,
+// per-path type changes (int -> double -> string, bool -> int, int array -> string array), dotted
+// keys that collide with nested paths, and a long tail of row-unique paths that pushes the column
+// past its subcolumn budget.
 static std::string ocsf_like_json(size_t row, bool dotted_keys) {
     const std::string r = std::to_string(row);
     std::string json = "{";
@@ -1163,7 +1164,14 @@ static std::string ocsf_like_json(size_t row, bool dotted_keys) {
             R"(,"port":)" + std::to_string(1024 + row % 1000) + "}";
     json += R"(,"observables":[{"name":"src_endpoint.ip","type_id":2,"value":"10.0.0.1"},)"
             R"({"name":"actor.user.name","type_id":4}])";
-    json += R"(,"categories":[1,2,)" + std::to_string(row % 3) + "]";
+    if (row % 29 == 0) {
+        json += R"(,"categories":["x"])";
+    } else {
+        json += R"(,"categories":[1,2,)" + std::to_string(row % 3) + "]";
+    }
+    json += R"(,"scores":[1.5,null,)" + std::to_string(row % 7) + ".25]";
+    json += R"(,"bools":[true,null,)" + std::string(row % 2 == 0 ? "false" : "true") + "]";
+    json += row % 6 == 0 ? R"(,"sometimes_null":[null])" : R"(,"sometimes_null":["s"])";
     json += R"(,"mixed":[1,"a",null,)" + std::string(row % 2 == 0 ? "2.5" : "true") + "]";
     json += R"(,"matrix":[[1,2],[3]],"empty_list":[])";
     json += R"(,"unmapped":{"k_)" + r + R"(":)" + r + R"(,"shared_)" + std::to_string(row % 50) +
