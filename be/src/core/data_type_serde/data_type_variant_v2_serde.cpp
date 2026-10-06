@@ -25,6 +25,7 @@
 #include <limits>
 #include <orc/Vector.hh>
 #include <span>
+#include <string_view>
 #include <utility>
 
 #include "common/cast_set.h"
@@ -40,6 +41,7 @@
 #include "core/data_type/data_type_factory.hpp"
 #include "core/data_type/data_type_nullable.h"
 #include "core/data_type/data_type_string.h"
+#include "core/data_type_serde/arrow_binary_values.h"
 #include "core/data_type_serde/data_type_string_serde.h"
 #include "core/types.h"
 #include "core/value/jsonb_value.h"
@@ -448,12 +450,6 @@ Status DataTypeVariantV2SerDe::read_column_from_pb(IColumn& column, const PValue
     return Status::NotSupported("read_column_from_pb with type " + column.get_name());
 }
 
-Status DataTypeVariantV2SerDe::read_column_from_arrow(IColumn& column, const arrow::Array*, int64_t,
-                                                      int64_t, const cctz::time_zone&) const {
-    return Status::Error(ErrorCode::NOT_IMPLEMENTED_ERROR,
-                         "read_column_from_arrow with type " + column.get_name());
-}
-
 namespace {
 
 ColumnVariantV2& destination(IColumn& column) {
@@ -527,6 +523,34 @@ Status DataTypeVariantV2SerDe::deserialize_column_from_json_vector(IColumn& colu
         VariantBatchBuilder block = encoder.finish_batch();
         result.insert_encoded_batch(block);
         *num_deserialized += slices.size();
+    });
+    return Status::OK();
+}
+
+// Arrow carries Variant values the way write_column_to_arrow emits them: one JSON document per
+// row in a string or binary array. Every row goes through the JSON load path, so empty input,
+// invalid JSON and invalid UTF-8 follow the same policies, and a failing row publishes nothing.
+// SQL NULL is the nullable wrapper's null map; the nested Variant row under it is JSON null.
+Status DataTypeVariantV2SerDe::read_column_from_arrow(IColumn& column,
+                                                      const arrow::Array* arrow_array,
+                                                      int64_t start, int64_t end,
+                                                      const cctz::time_zone&) const {
+    if (arrow_array == nullptr) {
+        return Status::InvalidArgument("Variant Arrow input is null");
+    }
+    RETURN_IF_CATCH_EXCEPTION({
+        ColumnVariantV2& result = destination(column);
+        JsonStringToVariantEncoder encoder;
+        static constexpr std::string_view json_null = "null";
+        RETURN_IF_ERROR(for_each_arrow_binary_value(
+                *arrow_array, start, end, [&](StringRef json) { encoder.add_json(json); },
+                [&] {
+                    encoder.add_json({json_null.data(), json_null.size()});
+                }));
+        if (end > start) {
+            VariantBatchBuilder block = encoder.finish_batch();
+            result.insert_encoded_batch(block);
+        }
     });
     return Status::OK();
 }
