@@ -23,6 +23,7 @@
 #include <bit>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -450,6 +451,89 @@ TEST(VariantValueTest, ObjectViewMatchesRandomAccessAndRetainsBoundsChecks) {
     const std::string empty_object = object_value({}, {}, {});
     const VariantRef::ObjectView empty = value_ref(truncated_metadata, empty_object).object_view();
     EXPECT_EQ(empty.size(), 0);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- GTest macros expand assertions.
+TEST(VariantValueTest, ArrayViewMatchesRandomAccessAndRetainsBoundsChecks) {
+    const std::string empty_metadata = metadata({}, true);
+    for (const bool large : {false, true}) {
+        for (const uint8_t offset_width : {uint8_t {1}, uint8_t {2}, uint8_t {4}}) {
+            SCOPED_TRACE(testing::Message() << "large=" << large << " width=" << int(offset_width));
+            const std::string encoded = array_value(
+                    {short_string("x"), primitive(VariantPrimitiveId::INT8, integer_payload(7, 1)),
+                     primitive(VariantPrimitiveId::NULL_VALUE),
+                     array_value({short_string("nested")}, 1, false)},
+                    offset_width, large);
+            const VariantRef ref = value_ref(empty_metadata, encoded);
+            const VariantRef::ArrayView array = ref.array_view();
+            ASSERT_EQ(array.size(), ref.num_elements());
+            for (uint32_t index = 0; index < array.size(); ++index) {
+                const VariantRef view_value = array.value_at(index);
+                const VariantRef direct_value = ref.array_at(index);
+                EXPECT_EQ(view_value.value.data, direct_value.value.data);
+                EXPECT_EQ(view_value.value.size, direct_value.value.size);
+            }
+            EXPECT_THROW(array.value_at(array.size()), Exception);
+        }
+    }
+    const std::string object = object_value({}, {}, {});
+    EXPECT_THROW(value_ref(empty_metadata, object).array_view(), Exception);
+    const std::string truncated_array(1, static_cast<char>(VariantBasicType::ARRAY));
+    EXPECT_THROW(value_ref(empty_metadata, truncated_array).array_view(), Exception);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- GTest macros expand assertions.
+TEST(VariantValueTest, ObjectViewChildObjectMatchesObjectView) {
+    const std::string sorted_metadata = metadata({"a", "b", "c"}, true);
+    const std::string leaf = short_string("v");
+    const std::string inner = object_value({2}, {0}, {leaf});
+    const std::string empty_inner = object_value({}, {}, {});
+    const std::string list = array_value({leaf}, 1, false);
+    const std::string encoded =
+            object_value({0, 1, 2}, {0, static_cast<uint32_t>(inner.size()),
+                                     static_cast<uint32_t>(inner.size() + empty_inner.size())},
+                         {inner, empty_inner, list});
+    const VariantRef ref = value_ref(sorted_metadata, encoded);
+    const VariantRef::ObjectView object = ref.object_view();
+    ASSERT_EQ(object.size(), 3);
+
+    std::optional<VariantRef::ObjectView> child_object;
+    for (uint32_t index = 0; index < object.size(); ++index) {
+        uint32_t view_field = 0;
+        uint32_t direct_field = 0;
+        const VariantRef child = object.value_at(index, &view_field, &child_object);
+        const VariantRef direct = object.value_at(index, &direct_field);
+        EXPECT_EQ(view_field, direct_field);
+        EXPECT_EQ(child.value.data, direct.value.data);
+        EXPECT_EQ(child.value.size, direct.value.size);
+        EXPECT_EQ(child_object.has_value(), child.basic_type() == VariantBasicType::OBJECT);
+        if (!child_object.has_value()) {
+            continue;
+        }
+        const VariantRef::ObjectView expected = child.object_view();
+        ASSERT_EQ(child_object->size(), expected.size());
+        for (uint32_t nested = 0; nested < expected.size(); ++nested) {
+            uint32_t actual_id = 0;
+            uint32_t expected_id = 0;
+            const VariantRef actual_value = child_object->value_at(nested, &actual_id);
+            const VariantRef expected_value = expected.value_at(nested, &expected_id);
+            EXPECT_EQ(actual_id, expected_id);
+            EXPECT_EQ(actual_value.value.data, expected_value.value.data);
+            EXPECT_EQ(actual_value.value.size, expected_value.value.size);
+        }
+    }
+
+    // A non-object child clears a view left by an earlier object child.
+    child_object = object.value_at(0).object_view();
+    static_cast<void>(object.value_at(2, nullptr, &child_object));
+    EXPECT_FALSE(child_object.has_value());
+
+    // A truncated nested object header fails exactly as value_at() does.
+    const std::string bad_inner(1, static_cast<char>(VariantBasicType::OBJECT));
+    const std::string bad = object_value({0}, {0}, {bad_inner});
+    const VariantRef::ObjectView bad_object = value_ref(sorted_metadata, bad).object_view();
+    EXPECT_THROW(bad_object.value_at(0), Exception);
+    EXPECT_THROW(bad_object.value_at(0, nullptr, &child_object), Exception);
 }
 
 TEST(VariantValueTest, ObjectFindRejectsInvalidReceivers) {

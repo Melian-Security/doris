@@ -441,11 +441,12 @@ private:
 
     void write_object(VariantRef value, uint32_t depth) {
         require_jsonb_write(_writer.writeStartObject(), "object start");
-        const uint32_t count = value.num_elements();
+        const VariantRef::ObjectView object = value.object_view();
+        const uint32_t count = object.size();
         StringRef previous_key;
         for (uint32_t index = 0; index < count; ++index) {
             uint32_t field_id = 0;
-            const VariantRef child = value.object_value_at(index, &field_id);
+            const VariantRef child = object.value_at(index, &field_id);
             const StringRef key = value.metadata.key_at(field_id);
             variant_json::require_json_object_key(key, previous_key, index);
             if (key.size > std::numeric_limits<uint8_t>::max()) {
@@ -463,9 +464,10 @@ private:
 
     void write_array(VariantRef value, uint32_t depth) {
         require_jsonb_write(_writer.writeStartArray(), "array start");
-        const uint32_t count = value.num_elements();
+        const VariantRef::ArrayView array = value.array_view();
+        const uint32_t count = array.size();
         for (uint32_t index = 0; index < count; ++index) {
-            write(value.array_at(index), depth + 1);
+            write(array.value_at(index), depth + 1);
         }
         require_jsonb_write(_writer.writeEndArray(), "array end");
     }
