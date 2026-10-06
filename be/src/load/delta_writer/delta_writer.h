@@ -69,8 +69,8 @@ public:
     // wait for all memtables to be flushed.
     // mem_consumption() should be 0 after this function returns.
     virtual Status build_rowset();
-    Status submit_calc_delete_bitmap_task();
-    Status wait_calc_delete_bitmap();
+    virtual Status submit_calc_delete_bitmap_task();
+    virtual Status wait_calc_delete_bitmap();
 
     // abandon current memtable and wait for all pending-flushing memtables to be destructed.
     // mem_consumption() should be 0 after this function returns.

@@ -118,6 +118,8 @@ DEFINE_Bool(enable_check_storage_vault, "true");
 
 DEFINE_mBool(skip_writing_empty_rowset_metadata, "true");
 
+DEFINE_mBool(skip_rowset_writer_for_empty_tablet, "true");
+
 DEFINE_mInt64(cloud_index_change_task_timeout_second, "3600");
 
 DEFINE_mInt64(warmup_tablet_replica_info_cache_ttl_sec, "600");
