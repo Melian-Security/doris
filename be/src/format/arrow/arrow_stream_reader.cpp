@@ -26,6 +26,9 @@
 #include "common/status.h"
 #include "core/block/block.h"
 #include "core/block/column_with_type_and_name.h"
+#include "core/data_type/data_type_nullable.h"
+#include "core/data_type/data_type_string.h"
+#include "core/data_type/data_type_variant.h"
 #include "exec/common/arrow_column_to_doris_column.h"
 #include "format/arrow/arrow_pip_input_stream.h"
 #include "io/fs/stream_load_pipe.h"
@@ -133,9 +136,22 @@ Status ArrowStreamReader::get_next_block(Block* block, size_t* read_rows, bool* 
 Status ArrowStreamReader::get_columns(std::unordered_map<std::string, DataTypePtr>* name_to_type,
                                       std::unordered_set<std::string>* missing_cols) {
     for (const auto& slot : _file_slot_descs) {
-        name_to_type->emplace(slot->col_name(), slot->type());
+        name_to_type->emplace(slot->col_name(), load_source_type(slot->type()));
     }
     return Status::OK();
+}
+
+// A legacy Variant column arrives as one JSON document per row. The reader keeps it as text and
+// the scanner's CAST(varchar AS variant) wraps the text as the root of a scalar variant, as it
+// does for JSON and CSV loads. The tablet sink then redistributes a plain string column, and the
+// segment writer parses each document once per tablet with the column's storage parse settings.
+// Parsing in the reader instead builds up to variant_max_subcolumns_count subcolumns per block,
+// which the sink copies to each tablet row by row and the segment writer cannot re-stage.
+DataTypePtr ArrowStreamReader::load_source_type(const DataTypePtr& slot_type) {
+    if (typeid_cast<const DataTypeVariant*>(remove_nullable(slot_type).get()) != nullptr) {
+        return std::make_shared<DataTypeString>();
+    }
+    return slot_type;
 }
 
 #include "common/compile_check_end.h"

@@ -15,9 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <arrow/array/builder_binary.h>
+#include <arrow/array/builder_primitive.h>
+#include <arrow/builder.h>
+#include <arrow/type.h>
+#include <cctz/time_zone.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <limits>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,6 +84,31 @@ std::string json_at(const DataTypeVariantV2SerDe& serde, const IColumn& column, 
     }
     writer.commit();
     return output->get_data_at(0).to_string();
+}
+
+std::shared_ptr<arrow::Array> make_arrow_strings(
+        const std::shared_ptr<arrow::DataType>& type,
+        const std::vector<std::optional<std::string>>& values) {
+    std::unique_ptr<arrow::ArrayBuilder> builder;
+    EXPECT_TRUE(arrow::MakeBuilder(arrow::default_memory_pool(), type, &builder).ok());
+    for (const auto& value : values) {
+        arrow::Status status;
+        if (!value.has_value()) {
+            status = builder->AppendNull();
+        } else if (type->id() == arrow::Type::STRING) {
+            status = static_cast<arrow::StringBuilder&>(*builder).Append(*value);
+        } else if (type->id() == arrow::Type::LARGE_STRING) {
+            status = static_cast<arrow::LargeStringBuilder&>(*builder).Append(*value);
+        } else if (type->id() == arrow::Type::BINARY) {
+            status = static_cast<arrow::BinaryBuilder&>(*builder).Append(*value);
+        } else {
+            status = static_cast<arrow::LargeBinaryBuilder&>(*builder).Append(*value);
+        }
+        EXPECT_TRUE(status.ok()) << status.ToString();
+    }
+    std::shared_ptr<arrow::Array> array;
+    EXPECT_TRUE(builder->Finish(&array).ok());
+    return array;
 }
 
 ColumnVariantV2::MutablePtr typed_int(int32_t value) {
@@ -296,7 +331,7 @@ TEST(DataTypeVariantV2SerdeInputTest, OuterSqlNullAndVariantNullRemainDistinct) 
     EXPECT_TRUE(outer->is_null_at(0));
 }
 
-TEST(DataTypeVariantV2SerdeInputTest, PbAndArrowReadKeepExplicitGuards) {
+TEST(DataTypeVariantV2SerdeInputTest, PbKeepsExplicitGuardsAndNullArrowInputIsRejected) {
     DataTypeVariantV2SerDe serde;
     auto column = ColumnVariantV2::create();
     PValues values;
@@ -304,7 +339,187 @@ TEST(DataTypeVariantV2SerdeInputTest, PbAndArrowReadKeepExplicitGuards) {
               ErrorCode::NOT_IMPLEMENTED_ERROR);
     EXPECT_EQ(serde.read_column_from_pb(*column, values).code(), ErrorCode::NOT_IMPLEMENTED_ERROR);
     EXPECT_EQ(serde.read_column_from_arrow(*column, nullptr, 0, 0, cctz::utc_time_zone()).code(),
-              ErrorCode::NOT_IMPLEMENTED_ERROR);
+              ErrorCode::INVALID_ARGUMENT);
+    EXPECT_EQ(column->size(), 0);
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, ArrowStringTypesParseOneJsonDocumentPerRow) {
+    DataTypeVariantV2SerDe serde;
+    const std::vector<std::string> expected {R"({"a":{"b":1}})", "[1,2]", "{}", "null"};
+    for (const auto& type :
+         {arrow::utf8(), arrow::large_utf8(), arrow::binary(), arrow::large_binary()}) {
+        SCOPED_TRACE(type->ToString());
+        auto array = make_arrow_strings(type, {R"({"a":{"b":1}})", "[1,2]", "", std::nullopt});
+        auto column = ColumnVariantV2::create();
+        ASSERT_TRUE(serde.read_column_from_arrow(*column, array.get(), 0, array->length(),
+                                                 cctz::utc_time_zone())
+                            .ok());
+        ASSERT_EQ(column->size(), expected.size());
+        for (size_t row = 0; row < expected.size(); ++row) {
+            EXPECT_EQ(json_at(serde, *column, row), expected[row]);
+        }
+    }
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, ArrowReadsOnlyTheRequestedRange) {
+    DataTypeVariantV2SerDe serde;
+    auto array = make_arrow_strings(arrow::utf8(), {"1", R"({"k":"v"})", "3"});
+    auto column = ColumnVariantV2::create();
+    ASSERT_TRUE(
+            serde.read_column_from_arrow(*column, array.get(), 1, 3, cctz::utc_time_zone()).ok());
+    ASSERT_EQ(column->size(), 2);
+    EXPECT_EQ(json_at(serde, *column, 0), R"({"k":"v"})");
+    EXPECT_EQ(json_at(serde, *column, 1), "3");
+
+    EXPECT_TRUE(
+            serde.read_column_from_arrow(*column, array.get(), 2, 2, cctz::utc_time_zone()).ok());
+    EXPECT_EQ(column->size(), 2);
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, ArrowFollowsJsonInvalidPolicyAndFailureIsAtomic) {
+    DataTypeVariantV2SerDe serde;
+    auto array = make_arrow_strings(arrow::utf8(), {R"({"a":1})", "not-json"});
+    auto column = ColumnVariantV2::create();
+    {
+        ScopedInvalidJsonMode mode(false);
+        ASSERT_TRUE(serde.read_column_from_arrow(*column, array.get(), 0, 2, cctz::utc_time_zone())
+                            .ok());
+    }
+    ASSERT_EQ(column->size(), 2);
+    EXPECT_EQ(json_at(serde, *column, 1), R"("not-json")");
+
+    const size_t before = column->size();
+    {
+        ScopedInvalidJsonMode mode(true);
+        EXPECT_EQ(serde.read_column_from_arrow(*column, array.get(), 0, 2, cctz::utc_time_zone())
+                          .code(),
+                  ErrorCode::INVALID_ARGUMENT);
+    }
+    EXPECT_EQ(column->size(), before);
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, ArrowRejectsNonStringArrays) {
+    DataTypeVariantV2SerDe serde;
+    arrow::Int64Builder builder;
+    ASSERT_TRUE(builder.Append(1).ok());
+    std::shared_ptr<arrow::Array> array;
+    ASSERT_TRUE(builder.Finish(&array).ok());
+    auto column = ColumnVariantV2::create();
+    EXPECT_EQ(
+            serde.read_column_from_arrow(*column, array.get(), 0, 1, cctz::utc_time_zone()).code(),
+            ErrorCode::INVALID_ARGUMENT);
+    EXPECT_EQ(column->size(), 0);
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, NullableArrowKeepsSqlNullDistinctFromJsonNull) {
+    DataTypeNullableSerDe nullable_serde(std::make_shared<DataTypeVariantV2SerDe>());
+    auto array = make_arrow_strings(arrow::utf8(), {"null", std::nullopt, R"({"x":true})"});
+    MutableColumnPtr nested = ColumnVariantV2::create();
+    auto null_map = ColumnUInt8::create();
+    auto outer = ColumnNullable::create(std::move(nested), std::move(null_map));
+    ASSERT_TRUE(
+            nullable_serde.read_column_from_arrow(*outer, array.get(), 0, 3, cctz::utc_time_zone())
+                    .ok());
+    ASSERT_EQ(outer->size(), 3);
+    EXPECT_FALSE(outer->is_null_at(0));
+    EXPECT_TRUE(outer->is_null_at(1));
+    EXPECT_FALSE(outer->is_null_at(2));
+    DataTypeVariantV2SerDe serde;
+    EXPECT_EQ(json_at(serde, outer->get_nested_column(), 0), "null");
+    EXPECT_EQ(json_at(serde, outer->get_nested_column(), 2), R"({"x":true})");
+}
+
+TEST(DataTypeVariantV2SerdeInputTest, ArrowWriteThenReadRoundTrips) {
+    DataTypeVariantV2SerDe serde;
+    auto source = ColumnVariantV2::create();
+    for (std::string_view json : {R"({"a":[1,{"b":"c"}],"d":null})", "42", R"("s")", "[]"}) {
+        ASSERT_TRUE(deserialize_json(serde, *source, json).ok());
+    }
+    arrow::StringBuilder builder;
+    ASSERT_TRUE(serde.write_column_to_arrow(*source, nullptr, &builder, 0, source->size(),
+                                            cctz::utc_time_zone())
+                        .ok());
+    std::shared_ptr<arrow::Array> array;
+    ASSERT_TRUE(builder.Finish(&array).ok());
+
+    auto column = ColumnVariantV2::create();
+    ASSERT_TRUE(serde.read_column_from_arrow(*column, array.get(), 0, array->length(),
+                                             cctz::utc_time_zone())
+                        .ok());
+    ASSERT_EQ(column->size(), source->size());
+    for (size_t row = 0; row < source->size(); ++row) {
+        EXPECT_EQ(json_at(serde, *column, row), json_at(serde, *source, row));
+    }
+}
+
+// The tablet sink distributes a loaded block across tablets with insert_indices_from on the
+// nullable Variant column, so a multi-batch Arrow read must leave a column every row of which
+// can be selected in any order. The documents vary their paths and value types row by row.
+TEST(DataTypeVariantV2SerdeInputTest, MultiBatchArrowReadSurvivesSinkRowSelection) {
+    DataTypeVariantV2SerDe serde;
+    DataTypeNullableSerDe nullable_serde(std::make_shared<DataTypeVariantV2SerDe>());
+    constexpr size_t num_rows = 10000;
+    constexpr size_t batch_rows = 4096;
+    std::vector<std::optional<std::string>> documents;
+    documents.reserve(num_rows);
+    for (size_t i = 0; i < num_rows; ++i) {
+        if (i % 11 == 0) {
+            documents.emplace_back(std::nullopt);
+            continue;
+        }
+        std::string doc = "{";
+        doc += i % 7 == 0 ? "\"a\":\"text_" + std::to_string(i) + "\""
+                          : "\"a\":" + std::to_string(i);
+        if (i % 3 == 0) {
+            doc += ",\"s\":\"" + std::string(i % 50, 'x') + "\"";
+        }
+        if (i % 5 == 0) {
+            doc += ",\"n\":{\"x\":" + std::to_string(i) + ",\"y\":\"v" + std::to_string(i) + "\"}";
+        }
+        if (i > 8000) {
+            doc += ",\"late\":true";
+        }
+        doc += "}";
+        documents.emplace_back(std::move(doc));
+    }
+
+    MutableColumnPtr nested = ColumnVariantV2::create();
+    auto outer = ColumnNullable::create(std::move(nested), ColumnUInt8::create());
+    for (size_t begin = 0; begin < num_rows; begin += batch_rows) {
+        const size_t end = std::min(num_rows, begin + batch_rows);
+        std::vector<std::optional<std::string>> batch(documents.begin() + begin,
+                                                      documents.begin() + end);
+        auto array = make_arrow_strings(arrow::utf8(), batch);
+        ASSERT_TRUE(nullable_serde
+                            .read_column_from_arrow(*outer, array.get(), 0, end - begin,
+                                                    cctz::utc_time_zone())
+                            .ok());
+    }
+    ASSERT_EQ(outer->size(), num_rows);
+    ASSERT_EQ(outer->get_nested_column().size(), num_rows);
+
+    std::vector<std::string> expected(num_rows);
+    for (size_t row = 0; row < num_rows; ++row) {
+        if (documents[row].has_value()) {
+            expected[row] = json_at(serde, outer->get_nested_column(), row);
+        }
+    }
+
+    std::vector<uint32_t> selector(num_rows);
+    std::iota(selector.begin(), selector.end(), 0);
+    std::mt19937 rng(42);
+    std::shuffle(selector.begin(), selector.end(), rng);
+    auto target = outer->clone_empty();
+    target->insert_indices_from(*outer, selector.data(), selector.data() + selector.size());
+    ASSERT_EQ(target->size(), num_rows);
+    const auto& target_nullable = assert_cast<const ColumnNullable&>(*target);
+    for (size_t k = 0; k < num_rows; ++k) {
+        const size_t row = selector[k];
+        ASSERT_EQ(target_nullable.is_null_at(k), !documents[row].has_value()) << row;
+        if (documents[row].has_value()) {
+            ASSERT_EQ(json_at(serde, target_nullable.get_nested_column(), k), expected[row]) << row;
+        }
+    }
 }
 
 } // namespace doris
