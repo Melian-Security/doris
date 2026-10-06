@@ -218,6 +218,7 @@ struct WriterStats {
     int64_t total_add_batch_num = 0;
     int64_t num_node_channels = 0;
     int64_t load_back_pressure_version_time_ms = 0;
+    int64_t local_add_batch_num = 0;
     VNodeChannelStat channel_stat;
 };
 
@@ -319,6 +320,7 @@ public:
             writer_stats->total_add_batch_num += _add_batch_counter.add_batch_num;
             writer_stats->load_back_pressure_version_time_ms +=
                     _load_back_pressure_version_block_ms;
+            writer_stats->local_add_batch_num += _local_add_batch_num;
         }
     }
 
@@ -348,6 +350,14 @@ protected:
     void _add_block_success_callback(const PTabletWriterAddBlockResult& result,
                                      const WriteBlockCallbackContext& ctx);
     void _add_block_failed_callback(const WriteBlockCallbackContext& ctx);
+    // The body of _add_block_success_callback. The caller holds _closed_lock, has checked that
+    // the channel is not closed, and runs on a thread attached to this task.
+    void _handle_add_block_result(const PTabletWriterAddBlockResult& result,
+                                  const WriteBlockCallbackContext& ctx);
+
+    // Hands a non-eos batch to this BE's LoadChannelMgr on the calling thread, which holds the
+    // in-flight flag, and handles the result as a brpc response would be handled.
+    void _send_local_block(const PTabletWriterAddBlockRequest& request, const Block& block);
 
     void _refresh_back_pressure_version_wait_time(
             const ::google::protobuf::RepeatedPtrField<::doris::PTabletLoadRowsetInfo>&
@@ -453,6 +463,11 @@ protected:
 
     std::atomic<int64_t> _write_bytes {0};
     std::atomic<int64_t> _load_back_pressure_version_wait_time_ms {0};
+
+    // Decided once in init(): add-block batches go to the in-process LoadChannelMgr instead of
+    // brpc. Open, cancel and the eos request always use brpc.
+    bool _is_local_channel = false;
+    std::atomic<int64_t> _local_add_batch_num {0};
 };
 
 // an IndexChannel is related to specific table and its rollup and mv
@@ -763,6 +778,7 @@ private:
     RuntimeProfile::Counter* _total_wait_exec_timer = nullptr;
     RuntimeProfile::Counter* _max_wait_exec_timer = nullptr;
     RuntimeProfile::Counter* _add_batch_number = nullptr;
+    RuntimeProfile::Counter* _local_add_batch_number = nullptr;
     RuntimeProfile::Counter* _num_node_channels = nullptr;
     RuntimeProfile::Counter* _load_back_pressure_version_time_ms = nullptr;
 

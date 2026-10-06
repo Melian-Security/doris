@@ -64,6 +64,7 @@
 #include "exec/sink/vtablet_finder.h"
 #include "exprs/vexpr.h"
 #include "exprs/vexpr_fwd.h"
+#include "load/channel/load_channel_mgr.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/memory_reclamation.h"
@@ -619,6 +620,11 @@ Status VNodeChannel::init(RuntimeState* state) {
                                      _node_info.host, _node_info.brpc_port, channel_info());
     }
 
+    _is_local_channel = config::enable_local_tablet_writer_shortcut &&
+                        BackendOptions::get_backend_id() > 0 &&
+                        _node_id == BackendOptions::get_backend_id() &&
+                        state->exec_env()->load_channel_mgr() != nullptr;
+
     _rpc_timeout_ms = state->execution_timeout() * 1000;
     _timeout_watch.start();
 
@@ -1099,7 +1105,10 @@ void VNodeChannel::try_send_pending_block(RuntimeState* state) {
         _send_block_callback->clear_in_flight();
         return;
     }
-    if (block.rows() > 0) {
+    // A local channel hands the rows of a non-eos batch to the LoadChannelMgr of this process
+    // as they are. A batch without rows takes the brpc path, where it carries no block either.
+    const bool send_local = _is_local_channel && !request->eos() && block.rows() > 0;
+    if (block.rows() > 0 && !send_local) {
         SCOPED_ATOMIC_TIMER(&_serialize_batch_ns);
         size_t uncompressed_bytes = 0, compressed_bytes = 0;
         int64_t compressed_time = 0;
@@ -1130,6 +1139,11 @@ void VNodeChannel::try_send_pending_block(RuntimeState* state) {
         } else {
             remain_ms = config::min_load_rpc_timeout_ms;
         }
+    }
+
+    if (send_local) {
+        _send_local_block(*request, block);
+        return;
     }
 
     _send_block_callback->reset();
@@ -1244,6 +1258,30 @@ void VNodeChannel::try_send_pending_block(RuntimeState* state) {
     _next_packet_seq++;
 }
 
+void VNodeChannel::_send_local_block(const PTabletWriterAddBlockRequest& request,
+                                     const Block& block) {
+    {
+        // What the receiver allocates belongs to the load channel, so this node channel's
+        // consumer tracker must not see it. Re-attaching the current limiter starts a scope
+        // without consumer trackers; the result is created and freed inside it too.
+        auto* tracker_mgr = thread_context()->thread_mem_tracker_mgr.get();
+        tracker_mgr->attach_limiter_tracker(tracker_mgr->limiter_mem_tracker_sptr());
+        Defer detach {[tracker_mgr]() { tracker_mgr->detach_limiter_tracker(); }};
+        PTabletWriterAddBlockResult result;
+        _state->exec_env()->load_channel_mgr()->add_batch_local(request, block, &result);
+        _local_add_batch_num++;
+        // The packet sequence must advance before the in-flight flag is cleared, since the
+        // next batch may be sent as soon as it is.
+        _next_packet_seq++;
+        std::lock_guard<std::mutex> l(_closed_lock);
+        if (!_is_closed) {
+            // Only the eos request is the last one, and it never takes this path.
+            _handle_add_block_result(result, WriteBlockCallbackContext {});
+        }
+    }
+    _send_block_callback->clear_in_flight();
+}
+
 void VNodeChannel::_add_block_success_callback(const PTabletWriterAddBlockResult& result,
                                                const WriteBlockCallbackContext& ctx) {
     std::lock_guard<std::mutex> l(this->_closed_lock);
@@ -1253,6 +1291,11 @@ void VNodeChannel::_add_block_success_callback(const PTabletWriterAddBlockResult
         return;
     }
     SCOPED_ATTACH_TASK(_state);
+    _handle_add_block_result(result, ctx);
+}
+
+void VNodeChannel::_handle_add_block_result(const PTabletWriterAddBlockResult& result,
+                                            const WriteBlockCallbackContext& ctx) {
     Status status(Status::create(result.status()));
     if (status.ok()) {
         _refresh_back_pressure_version_wait_time(result.tablet_load_rowset_num_infos());
@@ -1490,14 +1533,17 @@ void VNodeChannel::mark_close(bool hang_wait) {
         return;
     }
 
-    bool need_adaptive_random_bucket_eos = _cur_add_block_request->is_adaptive_random_bucket();
+    // The eos request goes through brpc, so a local channel sends its last rows as a separate
+    // in-process batch ahead of an eos without rows.
+    bool split_rows_from_eos =
+            _cur_add_block_request->is_adaptive_random_bucket() || _is_local_channel;
     {
         std::lock_guard<std::mutex> l(_pending_batches_lock);
         if (!_cur_mutable_block) [[unlikely]] {
             // never had a block arrived. add a dummy block
             _cur_mutable_block = MutableBlock::create_unique();
         }
-        if (need_adaptive_random_bucket_eos && _cur_mutable_block->rows() > 0) {
+        if (split_rows_from_eos && _cur_mutable_block->rows() > 0) {
             _cur_add_block_request->set_eos(false);
             auto tmp_add_block_request =
                     std::make_shared<PTabletWriterAddBlockRequest>(*_cur_add_block_request);
@@ -1802,6 +1848,7 @@ Status VTabletWriter::_init(RuntimeState* state, RuntimeProfile* profile) {
     _total_wait_exec_timer = ADD_TIMER(profile, "TotalWaitExecTime");
     _max_wait_exec_timer = ADD_TIMER(profile, "MaxWaitExecTime");
     _add_batch_number = ADD_COUNTER(profile, "NumberBatchAdded", TUnit::UNIT);
+    _local_add_batch_number = ADD_COUNTER(profile, "NumberLocalBatchAdded", TUnit::UNIT);
     _num_node_channels = ADD_COUNTER(profile, "NumberNodeChannels", TUnit::UNIT);
     _load_back_pressure_version_time_ms = ADD_TIMER(profile, "LoadBackPressureVersionTimeMs");
 
@@ -2142,6 +2189,7 @@ Status VTabletWriter::close(Status exec_status) {
             COUNTER_SET(_total_wait_exec_timer, writer_stats.total_wait_exec_time_ns);
             COUNTER_SET(_max_wait_exec_timer, writer_stats.max_wait_exec_time_ns);
             COUNTER_SET(_add_batch_number, writer_stats.total_add_batch_num);
+            COUNTER_SET(_local_add_batch_number, writer_stats.local_add_batch_num);
             COUNTER_SET(_num_node_channels, writer_stats.num_node_channels);
             COUNTER_SET(_load_back_pressure_version_time_ms,
                         writer_stats.load_back_pressure_version_time_ms);

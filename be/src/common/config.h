@@ -941,6 +941,12 @@ DECLARE_mBool(brpc_usercode_in_pthread);
 // is greater than 1.8G. This is to avoid the error of Request length overflow (2G).
 DECLARE_mBool(transfer_large_data_by_brpc);
 
+// Whether a tablet sink hands add-block batches for a tablet channel on this same BE directly
+// to the local LoadChannelMgr instead of serializing them into a brpc call to itself. Open,
+// cancel and eos still go through brpc. Read once per node channel when the channel is
+// initialized, so a change applies to loads started afterwards.
+DECLARE_mBool(enable_local_tablet_writer_shortcut);
+
 // max number of txns for every txn_partition_map in txn manager
 // this is a self protection to avoid too many txns saving in manager
 DECLARE_mInt64(max_runnings_transactions_per_txn_map);
