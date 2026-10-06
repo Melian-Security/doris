@@ -29,6 +29,7 @@
 
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/cloud_tablet.h"
+#include "cloud/config.h"
 #include "cpp/sync_point.h"
 #include "load/stream_load/stream_load_context.h"
 #include "storage/olap_common.h"
@@ -42,8 +43,17 @@ using namespace cloud;
 using namespace std::chrono;
 
 class CloudMetaMgrTest : public testing::Test {
-    void SetUp() override {}
-    void TearDown() override {}
+    // The fill_version_holes tests here check one hole rowset per version; hole rowset version
+    // ranges are covered by cloud_hole_rowset_range_test.cpp.
+    void SetUp() override {
+        _saved_enable_hole_rowset_version_range = config::enable_hole_rowset_version_range;
+        config::enable_hole_rowset_version_range = false;
+    }
+    void TearDown() override {
+        config::enable_hole_rowset_version_range = _saved_enable_hole_rowset_version_range;
+    }
+
+    bool _saved_enable_hole_rowset_version_range = true;
 };
 
 TEST_F(CloudMetaMgrTest, response_status_uses_actual_code_when_valid) {

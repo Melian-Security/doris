@@ -2471,8 +2471,13 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
         return Status::OK();
     }
 
+    // A non-MoW RUNNING tablet fills each hole with hole rowsets covering version ranges (see
+    // CloudTablet::add_hole_rowsets); other tablets keep one hole rowset per version.
+    const bool use_version_range = tablet->can_use_hole_rowset_version_range();
     const auto& rs_metas = tablet->tablet_meta()->all_rs_metas();
     std::vector<RowsetSharedPtr> hole_rowsets;
+    std::vector<std::pair<Version, RowsetMetaSharedPtr>> hole_ranges;
+    int64_t hole_version_count = 0;
     for (const auto& hole : holes) {
         auto anchor_it = rs_metas.find(hole.anchor);
         if (anchor_it == rs_metas.end()) [[unlikely]] {
@@ -2485,11 +2490,21 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
         int64_t first_to_fill = is_schema_change_tablet
                                         ? std::max(hole.first, tablet->alter_version() + 1)
                                         : hole.first;
-        for (int64_t ver = first_to_fill; ver <= hole.last; ++ver) {
-            RowsetSharedPtr hole_rowset;
-            RETURN_IF_ERROR(
-                    create_empty_rowset_for_hole(tablet, ver, anchor_it->second, &hole_rowset));
-            hole_rowsets.push_back(hole_rowset);
+        if (first_to_fill <= hole.last) {
+            hole_version_count += hole.last - first_to_fill + 1;
+        }
+        if (use_version_range) {
+            // Filled after the walk: adding rowsets changes the index `holes` came from.
+            if (first_to_fill <= hole.last) {
+                hole_ranges.emplace_back(Version(first_to_fill, hole.last), anchor_it->second);
+            }
+        } else {
+            for (int64_t ver = first_to_fill; ver <= hole.last; ++ver) {
+                RowsetSharedPtr hole_rowset;
+                RETURN_IF_ERROR(create_empty_rowset_for_hole(tablet, ver, anchor_it->second,
+                                                             &hole_rowset));
+                hole_rowsets.push_back(hole_rowset);
+            }
         }
         LOG(INFO) << "Created empty rowset for version hole, from " << hole.first << " to "
                   << hole.last << " for tablet " << tablet->tablet_id()
@@ -2500,28 +2515,53 @@ Status CloudMetaMgr::fill_version_holes(CloudTablet* tablet, int64_t max_version
     }
 
     if (!hole_rowsets.empty()) {
-        size_t hole_count = hole_rowsets.size();
         tablet->add_rowsets(std::move(hole_rowsets), false, wlock, false);
-        g_cloud_version_hole_filled_count << hole_count;
     }
+    // Holes are in ascending version order, so only the last one can extend the tablet's
+    // trailing hole rowset.
+    for (const auto& [versions, template_meta] : hole_ranges) {
+        RETURN_IF_ERROR(tablet->add_hole_rowsets(versions, template_meta, wlock));
+    }
+    g_cloud_version_hole_filled_count << hole_version_count;
     return Status::OK();
 }
 
 Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, int64_t version,
                                                   RowsetMetaSharedPtr prev_rowset_meta,
                                                   RowsetSharedPtr* rowset) {
+    return create_empty_rowset_for_hole(tablet, Version(version, version),
+                                        std::move(prev_rowset_meta), rowset);
+}
+
+Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, const Version& versions,
+                                                  RowsetMetaSharedPtr prev_rowset_meta,
+                                                  RowsetSharedPtr* rowset,
+                                                  const RowsetId* rowset_id) {
+    if (versions.first > versions.second ||
+        (versions.first != versions.second && rowset_id == nullptr)) {
+        return Status::InvalidArgument(
+                "invalid hole rowset request, tablet_id={}, version={}, has_rowset_id={}",
+                tablet->tablet_id(), versions.to_string(), rowset_id != nullptr);
+    }
     // Create a RowsetMeta for the empty rowset
     auto rs_meta = std::make_shared<RowsetMeta>();
 
-    // Generate a deterministic rowset ID for the hole (same tablet_id + version = same rowset_id)
+    // A single-version hole has a deterministic rowset ID (same tablet_id + version = same
+    // rowset_id). Hole rowsets of a version range (CloudTablet::add_hole_rowsets) can be
+    // re-created with the versions of one still on the stale path, so they take a unique id
+    // from the caller.
     RowsetId hole_rowset_id;
-    hole_rowset_id.init(2, 0, tablet->tablet_id(), version);
+    if (rowset_id != nullptr) {
+        hole_rowset_id = *rowset_id;
+    } else {
+        hole_rowset_id.init(2, 0, tablet->tablet_id(), versions.first);
+    }
     rs_meta->set_rowset_id(hole_rowset_id);
 
     // Generate a deterministic load_id for the hole rowset (same tablet_id + version = same load_id)
     PUniqueId load_id;
     load_id.set_hi(tablet->tablet_id());
-    load_id.set_lo(version);
+    load_id.set_lo(versions.first);
     rs_meta->set_load_id(load_id);
 
     // Copy schema and other metadata from template
@@ -2535,8 +2575,8 @@ Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, int64_t v
     rs_meta->set_index_id(tablet->index_id());
     rs_meta->set_partition_id(tablet->partition_id());
     rs_meta->set_tablet_uid(tablet->tablet_uid());
-    rs_meta->set_version(Version(version, version));
-    rs_meta->set_txn_id(version);
+    rs_meta->set_version(versions);
+    rs_meta->set_txn_id(versions.first);
 
     rs_meta->set_num_rows(0);
     rs_meta->set_total_disk_size(0);
@@ -2553,7 +2593,7 @@ Status CloudMetaMgr::create_empty_rowset_for_hole(CloudTablet* tablet, int64_t v
     if (!s.ok()) {
         LOG_WARNING("Failed to create empty rowset for hole")
                 .tag("tablet_id", tablet->tablet_id())
-                .tag("version", version)
+                .tag("version", versions.to_string())
                 .error(s);
         return s;
     }

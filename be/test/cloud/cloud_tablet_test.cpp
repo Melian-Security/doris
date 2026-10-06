@@ -1854,9 +1854,12 @@ TEST_F(CloudTabletVisibleVersionIndexTest, EmptyPendingRowsetUsesLatestRowsetAsT
     _tablet->apply_visible_pending_rowsets();
 
     EXPECT_EQ(_tablet->max_version_unlocked(), 312);
-    EXPECT_TRUE(_tablet->rowset_map().contains(Version(311, 311)));
-    EXPECT_TRUE(_tablet->rowset_map().contains(Version(312, 312)));
-    EXPECT_TRUE(_tablet->rowset_map().at(Version(311, 311))->is_hole_rowset());
+    // The two consecutive empty versions become one hole rowset covering both
+    // (enable_hole_rowset_version_range, on by default).
+    EXPECT_TRUE(_tablet->rowset_map().contains(Version(311, 312)));
+    EXPECT_TRUE(_tablet->rowset_map().at(Version(311, 312))->is_hole_rowset());
+    EXPECT_EQ(_tablet->rowset_map().at(Version(311, 312))->rowset_meta()->tablet_schema(),
+              _tablet->rowset_map().at(Version(301, 310))->rowset_meta()->tablet_schema());
     EXPECT_EQ(pending_rs_count(), 0);
     ASSERT_NO_FATAL_FAILURE(check_consistent(2));
 }

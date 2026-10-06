@@ -160,6 +160,24 @@ public:
     void delete_rowsets(const std::vector<RowsetSharedPtr>& to_delete,
                         std::unique_lock<BthreadSharedMutex>& meta_lock);
 
+    // Whether version holes of this tablet are filled with hole rowsets covering version ranges
+    // (see `add_hole_rowsets`) rather than one hole rowset per version. Only non-MoW RUNNING
+    // tablets do, so MoW delete bitmaps and schema change alter_version handling are unaffected.
+    bool can_use_hole_rowset_version_range() const;
+
+    // Fill every version in `versions` with empty hole rowsets. None of these versions may be
+    // covered by a live rowset. `template_meta` provides the schema of the new rowsets.
+    //
+    // With `can_use_hole_rowset_version_range()`, a run of versions becomes one hole rowset of at
+    // most `config::hole_rowset_max_versions` versions, and a run starting right after a trailing
+    // hole rowset extends that rowset instead of adding a new one. Each intermediate version v
+    // of a range [s, e] stays readable through a stale rowset [s, v] on the stale path, the same
+    // way compaction keeps the versions of its input rowsets readable.
+    // Otherwise one hole rowset per version is added, as before.
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    Status add_hole_rowsets(const Version& versions, const RowsetMetaSharedPtr& template_meta,
+                            std::unique_lock<BthreadSharedMutex>& meta_lock);
+
     // Like delete_rowsets, but also removes edges from the version graph.
     // Used by schema change to prevent the greedy capture algorithm from
     // preferring stale compaction rowsets over individual SC output rowsets.
@@ -465,6 +483,24 @@ private:
     // Add rowsets directly with warmup
     void _add_rowsets_directly(std::vector<RowsetSharedPtr>& rowsets, bool warmup_delta_data);
 
+    // The live trailing hole rowset that a hole range starting at `_max_version + 1` may extend,
+    // or nullptr. A rowset referenced outside the version map (e.g. a running compaction holding
+    // it as input) is never extended. MUST hold EXCLUSIVE `_meta_lock`.
+    RowsetSharedPtr _extendable_tail_hole_rowset() const;
+
+    // Rowsets from meta-service follow version boundaries of whichever BE produced them, so they
+    // can cover only part of a multi-version hole rowset of this tablet. Replaces each such hole
+    // rowset with hole rowsets covering its versions that `to_add` does not cover, and rebuilds
+    // the stale hole rowsets of its range so each stays nested in one live rowset.
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    void _split_hole_rowsets_overlapped_by(const std::vector<RowsetSharedPtr>& to_add,
+                                           std::unique_lock<BthreadSharedMutex>& meta_lock);
+
+    // Removes a live rowset from the rowset map, the visible version index, the delta counts,
+    // the version graph and the tablet meta without moving it to the stale path.
+    // MUST hold EXCLUSIVE `_meta_lock`.
+    void _drop_live_rowset(const Version& version);
+
     // MUST hold EXCLUSIVE `_meta_lock`. Keep `_visible_rowset_deltas` in step with
     // `_rs_version_map`; call right after the map gains, replaces or loses `version`.
     void _track_visible_rowset_delta(const RowsetSharedPtr& rs);
@@ -512,6 +548,8 @@ private:
     int64_t _cumulative_compaction_cnt = 0;
     int64_t _full_compaction_cnt = 0;
     int64_t _max_version = -1;
+    // Version of the last hole rowset `add_hole_rowsets` put at the tail; validated on use.
+    Version _tail_hole_version {-1, -1};
     // Mirrors the version keys of `_tablet_meta->all_rs_metas()`. Every mutation of those rowset
     // metas in this class updates it under the exclusive `_meta_lock`.
     CloudRowsetVersionIndex _visible_version_index;

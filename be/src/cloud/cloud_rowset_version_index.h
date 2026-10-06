@@ -91,6 +91,10 @@ public:
     // All indexed versions `v` with `range.contains(v)`, in ascending order.
     std::vector<Version> versions_contained_in(const Version& range) const;
 
+    // All indexed versions sharing at least one version with `range`, in ascending order.
+    // Assumes indexed versions do not overlap each other, as visible rowset versions do not.
+    std::vector<Version> versions_overlapping(const Version& range) const;
+
     // Inner holes in ascending order, then the trailing hole up to `max_version`
     // if there is one. Empty when the index is empty.
     std::vector<Hole> holes(int64_t max_version) const;

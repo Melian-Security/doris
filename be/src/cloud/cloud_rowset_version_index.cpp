@@ -70,6 +70,20 @@ std::vector<Version> CloudRowsetVersionIndex::versions_contained_in(const Versio
     return result;
 }
 
+std::vector<Version> CloudRowsetVersionIndex::versions_overlapping(const Version& range) const {
+    std::vector<Version> result;
+    auto it = _versions.lower_bound(Version(range.first, std::numeric_limits<int64_t>::min()));
+    // Only the version right before the first one starting in `range` can start before `range`
+    // and still reach into it.
+    if (it != _versions.begin() && std::prev(it)->second >= range.first) {
+        it = std::prev(it);
+    }
+    for (; it != _versions.end() && it->first <= range.second; ++it) {
+        result.push_back(*it);
+    }
+    return result;
+}
+
 std::vector<CloudRowsetVersionIndex::Hole> CloudRowsetVersionIndex::holes(
         int64_t max_version) const {
     std::vector<Hole> result;

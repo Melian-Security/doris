@@ -52,7 +52,9 @@ suite("test_cloud_empty_rs_notify_be_after_txn_commit", "nonConcurrent") {
     def customBeConfig = [
         enable_cloud_make_rs_visible_on_be : true,
         cloud_mow_sync_rowsets_when_load_txn_begin : false,
-        skip_writing_empty_rowset_metadata : true // empty rowset opt
+        skip_writing_empty_rowset_metadata : true, // empty rowset opt
+        // the rowset counts below assume one hole rowset per empty version
+        enable_hole_rowset_version_range : false
     ]
 
     def getTabletRowsets = {def tabletId ->

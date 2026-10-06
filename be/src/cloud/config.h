@@ -137,6 +137,15 @@ DECLARE_mInt64(get_delete_bitmap_bytes_threshold);
 // Skip writing empty rowset metadata to meta service
 DECLARE_mBool(skip_writing_empty_rowset_metadata);
 
+// Fill a run of consecutive versions that a non-MoW tablet has no rowset for (version holes,
+// e.g. versions whose loads wrote other tablets of the partition) with one empty hole rowset
+// covering the whole run, extending the tablet's trailing hole rowset as new versions arrive,
+// instead of creating one empty hole rowset per version.
+DECLARE_mBool(enable_hole_rowset_version_range);
+// Maximum number of versions a single hole rowset may cover when
+// enable_hole_rowset_version_range is true.
+DECLARE_mInt64(hole_rowset_max_versions);
+
 // When skip_writing_empty_rowset_metadata is on, commit the empty rowset of a tablet that received
 // no rows in a load without building a rowset writer for it, as long as the tablet is cached on
 // this BE. Only the per-tablet BE bookkeeping of the load (empty rowset markers, approximate

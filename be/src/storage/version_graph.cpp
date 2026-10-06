@@ -28,6 +28,7 @@
 #include <optional>
 #include <ostream>
 #include <ranges>
+#include <unordered_set>
 #include <utility>
 
 #include "common/logging.h"
@@ -198,6 +199,27 @@ void TimestampedVersionTracker::add_stale_path_version(
     sort(timestamped_versions.begin(), timestamped_versions.end(), TimestampedVersionPtrCompare());
     _stale_version_path_map[_next_path_id] = ptr;
     _next_path_id++;
+}
+
+void TimestampedVersionTracker::remove_stale_versions(const std::vector<Version>& versions) {
+    if (versions.empty()) {
+        return;
+    }
+    std::unordered_set<Version, HashOfVersion> to_remove(versions.begin(), versions.end());
+    for (auto it = _stale_version_path_map.begin(); it != _stale_version_path_map.end();) {
+        auto& path = it->second->timestamped_versions();
+        std::erase_if(path, [&to_remove](const TimestampedVersionSharedPtr& v) {
+            return to_remove.contains(v->version());
+        });
+        if (path.empty()) {
+            it = _stale_version_path_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& version : to_remove) {
+        static_cast<void>(_version_graph.delete_version_from_graph(version));
+    }
 }
 
 // Capture consistent versions from graph.
