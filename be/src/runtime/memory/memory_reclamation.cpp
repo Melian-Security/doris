@@ -19,6 +19,7 @@
 
 #include <unordered_map>
 
+#include "load/memtable/load_memory_backpressure.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/global_memory_arbitrator.h"
 #include "runtime/memory/jemalloc_control.h"
@@ -223,11 +224,16 @@ bool MemoryReclamation::revoke_process_memory(const std::string& revoke_reason) 
             MemTrackerLimiter::type_string(MemTrackerLimiter::Type::LOAD),
             MemTrackerLimiter::make_type_trackers_profile_str(MemTrackerLimiter::Type::LOAD));
     RuntimeProfile* free_top_load_profile = profile->create_child("FreeTopMemoryLoad", true, true);
-    freed_mem +=
-            revoke_tasks_memory(MemInfo::process_full_gc_size() - freed_mem, resource_ctxs,
-                                revoke_reason, free_top_load_profile, PriorityCmpFunc::TOP_MEMORY,
-                                {FilterFunc::IS_LOAD}, ActionFunc::CANCEL);
-    return freed_mem > MemInfo::process_full_gc_size();
+    // A cancelled load is replayed from scratch by its client, so free only what the target asks.
+    int64_t load_free_target = LoadMemoryBackpressure::process_gc_load_free_target(
+            MemInfo::process_full_gc_size(), GlobalMemoryArbitrator::process_memory_usage(),
+            MemInfo::mem_limit(), config::load_memory_gc_free_extra_percent,
+            GlobalMemoryArbitrator::sys_mem_available() <
+                    MemInfo::sys_mem_available_low_water_mark());
+    freed_mem += revoke_tasks_memory(load_free_target - freed_mem, resource_ctxs, revoke_reason,
+                                     free_top_load_profile, PriorityCmpFunc::TOP_MEMORY,
+                                     {FilterFunc::IS_LOAD}, ActionFunc::CANCEL);
+    return freed_mem > load_free_target;
 }
 
 void MemoryReclamation::je_purge_dirty_pages() {
