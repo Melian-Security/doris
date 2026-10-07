@@ -718,6 +718,7 @@ DEFINE_String(pprof_profile_dir, "${DORIS_HOME}/log");
 DEFINE_mString(jeprofile_dir, "${DORIS_HOME}/log");
 DEFINE_mBool(enable_je_purge_dirty_pages, "true");
 DEFINE_mInt32(je_dirty_decay_ms, "5000");
+DEFINE_mInt32(je_dirty_decay_ms_over_soft_limit, "0");
 
 // to forward compatibility, will be removed later
 DEFINE_mBool(enable_token_check, "true");
