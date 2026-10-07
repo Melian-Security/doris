@@ -84,8 +84,7 @@ bool run_off_event_loop(HttpRequest* req, ThreadPool* pool, std::function<void()
         work();
         auto* task = new DeferredReply {std::move(alive), std::move(reply)};
         static const timeval kImmediately {0, 0};
-        if (event_base_once(base, -1, EV_TIMEOUT, run_deferred_reply, task, &kImmediately) !=
-            0) {
+        if (event_base_once(base, -1, EV_TIMEOUT, run_deferred_reply, task, &kImmediately) != 0) {
             LOG(ERROR) << "failed to schedule a deferred http reply on its event loop";
             delete task;
         }

@@ -136,12 +136,10 @@ TEST(OffEventLoopTest, RequestWithoutConnectionIsNotScheduled) {
     {
         HttpRequest req(ev_req);
         bool ran = false;
-        EXPECT_FALSE(run_off_event_loop(
-                &req, pool.get(), [&]() { ran = true; }, []() {}));
+        EXPECT_FALSE(run_off_event_loop(&req, pool.get(), [&]() { ran = true; }, []() {}));
         pool->wait();
         EXPECT_FALSE(ran);
-        EXPECT_FALSE(run_off_event_loop(
-                &req, nullptr, []() {}, []() {}));
+        EXPECT_FALSE(run_off_event_loop(&req, nullptr, []() {}, []() {}));
     }
     evhttp_request_free(ev_req);
 }
