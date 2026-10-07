@@ -34,6 +34,7 @@
 #include "benchmark_hll_merge.hpp"
 #include "benchmark_jemalloc_free_stall.hpp"
 #include "benchmark_local_tablet_writer.hpp"
+#include "benchmark_segment_compression.hpp"
 #include "benchmark_time_series_empty_run.hpp"
 #include "benchmark_variant_v2_deserialize.hpp"
 #include "benchmark_variant_v2_json_encode.hpp"
