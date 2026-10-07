@@ -529,6 +529,9 @@ DECLARE_mBool(enable_vertical_compaction);
 DECLARE_mBool(enable_ordered_data_compaction);
 // In vertical compaction, column number for every group
 DECLARE_mInt32(vertical_compaction_num_columns_per_group);
+// In vertical compaction of value column groups, copy rows from interleaved inputs by gathering
+// each column once per output block instead of one range copy per run of same-source rows.
+DECLARE_mBool(enable_vertical_compaction_gather_copy);
 // In vertical compaction, max memory usage for row_source_buffer
 DECLARE_Int32(vertical_compaction_max_row_source_memory_mb);
 // In vertical compaction, max dest segment file size

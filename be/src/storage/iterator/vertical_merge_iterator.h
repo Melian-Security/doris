@@ -190,9 +190,9 @@ public:
 
     void add_cur_batch() { _cur_batch_num++; }
 
-    bool is_cur_block_finished() { return _index_in_block == _block->rows() - 1; }
+    bool is_cur_block_finished() { return _index_in_block == _block_rows - 1; }
 
-    size_t remain_rows() { return _block->rows() - _index_in_block; }
+    size_t remain_rows() { return _block_rows - _index_in_block; }
 
     bool is_first_row() const { return _is_first_row; }
     void set_is_first_row(bool is_first_row) { _is_first_row = is_first_row; }
@@ -247,6 +247,8 @@ private:
     bool _inited = false;
     mutable bool _is_same = false;
     int32_t _index_in_block = -1;
+    // Row count of _block, cached at load so per-run bookkeeping avoids Block::rows().
+    int64_t _block_rows = 0;
     size_t _block_row_max = 0;
     int64_t _num_key_columns;
     const std::vector<uint32_t> _key_group_cluster_key_idxes;
@@ -426,9 +428,27 @@ public:
     uint64_t merged_rows() const override { return _filtered_rows; }
 
 private:
+    // Rows of one source block consumed by the current output batch. A context consumes its block
+    // in order, so all runs taken from one block form the contiguous range [begin, end).
+    struct SourceSlice {
+        std::shared_ptr<Block> block;
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    // One maximal run of consecutive output rows taken from one source slice.
+    struct SourceRun {
+        uint32_t slice = 0;
+        uint32_t start = 0;
+        uint32_t count = 0;
+    };
+
     int64_t _get_size(Block* block) { return block->rows(); }
 
     Status check_all_iter_finished();
+
+    Status _next_batch_by_runs(Block* block);
+    Status _next_batch_by_slices(Block* block);
+    void _copy_slices(Block* block, size_t rows);
 
     // released after build ctx
     std::vector<RowwiseIteratorUPtr> _origin_iters;
@@ -443,6 +463,14 @@ private:
     RowSourcesBuffer* _row_sources_buf;
     StorageReadOptions _opts;
     CompactionSampleInfo* _sample_info = nullptr;
+
+    std::vector<SourceSlice> _slices;
+    std::vector<SourceRun> _runs;
+    // Index into _slices of the slice each source order last contributed in this batch, or -1.
+    std::vector<int32_t> _slice_by_order;
+    std::vector<uint32_t> _gather_indices;
+    // Per output column scratch holding this batch's source slices back to back.
+    std::vector<MutableColumnPtr> _gather_scratch;
 };
 
 // segment merge iterator

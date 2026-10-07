@@ -30,6 +30,7 @@
 #include "common/logging.h"
 #include "core/block/column_with_type_and_name.h"
 #include "core/column/column.h"
+#include "core/column/column_nullable.h"
 #include "core/data_type/data_type.h"
 #include "core/string_ref.h"
 #include "core/types.h"
@@ -390,7 +391,7 @@ Status VerticalMergeIteratorContext::advance() {
     _is_same = false;
     do {
         _index_in_block++;
-        if (LIKELY(_index_in_block < _block->rows())) {
+        if (LIKELY(_index_in_block < _block_rows)) {
             return Status::OK();
         }
         // current batch has no data, load next batch
@@ -408,7 +409,7 @@ Status VerticalMergeIteratorContext::advance_by(size_t n) {
     while (n > 0) {
         // Calculate how many rows we can advance within current block
         // _index_in_block points to current row, so remaining = total - current - 1
-        int64_t remaining_in_block = static_cast<int64_t>(_block->rows()) - _index_in_block - 1;
+        int64_t remaining_in_block = _block_rows - _index_in_block - 1;
 
         if (static_cast<int64_t>(n) <= remaining_in_block) {
             // All n rows are within current block
@@ -459,6 +460,7 @@ Status VerticalMergeIteratorContext::_load_next_block() {
                 // When reading to the end of the segment file, clearing the block did not release the memory.
                 // Directly releasing the block to free up memory.
                 _block.reset();
+                _block_rows = 0;
                 // When reading through segment file for columns that are dictionary encoded,
                 // the column iterator in the segment iterator will hold the dictionary.
                 // Release the segment iterator to free up the dictionary.
@@ -482,7 +484,8 @@ Status VerticalMergeIteratorContext::_load_next_block() {
                         RowLocation(_rowset_id, row_location.segment_id, row_location.row_id);
             }
         }
-    } while (_block->rows() == 0);
+        _block_rows = static_cast<int64_t>(_block->rows());
+    } while (_block_rows == 0);
     _index_in_block = -1;
     _valid = true;
     return Status::OK();
@@ -905,6 +908,141 @@ Status VerticalMaskMergeIterator::unique_key_next_batch(std::vector<RowBatch>* b
 
 Status VerticalMaskMergeIterator::next_batch(Block* block) {
     DCHECK(_row_sources_buf);
+    if (config::enable_vertical_compaction_gather_copy) {
+        return _next_batch_by_slices(block);
+    }
+    return _next_batch_by_runs(block);
+}
+
+Status VerticalMaskMergeIterator::_next_batch_by_slices(Block* block) {
+    _runs.clear();
+    _slices.clear();
+    _slice_by_order.assign(_origin_iter_ctx.size(), -1);
+    size_t rows = 0;
+    size_t pending_rows = 0;
+    auto st = _row_sources_buf->has_remaining();
+    while (rows < _block_row_max && st.ok()) {
+        uint16_t order = _row_sources_buf->current().get_source_num();
+        DCHECK(order < _origin_iter_ctx.size());
+        auto& ctx = _origin_iter_ctx[order];
+        RETURN_IF_ERROR(ctx->init(_opts, _sample_info));
+        if (!ctx->valid()) {
+            LOG(INFO) << "VerticalMergeIteratorContext not valid";
+            return Status::InternalError("VerticalMergeIteratorContext not valid");
+        }
+
+        const size_t remain_rows = ctx->remain_rows();
+        size_t limit = std::min(remain_rows, _block_row_max - rows);
+        auto same_source_cnt = _row_sources_buf->same_source_count(order, limit);
+        _row_sources_buf->advance(same_source_cnt);
+
+        const uint32_t start = ctx->current_row_pos();
+        const auto count = static_cast<uint32_t>(same_source_cnt);
+        int32_t slice = _slice_by_order[order];
+        if (slice < 0 || _slices[slice].block.get() != ctx->block()) {
+            slice = static_cast<int32_t>(_slices.size());
+            _slices.push_back({.block = ctx->block_ptr(), .begin = start, .end = start});
+            _slice_by_order[order] = slice;
+        }
+        auto& source_slice = _slices[slice];
+        DCHECK_EQ(source_slice.end, start);
+        source_slice.end = start + count;
+        if (!_runs.empty() && _runs.back().slice == static_cast<uint32_t>(slice)) {
+            _runs.back().count += count;
+        } else {
+            _runs.push_back({.slice = static_cast<uint32_t>(slice), .start = start, .count = count});
+        }
+        pending_rows += same_source_cnt;
+
+        if (same_source_cnt == remain_rows) {
+            // This run ends the context's block. Copy the pending rows before the context reads
+            // its next block, so no source block is read after its iterator has moved on, as
+            // with the per-run copy.
+            RETURN_IF_CATCH_EXCEPTION(_copy_slices(block, pending_rows));
+            pending_rows = 0;
+            _runs.clear();
+            _slices.clear();
+            std::fill(_slice_by_order.begin(), _slice_by_order.end(), -1);
+        }
+        // Step to the last row of the run inside the block, then past it with advance(), which
+        // positions on the first row of the next block when the run ends this one.
+        RETURN_IF_ERROR(ctx->advance_by(same_source_cnt - 1));
+        RETURN_IF_ERROR(ctx->advance());
+        rows += same_source_cnt;
+        st = _row_sources_buf->has_remaining();
+    }
+    RETURN_IF_CATCH_EXCEPTION(_copy_slices(block, pending_rows));
+    _runs.clear();
+    _slices.clear();
+    if (st.is<END_OF_FILE>()) {
+        RETURN_IF_ERROR(check_all_iter_finished());
+    }
+    return st;
+}
+
+void VerticalMaskMergeIterator::_copy_slices(Block* block, size_t rows) {
+    if (rows == 0) {
+        return;
+    }
+    // Long runs are already cheap to copy range by range. Short runs from interleaved sources
+    // pay a virtual call per run per column; for those, each column first appends this batch's
+    // source slices back to back (one bulk copy per source block) and then gathers the output
+    // order with a single insert_indices_from.
+    constexpr size_t MIN_AVERAGE_RUN_FOR_RANGE_COPY = 8;
+    const bool short_runs = rows < _runs.size() * MIN_AVERAGE_RUN_FOR_RANGE_COPY;
+    if (short_runs) {
+        std::vector<uint32_t> slice_base(_slices.size());
+        uint32_t base = 0;
+        for (size_t i = 0; i < _slices.size(); ++i) {
+            slice_base[i] = base;
+            base += _slices[i].end - _slices[i].begin;
+        }
+        DCHECK_EQ(base, rows);
+        _gather_indices.resize(rows);
+        uint32_t* out = _gather_indices.data();
+        for (const auto& run : _runs) {
+            const uint32_t first = slice_base[run.slice] + (run.start - _slices[run.slice].begin);
+            for (uint32_t i = 0; i < run.count; ++i) {
+                *out++ = first + i;
+            }
+        }
+        if (_gather_scratch.size() < _ori_return_cols) {
+            _gather_scratch.resize(_ori_return_cols);
+        }
+    }
+
+    for (size_t col = 0; col < _ori_return_cols; ++col) {
+        IColumn& dst = block->get_by_position(col).column->assert_mutable_ref();
+        const IColumn* physical = &dst;
+        if (const auto* nullable = check_and_get_column<ColumnNullable>(dst)) {
+            physical = &nullable->get_nested_column();
+        }
+        const bool gatherable = physical->is_column_string() || !physical->is_variable_length();
+        if (short_runs && gatherable) {
+            // Output column types are fixed for the lifetime of this iterator.
+            auto& scratch = _gather_scratch[col];
+            if (!scratch) {
+                scratch = dst.clone_empty();
+            } else {
+                scratch->clear();
+            }
+            scratch->reserve(rows);
+            for (const auto& slice : _slices) {
+                scratch->insert_range_from(*slice.block->get_by_position(col).column, slice.begin,
+                                           slice.end - slice.begin);
+            }
+            dst.insert_indices_from(*scratch, _gather_indices.data(),
+                                    _gather_indices.data() + rows);
+            continue;
+        }
+        for (const auto& run : _runs) {
+            dst.insert_range_from(*_slices[run.slice].block->get_by_position(col).column, run.start,
+                                  run.count);
+        }
+    }
+}
+
+Status VerticalMaskMergeIterator::_next_batch_by_runs(Block* block) {
     size_t rows = 0;
     auto st = _row_sources_buf->has_remaining();
     while (rows < _block_row_max && st.ok()) {
