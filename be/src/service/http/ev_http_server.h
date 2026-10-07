@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +35,14 @@ namespace doris {
 class HttpHandler;
 class HttpRequest;
 class ThreadPool;
+
+// Runs `work` on `pool`, then `reply` on the event loop thread that owns `req`'s connection.
+// Each event loop thread serves many connections, so a handler that blocks on it (for example
+// until a load finishes) stops every other connection of that loop from being read, including
+// request bodies still in flight. `reply` is dropped if `req` was freed in the meantime.
+// Returns false when nothing was scheduled; the caller then does the work inline.
+bool run_off_event_loop(HttpRequest* req, ThreadPool* pool, std::function<void()> work,
+                        std::function<void()> reply);
 
 class EvHttpServer {
 public:

@@ -49,6 +49,54 @@ struct evhttp;
 
 namespace doris {
 
+namespace {
+
+struct DeferredReply {
+    std::weak_ptr<void> request_alive;
+    std::function<void()> reply;
+};
+
+void run_deferred_reply(evutil_socket_t /*fd*/, short /*events*/, void* arg) {
+    std::unique_ptr<DeferredReply> task(static_cast<DeferredReply*>(arg));
+    if (task->request_alive.expired()) {
+        LOG(WARNING) << "http request was freed before its deferred reply";
+        return;
+    }
+    task->reply();
+}
+
+} // namespace
+
+bool run_off_event_loop(HttpRequest* req, ThreadPool* pool, std::function<void()> work,
+                        std::function<void()> reply) {
+    if (pool == nullptr || req == nullptr || req->get_evhttp_request() == nullptr) {
+        return false;
+    }
+    evhttp_connection* conn = evhttp_request_get_connection(req->get_evhttp_request());
+    event_base* base = conn == nullptr ? nullptr : evhttp_connection_get_base(conn);
+    if (base == nullptr) {
+        return false;
+    }
+    // The event bases are created after evthread_use_pthreads(), so event_base_once() may be
+    // called from a pool thread and wakes the loop.
+    auto st = pool->submit_func([base, alive = req->lifetime_token(), work = std::move(work),
+                                 reply = std::move(reply)]() mutable {
+        work();
+        auto* task = new DeferredReply {std::move(alive), std::move(reply)};
+        static const timeval kImmediately {0, 0};
+        if (event_base_once(base, -1, EV_TIMEOUT, run_deferred_reply, task, &kImmediately) !=
+            0) {
+            LOG(ERROR) << "failed to schedule a deferred http reply on its event loop";
+            delete task;
+        }
+    });
+    if (!st.ok()) {
+        LOG(WARNING) << "failed to submit http work off the event loop: " << st;
+        return false;
+    }
+    return true;
+}
+
 static void on_chunked(struct evhttp_request* ev_req, void* param) {
     HttpRequest* request = (HttpRequest*)ev_req->on_free_cb_arg;
     request->handler()->on_chunk_data(request);

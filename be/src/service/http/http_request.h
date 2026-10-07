@@ -74,6 +74,10 @@ public:
 
     struct evhttp_request* get_evhttp_request() const { return _ev_req; }
 
+    // Expires when this request is destroyed. Work finishing on another thread checks it on the
+    // event loop thread before touching the request.
+    std::weak_ptr<void> lifetime_token() const { return _lifetime_token; }
+
     std::shared_ptr<void> handler_ctx() const { return _handler_ctx; }
     void set_handler_ctx(std::shared_ptr<void> ctx) {
         DCHECK(_handler != nullptr);
@@ -97,6 +101,8 @@ private:
     HttpHandler* _handler = nullptr;
 
     std::shared_ptr<void> _handler_ctx;
+
+    std::shared_ptr<void> _lifetime_token = std::make_shared<char>(0);
     std::string _request_body;
 };
 
