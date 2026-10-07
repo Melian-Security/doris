@@ -122,6 +122,12 @@ DECLARE_Int32(arrow_flight_sql_port);
 // Validate Arrow input buffers in opted-in Arrow readers before converting them to Doris columns.
 DECLARE_Bool(enable_arrow_input_validation);
 
+// Read an Arrow stream load one record batch at a time and return blocks of at most
+// arrow_stream_load_block_rows rows, instead of decoding the whole stream into one block.
+DECLARE_mBool(enable_arrow_stream_load_streaming_read);
+// Row cap of one block from the Arrow stream load reader. <= 0 uses the load's batch_size.
+DECLARE_mInt32(arrow_stream_load_block_rows);
+
 // port for cdc client scan oltp cdc data
 DECLARE_Int32(cdc_client_port);
 
