@@ -460,7 +460,7 @@ void Daemon::report_runtime_query_statistics_thread() {
 }
 
 void Daemon::je_reset_dirty_decay_thread() const {
-    int64_t last_decay_ms = 0;
+    [[maybe_unused]] int64_t last_decay_ms = 0;
     do {
         std::unique_lock<std::mutex> l(doris::JemallocControl::je_reset_dirty_decay_lock);
         while (_stop_background_threads_latch.count() != 0 &&
