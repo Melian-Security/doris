@@ -522,4 +522,125 @@ TEST(DataTypeVariantV2SerdeInputTest, MultiBatchArrowReadSurvivesSinkRowSelectio
     }
 }
 
+namespace {
+
+class ScopedBoundedColumnGrowth {
+public:
+    explicit ScopedBoundedColumnGrowth(bool value)
+            : _old(config::variant_v2_bounded_column_growth) {
+        config::variant_v2_bounded_column_growth = value;
+    }
+    ~ScopedBoundedColumnGrowth() { config::variant_v2_bounded_column_growth = _old; }
+
+private:
+    bool _old;
+};
+
+// Log-shaped documents of about 600 bytes, so a few thousand rows cross the 1 MB threshold where
+// bounded growth starts.
+std::vector<std::optional<std::string>> log_documents(size_t rows, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<std::optional<std::string>> documents;
+    documents.reserve(rows);
+    for (size_t row = 0; row < rows; ++row) {
+        if (rng() % 50 == 0) {
+            documents.emplace_back(std::nullopt);
+            continue;
+        }
+        std::string document =
+                R"({"time":)" + std::to_string(1760000000000 + row) + R"(,"severity_id":)" +
+                std::to_string(rng() % 6) + R"(,"message":"request )" + std::to_string(rng()) +
+                R"( served","src":{"ip":"10.0.)" + std::to_string(rng() % 256) + R"(.7","port":)" +
+                std::to_string(rng() % 65536) + R"(},"labels":["edge","waf"],"unmapped":{)";
+        for (int field = 0; field < 12; ++field) {
+            document += (field == 0 ? "" : ",");
+            document += R"("vendor_field_)" + std::to_string(rng() % 40) + "_" +
+                        std::to_string(field) + R"(":"value-)" + std::to_string(rng()) + R"(")";
+        }
+        document += "}}";
+        documents.emplace_back(std::move(document));
+    }
+    return documents;
+}
+
+ColumnVariantV2::MutablePtr read_arrow_batch(const std::vector<std::optional<std::string>>& docs) {
+    DataTypeVariantV2SerDe serde;
+    auto array = make_arrow_strings(arrow::utf8(), docs);
+    auto column = ColumnVariantV2::create();
+    const Status status = serde.read_column_from_arrow(*column, array.get(), 0, array->length(),
+                                                       cctz::utc_time_zone());
+    EXPECT_TRUE(status.ok()) << status;
+    return column;
+}
+
+void expect_same_rows(const ColumnVariantV2& actual, const ColumnVariantV2& expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t row = 0; row < actual.size(); ++row) {
+        const VariantRef left = actual.get_value_ref(row);
+        const VariantRef right = expected.get_value_ref(row);
+        ASSERT_EQ(StringRef(left.metadata.data, left.metadata.size),
+                  StringRef(right.metadata.data, right.metadata.size))
+                << row;
+        ASSERT_EQ(left.value, right.value) << row;
+    }
+}
+
+} // namespace
+
+TEST(DataTypeVariantV2SerdeArrowMemoryTest, ArrowBatchFillsAnEmptyColumnExactly) {
+    const auto documents = log_documents(4096, 7);
+    ColumnVariantV2::MutablePtr bounded;
+    {
+        ScopedBoundedColumnGrowth growth(true);
+        bounded = read_arrow_batch(documents);
+    }
+    ColumnVariantV2::MutablePtr power_of_two;
+    {
+        ScopedBoundedColumnGrowth growth(false);
+        power_of_two = read_arrow_batch(documents);
+    }
+    ASSERT_GT(bounded->byte_size(), size_t {1} << 20);
+    expect_same_rows(*bounded, *power_of_two);
+    // Only PODArray padding and the batch metadata dictionary sit above the encoded bytes.
+    EXPECT_LE(bounded->allocated_bytes(), bounded->byte_size() + (64U << 10));
+    EXPECT_LE(bounded->allocated_bytes(), power_of_two->allocated_bytes());
+}
+
+TEST(DataTypeVariantV2SerdeArrowMemoryTest, MemtableStyleAppendsGrowByAQuarter) {
+    // MemTable::insert gathers each sink batch into one column with insert_indices_from, and the
+    // flush gathers that column once more into sorted order.
+    auto run = [](bool bounded_growth, size_t* max_allocated_over_bytes_permille) {
+        ScopedBoundedColumnGrowth growth(bounded_growth);
+        auto memtable = ColumnVariantV2::create();
+        *max_allocated_over_bytes_permille = 0;
+        for (uint32_t batch = 0; batch < 24; ++batch) {
+            auto source = read_arrow_batch(log_documents(1024, batch));
+            std::vector<uint32_t> rows(source->size());
+            std::iota(rows.begin(), rows.end(), 0);
+            memtable->insert_indices_from(*source, rows.data(), rows.data() + rows.size());
+            if (memtable->byte_size() > (size_t {4} << 20)) {
+                *max_allocated_over_bytes_permille =
+                        std::max(*max_allocated_over_bytes_permille,
+                                 memtable->allocated_bytes() * 1000 / memtable->byte_size());
+            }
+        }
+        std::vector<uint32_t> sorted(memtable->size());
+        std::iota(sorted.rbegin(), sorted.rend(), 0);
+        auto flushed = ColumnVariantV2::create();
+        flushed->insert_indices_from(*memtable, sorted.data(), sorted.data() + sorted.size());
+        return std::make_pair(std::move(memtable), std::move(flushed));
+    };
+    size_t bounded_permille = 0;
+    size_t power_of_two_permille = 0;
+    auto [bounded, bounded_flushed] = run(true, &bounded_permille);
+    auto [power_of_two, power_of_two_flushed] = run(false, &power_of_two_permille);
+
+    expect_same_rows(*bounded, *power_of_two);
+    expect_same_rows(*bounded_flushed, *power_of_two_flushed);
+    EXPECT_LE(bounded_permille, 1260);
+    EXPECT_LT(bounded_permille, power_of_two_permille);
+    EXPECT_LE(bounded_flushed->allocated_bytes(),
+              bounded_flushed->byte_size() + bounded_flushed->byte_size() / 50);
+}
+
 } // namespace doris

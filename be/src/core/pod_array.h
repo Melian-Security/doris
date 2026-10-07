@@ -262,6 +262,15 @@ public:
                     std::forward<TAllocatorParams>(allocator_params)...);
     }
 
+    /// Like reserve(), but allocates room for exactly n elements plus padding instead of rounding
+    /// the allocation up to the next power of two.
+    template <typename... TAllocatorParams>
+    void reserve_exact(size_t n, TAllocatorParams&&... allocator_params) {
+        if (n > capacity())
+            realloc(minimum_memory_for_elements(n),
+                    std::forward<TAllocatorParams>(allocator_params)...);
+    }
+
     template <typename... TAllocatorParams>
     void resize(size_t n, TAllocatorParams&&... allocator_params) {
         reserve(n, std::forward<TAllocatorParams>(allocator_params)...);

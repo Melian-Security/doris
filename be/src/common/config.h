@@ -1507,6 +1507,12 @@ DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
 // every payload when it built the column, and structural checks still run. Set to true to
 // re-validate every payload on receipt.
 DECLARE_mBool(variant_v2_validate_internal_block);
+// When true, the encoded buffers of a Variant V2 column are allocated exactly when an empty column
+// is filled (one Arrow batch, a tablet sink batch, a memtable flush copy), and grow by a quarter
+// instead of to the next power of two once they exceed 1 MB. A memtable accumulating a load then
+// holds about 1.1x its encoded bytes instead of up to 2x. The encoded bytes are identical either
+// way. Read on every reservation.
+DECLARE_mBool(variant_v2_bounded_column_growth);
 
 DECLARE_mBool(enable_merge_on_write_correctness_check);
 // USED FOR DEBUGING
