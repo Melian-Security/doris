@@ -808,6 +808,11 @@ DECLARE_mBool(enable_adaptive_write_buffer_size);
 DECLARE_mInt64(write_buffer_size_for_agg);
 
 DECLARE_mInt64(min_write_buffer_size_for_partial_update);
+// When true, a memtable flush that copies its rows into sorted order releases each input column as
+// soon as its sorted copy is built, and moves the columns without copying when the rows are already
+// in sorted order. The flush then holds one copy of the memtable plus one column instead of two
+// copies. Read when a memtable is flushed.
+DECLARE_mBool(memtable_flush_release_input_columns);
 // max parallel flush task per memtable writer
 DECLARE_mInt32(memtable_flush_running_count_limit);
 
@@ -1517,6 +1522,12 @@ DECLARE_mBool(variant_nested_group_discard_scalar_on_conflict);
 // every payload when it built the column, and structural checks still run. Set to true to
 // re-validate every payload on receipt.
 DECLARE_mBool(variant_v2_validate_internal_block);
+// When true, the encoded buffers of a Variant V2 column are allocated exactly when an empty column
+// is filled (one Arrow batch, a tablet sink batch, a memtable flush copy), and grow by a quarter
+// instead of to the next power of two once they exceed 1 MB. A memtable accumulating a load then
+// holds about 1.1x its encoded bytes instead of up to 2x. The encoded bytes are identical either
+// way. Read on every reservation.
+DECLARE_mBool(variant_v2_bounded_column_growth);
 
 DECLARE_mBool(enable_merge_on_write_correctness_check);
 // USED FOR DEBUGING

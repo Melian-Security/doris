@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "common/check.h"
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/assert_cast.h"
 #include "core/column/column_const.h"
@@ -116,13 +117,34 @@ void require_exclusive(const IColumn::WrappedPtr& column, std::string_view descr
             << "ColumnVariantV2 " << description << " must be COW-detached before mutation";
 }
 
+// Below this size the power-of-two growth of PODArray costs little memory and keeps small columns
+// that grow row by row on amortized constant-time appends.
+constexpr size_t BOUNDED_GROWTH_MIN_BYTES = 1U << 20;
+
+// A load keeps every encoded row in a memtable column that grows one sink batch at a time, and the
+// flush copies it once more into sorted order. Power-of-two growth leaves both up to half empty.
+// Fill an empty array exactly and grow a large one by a quarter of its capacity instead.
+template <typename Array>
+void reserve_elements(Array& array, size_t elements) {
+    if (elements <= array.capacity()) {
+        return;
+    }
+    if (!config::variant_v2_bounded_column_growth ||
+        elements * sizeof(typename Array::value_type) < BOUNDED_GROWTH_MIN_BYTES) {
+        array.reserve(elements);
+        return;
+    }
+    const size_t capacity = array.capacity();
+    array.reserve_exact(array.empty() ? elements : std::max(elements, capacity + capacity / 4));
+}
+
 void reserve_rows(ColumnString& values, MetaIdsColumn& metadata_ids, size_t value_bytes,
                   size_t rows) {
     const size_t final_value_bytes = values.get_chars().size() + value_bytes;
     ColumnString::check_chars_length(final_value_bytes, values.size() + rows, values.size());
-    values.get_chars().reserve(final_value_bytes);
-    values.get_offsets().reserve(values.size() + rows);
-    metadata_ids.get_data().reserve(metadata_ids.size() + rows);
+    reserve_elements(values.get_chars(), final_value_bytes);
+    reserve_elements(values.get_offsets(), values.size() + rows);
+    reserve_elements(metadata_ids.get_data(), metadata_ids.size() + rows);
 }
 
 bool byte_ranges_overlap(StringRef left, StringRef right) {
@@ -1624,7 +1646,13 @@ void ColumnVariantV2::insert_indices_from( // NOLINT(readability-function-size)
     }
     auto& values = assert_cast<ColumnString&>(*_values);
     auto& metadata_ids = assert_cast<MetaIdsColumn&>(*_meta_ids);
-    metadata_ids.get_data().reserve(metadata_ids.size() + rows);
+    const auto& source_offsets = source_values.get_offsets();
+    size_t selected_value_bytes = 0;
+    for (const uint32_t* index = indices_begin; index != indices_end; ++index) {
+        selected_value_bytes +=
+                source_offsets[*index] - source_offsets[static_cast<ssize_t>(*index) - 1];
+    }
+    reserve_rows(values, metadata_ids, selected_value_bytes, rows);
     if (copy_metadata_dictionary) {
         static_cast<IColumn::Ptr&>(_metadatas) =
                 source._metadatas->clone_resized(source_metadatas.size());

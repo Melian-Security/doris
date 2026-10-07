@@ -746,6 +746,7 @@ DEFINE_mBool(enable_adaptive_write_buffer_size, "true");
 // max buffer size used in memtable for the aggregated table, default 400MB
 DEFINE_mInt64(write_buffer_size_for_agg, "104857600");
 DEFINE_mInt64(min_write_buffer_size_for_partial_update, "1048576");
+DEFINE_mBool(memtable_flush_release_input_columns, "true");
 // max parallel flush task per memtable writer
 DEFINE_mInt32(memtable_flush_running_count_limit, "2");
 
@@ -1225,6 +1226,7 @@ DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
 DEFINE_mInt32(variant_nested_group_max_depth, "10");
 DEFINE_mBool(variant_nested_group_discard_scalar_on_conflict, "true");
 DEFINE_mBool(variant_v2_validate_internal_block, "false");
+DEFINE_mBool(variant_v2_bounded_column_growth, "true");
 
 DEFINE_Validator(variant_max_json_key_length,
                  [](const int config) -> bool { return config > 0 && config <= 65535; });

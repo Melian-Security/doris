@@ -304,8 +304,37 @@ Status MemTable::_put_into_output(Block& in_block) {
     for (int i = 0; i < _row_in_blocks->size(); i++) {
         row_pos_vec.emplace_back((*_row_in_blocks)[i]->_row_pos);
     }
-    return _output_mutable_block.add_rows(&in_block, row_pos_vec.data(),
-                                          row_pos_vec.data() + in_block.rows());
+    if (!config::memtable_flush_release_input_columns) {
+        return _output_mutable_block.add_rows(&in_block, row_pos_vec.data(),
+                                              row_pos_vec.data() + in_block.rows());
+    }
+    // Copying every column before dropping the input holds two copies of the memtable at the
+    // flush peak. Gather one column at a time and release its input right away, so the peak is
+    // one copy plus the largest column. Rows that are already in sort order need no copy at all.
+    const uint32_t* row_begin = row_pos_vec.data();
+    const uint32_t* row_end = row_begin + in_block.rows();
+    bool in_order = true;
+    for (uint32_t row = 0; row < row_pos_vec.size(); ++row) {
+        if (row_pos_vec[row] != row) {
+            in_order = false;
+            break;
+        }
+    }
+    RETURN_IF_CATCH_EXCEPTION({
+        auto& output_columns = _output_mutable_block.mutable_columns();
+        DCHECK_LE(output_columns.size(), in_block.columns());
+        for (size_t i = 0; i < output_columns.size(); ++i) {
+            auto& input = in_block.get_by_position(i);
+            DCHECK_EQ(_output_mutable_block.data_types()[i]->get_name(), input.type->get_name());
+            if (in_order && output_columns[i]->empty()) {
+                output_columns[i] = IColumn::mutate(std::move(input.column));
+            } else {
+                output_columns[i]->insert_indices_from(*input.column, row_begin, row_end);
+            }
+            input.column = input.type->create_column();
+        }
+    });
+    return Status::OK();
 }
 
 size_t MemTable::_sort() {
