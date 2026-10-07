@@ -460,6 +460,7 @@ void Daemon::report_runtime_query_statistics_thread() {
 }
 
 void Daemon::je_reset_dirty_decay_thread() const {
+    [[maybe_unused]] int64_t last_decay_ms = 0;
     do {
         std::unique_lock<std::mutex> l(doris::JemallocControl::je_reset_dirty_decay_lock);
         while (_stop_background_threads_latch.count() != 0 &&
@@ -467,6 +468,17 @@ void Daemon::je_reset_dirty_decay_thread() const {
                        std::memory_order_relaxed)) {
             doris::JemallocControl::je_reset_dirty_decay_cv.wait_for(
                     l, std::chrono::milliseconds(100));
+#ifdef USE_JEMALLOC
+            // With a positive decay over the soft limit, purge here instead of on the threads
+            // that free memory.
+            if (!doris::JemallocControl::je_enable_dirty_page &&
+                config::je_dirty_decay_ms_over_soft_limit > 0 && !config::disable_memory_gc &&
+                config::enable_je_purge_dirty_pages &&
+                MonotonicMillis() - last_decay_ms >= config::memory_gc_sleep_time_ms) {
+                doris::JemallocControl::je_decay_all_arena_dirty_pages();
+                last_decay_ms = MonotonicMillis();
+            }
+#endif
         }
         if (_stop_background_threads_latch.count() == 0) {
             break;
@@ -501,7 +513,8 @@ void Daemon::je_reset_dirty_decay_thread() const {
         if (doris::JemallocControl::je_enable_dirty_page) {
             doris::JemallocControl::je_reset_all_arena_dirty_decay_ms(config::je_dirty_decay_ms);
         } else {
-            doris::JemallocControl::je_reset_all_arena_dirty_decay_ms(0);
+            doris::JemallocControl::je_reset_all_arena_dirty_decay_ms(
+                    config::je_dirty_decay_ms_over_soft_limit);
         }
 #endif
     } while (true);

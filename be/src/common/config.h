@@ -779,6 +779,13 @@ DECLARE_mString(jeprofile_dir);
 DECLARE_mBool(enable_je_purge_dirty_pages);
 // Jemalloc `arenas.dirty_decay_ms`, equal to `dirty_decay_ms` in JEMALLOC_CONF in be.conf.
 DECLARE_mInt32(je_dirty_decay_ms);
+// Jemalloc `dirty_decay_ms` of every arena while process memory exceeds the soft mem limit.
+// 0 purges each freed extent immediately on the freeing thread: madvise, TLB shootdown and a
+// re-fault on reuse, serialized on the arena's decay mutex, which stalls threads in free()
+// under heavy load. A positive value keeps purging off the freeing threads: jemalloc background
+// threads purge by decay, and the daemon also forces an `arena.<all>.decay` every
+// `memory_gc_sleep_time_ms`.
+DECLARE_mInt32(je_dirty_decay_ms_over_soft_limit);
 
 // to forward compatibility, will be removed later
 DECLARE_mBool(enable_token_check);
