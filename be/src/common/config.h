@@ -808,6 +808,11 @@ DECLARE_mBool(enable_adaptive_write_buffer_size);
 DECLARE_mInt64(write_buffer_size_for_agg);
 
 DECLARE_mInt64(min_write_buffer_size_for_partial_update);
+// When true, a memtable flush that copies its rows into sorted order releases each input column as
+// soon as its sorted copy is built, and moves the columns without copying when the rows are already
+// in sorted order. The flush then holds one copy of the memtable plus one column instead of two
+// copies. Read when a memtable is flushed.
+DECLARE_mBool(memtable_flush_release_input_columns);
 // max parallel flush task per memtable writer
 DECLARE_mInt32(memtable_flush_running_count_limit);
 
