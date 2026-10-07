@@ -60,11 +60,13 @@ public:
 private:
     static inline int64_t _sys_avail_mem_less_than_warning_water_mark();
     static inline int64_t _process_used_mem_more_than_soft_mem_limit();
+    // Bytes above the load back-pressure watermark; <= 0 when below it or when disabled.
+    static int64_t _process_used_mem_more_than_backpressure_watermark(bool use_watermark);
 
     bool _soft_limit_reached();
-    bool _hard_limit_reached();
+    bool _hard_limit_reached(bool use_watermark = true);
     bool _load_usage_low();
-    int64_t _need_flush();
+    int64_t _need_flush(bool use_watermark);
     int64_t _table_flush_pending_memtable_count(int64_t table_id);
     int64_t _flush_active_memtables(int64_t need_flush);
     void _refresh_mem_tracker();

@@ -917,6 +917,16 @@ DECLARE_mBool(enable_adaptive_flush_threads);
 DECLARE_mBool(enable_table_memtable_flush_backpressure);
 // Max pending flush memtables for one table on this BE before blocking new writes.
 DECLARE_mInt32(table_memtable_flush_pending_count_limit);
+// Wait (bounded) on memtable writes when process memory crosses a watermark below the GC limit.
+DECLARE_mBool(enable_load_memory_backpressure);
+// Percent of mem_limit at which load writes start to flush and wait.
+DECLARE_mInt32(load_memory_backpressure_process_mem_percent);
+// Budget for queued plus flushing memtable bytes, percent of mem_limit. 0 disables it.
+DECLARE_mInt32(load_memtable_pending_mem_limit_percent);
+// Upper bound of one memory-driven load wait.
+DECLARE_mInt64(load_memory_backpressure_max_wait_ms);
+// Process GC frees only the overshoot plus this percent of mem_limit from loads. -1 disables it.
+DECLARE_mInt32(load_memory_gc_free_extra_percent);
 
 // config for tablet meta checkpoint
 DECLARE_mInt32(tablet_meta_checkpoint_min_new_rowsets_num);

@@ -22,6 +22,7 @@
 #include "common/config.h"
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
+#include "load/memtable/load_memory_backpressure.h"
 #include "load/memtable/memtable.h"
 #include "load/memtable/memtable_writer.h"
 #include "util/mem_info.h"
@@ -98,21 +99,31 @@ int64_t MemTableMemoryLimiter::_process_used_mem_more_than_soft_mem_limit() {
            config::memtable_limiter_reserved_memory_bytes;
 }
 
+int64_t MemTableMemoryLimiter::_process_used_mem_more_than_backpressure_watermark(
+        bool use_watermark) {
+    int64_t watermark = LoadMemoryBackpressure::process_watermark(
+            use_watermark && config::enable_load_memory_backpressure, MemInfo::mem_limit(),
+            config::load_memory_backpressure_process_mem_percent);
+    return LoadMemoryBackpressure::over_watermark(GlobalMemoryArbitrator::process_memory_usage(),
+                                                  watermark);
+}
+
 bool MemTableMemoryLimiter::_soft_limit_reached() {
     return _mem_tracker->consumption() > _load_soft_mem_limit || _hard_limit_reached();
 }
 
-bool MemTableMemoryLimiter::_hard_limit_reached() {
+bool MemTableMemoryLimiter::_hard_limit_reached(bool use_watermark) {
     return _mem_tracker->consumption() > _load_hard_mem_limit ||
            _sys_avail_mem_less_than_warning_water_mark() > 0 ||
-           _process_used_mem_more_than_soft_mem_limit() > 0;
+           _process_used_mem_more_than_soft_mem_limit() > 0 ||
+           _process_used_mem_more_than_backpressure_watermark(use_watermark) > 0;
 }
 
 bool MemTableMemoryLimiter::_load_usage_low() {
     return _mem_tracker->consumption() <= _load_safe_mem_permit;
 }
 
-int64_t MemTableMemoryLimiter::_need_flush() {
+int64_t MemTableMemoryLimiter::_need_flush(bool use_watermark) {
     DBUG_EXECUTE_IF("MemTableMemoryLimiter._need_flush.random_flush", {
         if (rand() % 100 < (100 * dp->param("percent", 0.5))) {
             LOG(INFO) << "debug memtable need flush return 1";
@@ -122,7 +133,8 @@ int64_t MemTableMemoryLimiter::_need_flush() {
     int64_t limit1 = _mem_tracker->consumption() - _load_soft_mem_limit;
     int64_t limit2 = _sys_avail_mem_less_than_warning_water_mark();
     int64_t limit3 = _process_used_mem_more_than_soft_mem_limit();
-    int64_t need_flush = std::max({limit1, limit2, limit3});
+    int64_t limit4 = _process_used_mem_more_than_backpressure_watermark(use_watermark);
+    int64_t need_flush = std::max({limit1, limit2, limit3, limit4});
     return need_flush - _queue_mem_usage - _flush_mem_usage;
 }
 
@@ -146,26 +158,50 @@ void MemTableMemoryLimiter::handle_table_memtable_backpressure(std::function<boo
         return;
     }
     const int64_t pending_count_limit = config::table_memtable_flush_pending_count_limit;
-    if (pending_count_limit <= 0) {
+    const bool memory_enabled = config::enable_load_memory_backpressure;
+    if (pending_count_limit <= 0 && !memory_enabled) {
         return;
     }
     DORIS_CHECK(table_id > 0);
 
-    std::unique_lock<std::mutex> l(_lock);
-    int64_t pending_count = _table_flush_pending_memtable_count(table_id);
-    if (pending_count < pending_count_limit) {
-        return;
-    }
+    const int64_t mem_limit = MemInfo::mem_limit();
+    const int64_t max_wait_ms = config::load_memory_backpressure_max_wait_ms;
+    const int64_t pending_bytes_limit = LoadMemoryBackpressure::percent_of(
+            mem_limit, config::load_memtable_pending_mem_limit_percent);
+    const int64_t watermark = LoadMemoryBackpressure::process_watermark(
+            memory_enabled, mem_limit, config::load_memory_backpressure_process_mem_percent);
 
     MonotonicStopWatch timer;
     timer.start();
+    // Both the pending-count gate and the memory gate are re-evaluated on every wake-up. The
+    // memory gate stops applying once its bounded wait is used up.
+    auto should_wait = [&](int64_t pending_count) {
+        bool memory_wait = LoadMemoryBackpressure::memory_wait_allowed(
+                memory_enabled, timer.elapsed_time() / 1000 / 1000, max_wait_ms);
+        return LoadMemoryBackpressure::table_write_should_wait(
+                pending_count, pending_count_limit, memory_wait,
+                _queue_mem_usage + _flush_mem_usage, pending_bytes_limit,
+                GlobalMemoryArbitrator::process_memory_usage(), watermark);
+    };
+
+    std::unique_lock<std::mutex> l(_lock);
+    int64_t pending_count = _table_flush_pending_memtable_count(table_id);
+    if (!should_wait(pending_count)) {
+        return;
+    }
+
     g_memtable_table_backpressure_waiting_threads << 1;
-    while (pending_count >= pending_count_limit) {
+    while (should_wait(pending_count)) {
         g_memtable_table_backpressure_pending_count.set_value(pending_count);
         LOG_EVERY_T(INFO, 1) << "table memtable flush backpressure: table_id=" << table_id
                              << ", pending_memtables=" << pending_count
-                             << ", limit=" << pending_count_limit
-                             << ", memtable writers num: " << _writers.size();
+                             << ", limit=" << pending_count_limit << ", pending_bytes="
+                             << PrettyPrinter::print_bytes(_queue_mem_usage + _flush_mem_usage)
+                             << ", pending_bytes_limit="
+                             << PrettyPrinter::print_bytes(pending_bytes_limit)
+                             << ", process_watermark=" << PrettyPrinter::print_bytes(watermark)
+                             << ", memtable writers num: " << _writers.size() << ", "
+                             << GlobalMemoryArbitrator::process_memory_used_str();
         if (cancel_check && cancel_check()) {
             LOG(INFO) << "cancelled when waiting for table memtable flush backpressure"
                       << ", table_id=" << table_id << ", pending_memtables=" << pending_count
@@ -205,7 +241,12 @@ void MemTableMemoryLimiter::handle_memtable_flush(std::function<bool()> cancel_c
     std::unique_lock<std::mutex> l(_lock);
     g_memtable_memory_limit_waiting_threads << 1;
     bool first = true;
+    // The watermark is a bounded wait; once it is used up only the legacy limits keep waiting.
+    bool use_watermark = true;
     do {
+        use_watermark = LoadMemoryBackpressure::memory_wait_allowed(
+                config::enable_load_memory_backpressure, timer.elapsed_time() / 1000 / 1000,
+                config::load_memory_backpressure_max_wait_ms);
         if (!first) {
             auto st = _hard_limit_end_cond.wait_for(l, std::chrono::milliseconds(1000));
             if (st == std::cv_status::timeout) {
@@ -218,9 +259,9 @@ void MemTableMemoryLimiter::handle_memtable_flush(std::function<bool()> cancel_c
             return;
         }
         first = false;
-        int64_t need_flush = _need_flush();
+        int64_t need_flush = _need_flush(use_watermark);
         if (need_flush > 0) {
-            auto limit = _hard_limit_reached() ? Limit::HARD : Limit::SOFT;
+            auto limit = _hard_limit_reached(use_watermark) ? Limit::HARD : Limit::SOFT;
             LOG(INFO) << "reached memtable memory " << (limit == Limit::HARD ? "hard" : "soft")
                       << ", " << GlobalMemoryArbitrator::process_memory_used_details_str() << ", "
                       << GlobalMemoryArbitrator::sys_mem_available_details_str()
@@ -245,7 +286,7 @@ void MemTableMemoryLimiter::handle_memtable_flush(std::function<bool()> cancel_c
             }
             _flush_active_memtables(need_flush);
         }
-    } while (_hard_limit_reached() && !_load_usage_low());
+    } while (_hard_limit_reached(use_watermark) && !_load_usage_low());
     g_memtable_memory_limit_waiting_threads << -1;
     timer.stop();
     int64_t time_ms = timer.elapsed_time() / 1000 / 1000;
