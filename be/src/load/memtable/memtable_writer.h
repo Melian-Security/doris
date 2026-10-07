@@ -97,6 +97,8 @@ public:
 
     int64_t table_id() const;
 
+    const PUniqueId& load_id() const { return _req.load_id; }
+
     int64_t total_received_rows() const { return _total_received_rows; }
 
     const FlushStatistic& get_flush_token_stats();

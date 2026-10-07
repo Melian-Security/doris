@@ -158,7 +158,7 @@ Status DeltaWriterV2::write(const Block* block, const DorisVector<uint32_t>& row
                     cancel_status = cancel_check();
                     return !cancel_status.ok();
                 },
-                _table_id());
+                _table_id(), &_req.load_id);
         RETURN_IF_ERROR(cancel_status);
     }
     _lock_watch.start();
