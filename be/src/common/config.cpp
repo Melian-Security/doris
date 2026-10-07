@@ -74,6 +74,12 @@ DEFINE_Int32(arrow_flight_sql_port, "8050");
 // Validate Arrow input buffers in opted-in Arrow readers before converting them to Doris columns.
 DEFINE_Bool(enable_arrow_input_validation, "true");
 
+// When true, the Arrow stream load reader decodes one record batch at a time and converts it in
+// row ranges, so a load holds one decoded batch and one block of converted rows instead of every
+// decoded batch plus the whole load as one block. When false it reads the whole stream first.
+DEFINE_mBool(enable_arrow_stream_load_streaming_read, "true");
+DEFINE_mInt32(arrow_stream_load_block_rows, "0");
+
 DEFINE_Int32(cdc_client_port, "9096");
 
 DEFINE_String(cdc_client_java_opts, "");

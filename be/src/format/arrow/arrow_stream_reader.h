@@ -33,6 +33,13 @@
 #include "io/file_factory.h"
 #include "io/fs/file_reader_writer_fwd.h"
 
+namespace arrow {
+class RecordBatch;
+namespace ipc {
+class RecordBatchStreamReader;
+} // namespace ipc
+} // namespace arrow
+
 namespace doris {
 namespace io {
 class FileSystem;
@@ -55,6 +62,8 @@ public:
     ~ArrowStreamReader() override;
 
     Status init_reader();
+    // Reads the stream from file_reader instead of the load's stream load pipe.
+    Status init_reader(io::FileReaderSPtr file_reader);
 
     Status get_next_block(Block* block, size_t* read_rows, bool* eof) override;
 
@@ -66,12 +75,21 @@ public:
     static DataTypePtr load_source_type(const DataTypePtr& slot_type);
 
 private:
+    Status _open_stream(bool* opened);
+    Status _convert_batch(const arrow::RecordBatch& batch, int64_t start, int64_t end,
+                          Block* block);
+    Status _read_whole_stream(Block* block, size_t* read_rows, bool* eof);
+
     RuntimeState* _state;
     const TFileRangeDesc& _range;
     const std::vector<SlotDescriptor*>& _file_slot_descs;
     io::IOContext* _io_ctx;
     io::FileReaderSPtr _file_reader;
     std::unique_ptr<doris::ArrowPipInputStream> _pip_stream;
+    // Open IPC stream and the record batch being converted, kept across get_next_block calls.
+    std::shared_ptr<arrow::ipc::RecordBatchStreamReader> _batch_reader;
+    std::shared_ptr<arrow::RecordBatch> _batch;
+    int64_t _batch_offset = 0;
     cctz::time_zone _ctzz;
 };
 #include "common/compile_check_end.h"
