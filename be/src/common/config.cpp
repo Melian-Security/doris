@@ -624,6 +624,12 @@ DEFINE_Bool(enable_all_http_auth, "false");
 // Number of webserver workers
 DEFINE_Int32(webserver_num_workers, "128");
 
+// Wait for a stream load to finish and commit on a pool thread instead of the HTTP event loop
+// thread, which serves the bodies of other loads on the same keep-alive event loop.
+DEFINE_mBool(enable_stream_load_finish_off_event_loop, "true");
+// Upper bound of threads waiting for stream loads to finish; idle threads exit.
+DEFINE_Int32(stream_load_finish_thread_num, "1024");
+
 DEFINE_Bool(enable_single_replica_load, "true");
 // Number of download workers for single replica load
 DEFINE_Int32(single_replica_load_download_num_workers, "64");

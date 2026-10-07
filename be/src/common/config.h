@@ -687,6 +687,11 @@ DECLARE_Bool(enable_all_http_auth);
 // Number of webserver workers
 DECLARE_Int32(webserver_num_workers);
 
+// Wait for a stream load to finish and commit on a pool thread instead of the HTTP event loop
+// thread, which serves the bodies of other loads on the same keep-alive event loop.
+DECLARE_mBool(enable_stream_load_finish_off_event_loop);
+DECLARE_Int32(stream_load_finish_thread_num);
+
 DECLARE_Bool(enable_single_replica_load);
 // Number of download workers for single replica load
 DECLARE_Int32(single_replica_load_download_num_workers);

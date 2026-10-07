@@ -54,6 +54,7 @@
 #include "load/stream_load/stream_load_executor.h"
 #include "load/stream_load/stream_load_recorder.h"
 #include "runtime/exec_env.h"
+#include "service/http/ev_http_server.h"
 #include "service/http/http_channel.h"
 #include "service/http/http_common.h"
 #include "service/http/http_headers.h"
@@ -64,6 +65,7 @@
 #include "util/client_cache.h"
 #include "util/load_util.h"
 #include "util/string_util.h"
+#include "util/threadpool.h"
 #include "util/thrift_rpc_helper.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -101,6 +103,10 @@ StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
     INT_COUNTER_METRIC_REGISTER(_stream_load_entity, streaming_load_requests_total);
     INT_COUNTER_METRIC_REGISTER(_stream_load_entity, streaming_load_duration_ms);
     INT_GAUGE_METRIC_REGISTER(_stream_load_entity, streaming_load_current_processing);
+    static_cast<void>(ThreadPoolBuilder("StreamLoadFinish")
+                              .set_min_threads(0)
+                              .set_max_threads(config::stream_load_finish_thread_num)
+                              .build(&_finish_pool));
 }
 
 StreamLoadAction::~StreamLoadAction() {
@@ -114,6 +120,19 @@ void StreamLoadAction::handle(HttpRequest* req) {
         return;
     }
 
+    // Waiting for the load to finish takes as long as the write and commit. Done on the event
+    // loop thread, it stalls the bodies of every other load on the same keep-alive event loop.
+    if (ctx->status.ok() && config::enable_stream_load_finish_off_event_loop &&
+        run_off_event_loop(
+                req, _finish_pool.get(), [this, ctx]() { _finish_load(ctx); },
+                [this, req, ctx]() { _reply(req, ctx); })) {
+        return;
+    }
+    _finish_load(ctx);
+    _reply(req, ctx);
+}
+
+void StreamLoadAction::_finish_load(const std::shared_ptr<StreamLoadContext>& ctx) {
     // status already set to fail
     if (ctx->status.ok()) {
         ctx->status = _handle(ctx);
@@ -134,19 +153,6 @@ void StreamLoadAction::handle(HttpRequest* req) {
         }
     }
 
-    auto str = ctx->to_json();
-    // add new line at end
-    str = str + '\n';
-    HttpChannel::send_reply(req, str);
-#ifndef BE_TEST
-    if (config::enable_stream_load_record || config::enable_stream_load_record_to_audit_log_table) {
-        if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
-            str = ctx->prepare_stream_load_record(str);
-            _save_stream_load_record(ctx, str);
-        }
-    }
-#endif
-
     LOG(INFO) << "finished to execute stream load. label=" << ctx->label
               << ", txn_id=" << ctx->txn_id << ", query_id=" << ctx->id
               << ", load_cost_ms=" << ctx->load_cost_millis << ", receive_data_cost_ms="
@@ -166,6 +172,21 @@ void StreamLoadAction::handle(HttpRequest* req) {
     if (!ctx->data_saved_path.empty()) {
         _exec_env->load_path_mgr()->clean_tmp_files(ctx->data_saved_path);
     }
+}
+
+void StreamLoadAction::_reply(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx) {
+    auto str = ctx->to_json();
+    // add new line at end
+    str = str + '\n';
+    HttpChannel::send_reply(req, str);
+#ifndef BE_TEST
+    if (config::enable_stream_load_record || config::enable_stream_load_record_to_audit_log_table) {
+        if (req->header(HTTP_SKIP_RECORD_TO_AUDIT_LOG_TABLE).empty()) {
+            str = ctx->prepare_stream_load_record(str);
+            _save_stream_load_record(ctx, str);
+        }
+    }
+#endif
 }
 
 Status StreamLoadAction::_handle(std::shared_ptr<StreamLoadContext> ctx) {

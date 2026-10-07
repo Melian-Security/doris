@@ -29,6 +29,7 @@ class ExecEnv;
 class Status;
 class StreamLoadContext;
 class HttpRequest;
+class ThreadPool;
 
 class StreamLoadAction : public HttpHandler {
 public:
@@ -47,6 +48,8 @@ public:
 private:
     Status _on_header(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx);
     Status _handle(std::shared_ptr<StreamLoadContext> ctx);
+    void _finish_load(const std::shared_ptr<StreamLoadContext>& ctx);
+    void _reply(HttpRequest* req, const std::shared_ptr<StreamLoadContext>& ctx);
     Status _data_saved_path(HttpRequest* req, std::string* file_path, int64_t file_bytes);
     Status _process_put(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx);
     Status _can_group_commit(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx,
@@ -57,6 +60,8 @@ private:
 
 private:
     ExecEnv* _exec_env;
+    // Waits for loads to finish so the HTTP event loop threads keep reading other bodies.
+    std::unique_ptr<ThreadPool> _finish_pool;
 
     std::shared_ptr<MetricEntity> _stream_load_entity;
     IntCounter* streaming_load_requests_total;
