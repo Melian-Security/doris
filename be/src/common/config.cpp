@@ -860,6 +860,24 @@ DEFINE_mBool(enable_table_memtable_flush_backpressure, "true");
 // Max pending flush memtables for one table on this BE before blocking new writes.
 DEFINE_mInt32(table_memtable_flush_pending_count_limit, "10");
 
+// Memory-driven load back-pressure: when enabled, memtable writes wait (bounded) once process
+// memory crosses a watermark below the process GC threshold, so loads are throttled before the
+// "Cancel Top Memory task" GC starts cancelling them.
+DEFINE_mBool(enable_load_memory_backpressure, "false");
+// Process memory, as a percent of mem_limit, at which load writes start to flush and wait.
+// Must sit below soft_mem_limit_frac * 100 to take effect earlier than the default limiter.
+DEFINE_mInt32(load_memory_backpressure_process_mem_percent, "85");
+// Budget for memtables queued for or running flush on this BE, as a percent of mem_limit.
+// Above it, table writes that have pending flushes wait. 0 disables the byte budget.
+DEFINE_mInt32(load_memtable_pending_mem_limit_percent, "0");
+// Upper bound of one memory-driven wait. After it the write proceeds, and the process GC remains
+// the safety valve. The pending-count gate keeps its own unbounded semantics.
+DEFINE_mInt64(load_memory_backpressure_max_wait_ms, "60000");
+// When >= 0, the process GC cancels loads only to free the overshoot above mem_limit plus this
+// percent of mem_limit (capped at process_full_gc_size), instead of process_full_gc_size.
+// Not applied when the GC is triggered by low system available memory. -1 keeps the old target.
+DEFINE_mInt32(load_memory_gc_free_extra_percent, "-1");
+
 // config for tablet meta checkpoint
 DEFINE_mInt32(tablet_meta_checkpoint_min_new_rowsets_num, "10");
 DEFINE_mInt32(tablet_meta_checkpoint_min_interval_secs, "600");
