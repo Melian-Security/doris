@@ -486,6 +486,9 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     for (auto& weak_tablet : weak_tablets) {
         auto t = weak_tablet.lock();
         if (t == nullptr) { continue; }
+        // A dropped tablet stays reachable here while anything still holds it, and its score
+        // stays as high as the backlog it was dropped with.
+        if (t->is_dropped()) { continue; }
 
         int64_t s = score(t.get());
         if (s <= 0) { continue; }

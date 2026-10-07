@@ -144,7 +144,7 @@ public:
 
     Status abort_tablet_job(const TabletJobInfoPB& job);
 
-    Status lease_tablet_job(const TabletJobInfoPB& job);
+    Status lease_tablet_job(const TabletJobInfoPB& job, FinishTabletJobResponse* res);
 
     Status update_delete_bitmap(const CloudTablet& tablet, int64_t lock_id, int64_t initiator,
                                 DeleteBitmap* delete_bitmap, DeleteBitmap* delete_bitmap_v2,

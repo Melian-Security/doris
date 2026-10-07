@@ -732,6 +732,7 @@ std::vector<CloudTabletSPtr> CloudStorageEngine::_generate_cloud_compaction_task
 
     // Even if need_pick_tablet is false, we still need to call find_best_tablet_to_compaction(),
     // So that we can update the max_compaction_score metric.
+    bool scored = false;
     do {
         std::vector<CloudTabletSPtr> tablets;
         auto st = tablet_mgr().get_topn_tablets_to_compact(n, compaction_type, filter_out, &tablets,
@@ -740,11 +741,14 @@ std::vector<CloudTabletSPtr> CloudStorageEngine::_generate_cloud_compaction_task
             LOG(WARNING) << "failed to get tablets to compact, err=" << st;
             break;
         }
+        scored = true;
         if (!need_pick_tablet) break;
         tablets_compaction = std::move(tablets);
     } while (false);
 
-    if (max_compaction_score > 0) {
+    // Publish a zero score too: once the last tablets with a backlog are dropped or compacted the
+    // gauge must fall instead of keeping their final score.
+    if (scored) {
         if (compaction_type == CompactionType::BASE_COMPACTION) {
             DorisMetrics::instance()->tablet_base_max_compaction_score->set_value(
                     max_compaction_score);

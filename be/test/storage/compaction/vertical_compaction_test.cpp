@@ -803,6 +803,44 @@ TEST_F(VerticalCompactionTest, TestDupKeyVerticalMerge) {
     }
 }
 
+// A tablet that the meta service reported dropped while its compaction was running stops
+// merging at the next block instead of writing the whole output.
+TEST_F(VerticalCompactionTest, TestVerticalMergeStopsOnDroppedTablet) {
+    auto num_input_rowset = 2;
+    auto num_segments = 2;
+    auto rows_per_segment = 10 * 1024;
+    std::vector<std::vector<std::vector<std::tuple<int64_t, int64_t>>>> input_data;
+    generate_input_data(num_input_rowset, num_segments, rows_per_segment, OVERLAPPING, input_data);
+    TabletSchemaSPtr tablet_schema = create_schema();
+    std::vector<RowsetSharedPtr> input_rowsets;
+    for (auto i = 0; i < num_input_rowset; i++) {
+        input_rowsets.push_back(create_rowset(tablet_schema, OVERLAPPING, input_data[i], i));
+    }
+    std::vector<RowsetReaderSharedPtr> input_rs_readers;
+    for (auto& rowset : input_rowsets) {
+        RowsetReaderSharedPtr rs_reader;
+        ASSERT_TRUE(rowset->create_reader(&rs_reader).ok());
+        input_rs_readers.push_back(std::move(rs_reader));
+    }
+    auto writer_context = create_rowset_writer_context(tablet_schema, NONOVERLAPPING, 3456,
+                                                       {0, input_rowsets.back()->end_version()});
+    auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
+    ASSERT_TRUE(res.has_value()) << res.error();
+    auto output_rs_writer = std::move(res).value();
+
+    TabletSharedPtr tablet = create_tablet(*tablet_schema, false);
+    tablet->mark_dropped();
+    Merger::Statistics stats;
+    RowIdConversion rowid_conversion;
+    stats.rowid_conversion = &rowid_conversion;
+    auto s = Merger::vertical_merge_rowsets(tablet, ReaderType::READER_CUMULATIVE_COMPACTION,
+                                            *tablet_schema, input_rs_readers,
+                                            output_rs_writer.get(), 100, num_segments, &stats);
+    ASSERT_FALSE(s.ok());
+    EXPECT_NE(s.to_string().find("not used any more"), std::string::npos) << s;
+    EXPECT_EQ(stats.output_rows, 0);
+}
+
 TEST_F(VerticalCompactionTest, TestDupWithoutKeyVerticalMerge) {
     auto num_input_rowset = 2;
     auto num_segments = 2;

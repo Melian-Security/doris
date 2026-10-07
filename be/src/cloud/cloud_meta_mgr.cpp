@@ -1944,14 +1944,14 @@ Status CloudMetaMgr::abort_tablet_job(const TabletJobInfoPB& job) {
                      });
 }
 
-Status CloudMetaMgr::lease_tablet_job(const TabletJobInfoPB& job) {
+Status CloudMetaMgr::lease_tablet_job(const TabletJobInfoPB& job, FinishTabletJobResponse* res) {
     VLOG_DEBUG << "lease_tablet_job: " << job.ShortDebugString();
+    TEST_SYNC_POINT_RETURN_WITH_VALUE("CloudMetaMgr::lease_tablet_job", Status::OK(), job, res);
     FinishTabletJobRequest req;
-    FinishTabletJobResponse res;
     req.mutable_job()->CopyFrom(job);
     req.set_action(FinishTabletJobRequest::LEASE);
     req.set_cloud_unique_id(config::cloud_unique_id);
-    return retry_rpc(MetaServiceRPC::FINISH_TABLET_JOB, req, &res,
+    return retry_rpc(MetaServiceRPC::FINISH_TABLET_JOB, req, res,
                      &MetaService_Stub::finish_tablet_job,
                      {
                              .host_limiters = host_level_ms_rpc_rate_limiters_,
