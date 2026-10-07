@@ -86,7 +86,7 @@ Status CloudDeltaWriter::write(const Block* block, const DorisVector<uint32_t>& 
                     std::lock_guard lock(_mtx);
                     return _is_cancelled;
                 },
-                table_id());
+                table_id(), &_req.load_id);
     }
     std::lock_guard lock(_mtx);
     CHECK(_is_init || _is_cancelled);

@@ -29,6 +29,7 @@
 
 namespace doris {
 class MemTableWriter;
+class PUniqueId;
 struct WriterMemItem {
     std::weak_ptr<MemTableWriter> writer;
     int64_t mem_size;
@@ -45,7 +46,10 @@ public:
     // Every write operation will call this API to check if need flush memtable OR hang
     // when memory is not available.
     void handle_memtable_flush(std::function<bool()> cancel_check, WorkloadGroup* wg = nullptr);
-    void handle_table_memtable_backpressure(std::function<bool()> cancel_check, int64_t table_id);
+    // `load_id`, when given, lets the memory gate wait only on the flushes of the writer's own load
+    // (see config::load_memory_backpressure_wait_on_own_load).
+    void handle_table_memtable_backpressure(std::function<bool()> cancel_check, int64_t table_id,
+                                            const PUniqueId* load_id = nullptr);
 
     void register_writer(std::weak_ptr<MemTableWriter> writer);
 
@@ -67,7 +71,10 @@ private:
     bool _hard_limit_reached(bool use_watermark = true);
     bool _load_usage_low();
     int64_t _need_flush(bool use_watermark);
-    int64_t _table_flush_pending_memtable_count(int64_t table_id);
+    // Memtables queued for or running flush for `table_id`, and the part of them that belongs to
+    // `load_id` (0 when `load_id` is null).
+    void _flush_pending_memtable_count(int64_t table_id, const PUniqueId* load_id,
+                                       int64_t* table_pending, int64_t* load_pending);
     int64_t _flush_active_memtables(int64_t need_flush);
     void _refresh_mem_tracker();
     std::mutex _lock;

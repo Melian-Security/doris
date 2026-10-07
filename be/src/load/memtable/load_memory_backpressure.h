@@ -61,10 +61,21 @@ struct LoadMemoryBackpressure {
                                         bool memory_wait_allowed, int64_t pending_bytes,
                                         int64_t pending_bytes_limit, int64_t process_used,
                                         int64_t watermark) {
+        return table_write_should_wait(pending_count, count_limit, memory_wait_allowed,
+                                       pending_count, pending_bytes, pending_bytes_limit,
+                                       process_used, watermark);
+    }
+
+    // Same as above, but the memory gate is conditioned on `memory_pending_count`, the pending
+    // flushes the waiter can count on to end its wait, which may be narrower than the table's.
+    static bool table_write_should_wait(int64_t pending_count, int64_t count_limit,
+                                        bool memory_wait_allowed, int64_t memory_pending_count,
+                                        int64_t pending_bytes, int64_t pending_bytes_limit,
+                                        int64_t process_used, int64_t watermark) {
         if (count_limit > 0 && pending_count >= count_limit) {
             return true;
         }
-        if (!memory_wait_allowed || pending_count <= 0) {
+        if (!memory_wait_allowed || memory_pending_count <= 0) {
             return false;
         }
         if (pending_bytes_limit > 0 && pending_bytes >= pending_bytes_limit) {

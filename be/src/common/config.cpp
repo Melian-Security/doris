@@ -874,6 +874,10 @@ DEFINE_mInt32(load_memtable_pending_mem_limit_percent, "0");
 // Upper bound of one memory-driven wait. After it the write proceeds, and the process GC remains
 // the safety valve. The pending-count gate keeps its own unbounded semantics.
 DEFINE_mInt64(load_memory_backpressure_max_wait_ms, "60000");
+// When true, the memory part of the per-table write gate holds a write only while the writer's own
+// load has memtables queued for or running flush on this BE. When false it holds every write to the
+// table while any load of that table has a pending flush. The pending-count gate is unaffected.
+DEFINE_mBool(load_memory_backpressure_wait_on_own_load, "false");
 // When >= 0, the process GC cancels loads only to free the overshoot above mem_limit plus this
 // percent of mem_limit (capped at process_full_gc_size), instead of process_full_gc_size.
 // Not applied when the GC is triggered by low system available memory. -1 keeps the old target.

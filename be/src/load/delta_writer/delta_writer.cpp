@@ -160,7 +160,7 @@ Status DeltaWriter::write(const Block* block, const DorisVector<uint32_t>& row_i
                     std::lock_guard<std::mutex> l(_lock);
                     return _is_cancelled;
                 },
-                table_id());
+                table_id(), &_req.load_id);
     }
     _lock_watch.start();
     std::lock_guard<std::mutex> l(_lock);

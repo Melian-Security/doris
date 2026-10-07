@@ -84,6 +84,31 @@ TEST(LoadMemoryBackpressureTest, TableWriteMemoryGate) {
                                                                  MEM_LIMIT, -1));
 }
 
+TEST(LoadMemoryBackpressureTest, TableWriteMemoryGateScopedToLoad) {
+    const int64_t watermark = LoadMemoryBackpressure::process_watermark(true, MEM_LIMIT, 82);
+    const int64_t pending_limit = LoadMemoryBackpressure::percent_of(MEM_LIMIT, 15);
+
+    // Above the watermark, the table has flushes pending but this load has none: no wait.
+    EXPECT_FALSE(LoadMemoryBackpressure::table_write_should_wait(
+            60, 100, true, 0, 0, pending_limit, MEM_LIMIT, watermark));
+    // Same, but this load has a flush pending: wait for it.
+    EXPECT_TRUE(LoadMemoryBackpressure::table_write_should_wait(60, 100, true, 1, 0, pending_limit,
+                                                                MEM_LIMIT, watermark));
+    // Byte budget exceeded, this load has a flush pending: wait.
+    EXPECT_TRUE(LoadMemoryBackpressure::table_write_should_wait(
+            60, 100, true, 2, pending_limit, pending_limit, 0, watermark));
+    // The table-wide count gate still applies whatever this load holds.
+    EXPECT_TRUE(LoadMemoryBackpressure::table_write_should_wait(100, 100, true, 0, 0, pending_limit,
+                                                                0, watermark));
+    EXPECT_TRUE(LoadMemoryBackpressure::table_write_should_wait(100, 100, false, 0, 0, -1, 0, -1));
+    // Memory wait used up: only the count gate decides.
+    EXPECT_FALSE(LoadMemoryBackpressure::table_write_should_wait(
+            60, 100, false, 5, 1000 * GB, pending_limit, MEM_LIMIT, watermark));
+    // The 7-argument form scopes the memory gate to the table, as before.
+    EXPECT_TRUE(LoadMemoryBackpressure::table_write_should_wait(60, 100, true, 0, pending_limit,
+                                                                MEM_LIMIT, watermark));
+}
+
 TEST(LoadMemoryBackpressureTest, MemoryWaitIsBounded) {
     EXPECT_FALSE(LoadMemoryBackpressure::memory_wait_allowed(false, 0, 60000));
     EXPECT_TRUE(LoadMemoryBackpressure::memory_wait_allowed(true, 0, 60000));

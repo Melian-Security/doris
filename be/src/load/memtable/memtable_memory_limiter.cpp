@@ -138,22 +138,29 @@ int64_t MemTableMemoryLimiter::_need_flush(bool use_watermark) {
     return need_flush - _queue_mem_usage - _flush_mem_usage;
 }
 
-int64_t MemTableMemoryLimiter::_table_flush_pending_memtable_count(int64_t table_id) {
-    int64_t pending_memtables = 0;
+void MemTableMemoryLimiter::_flush_pending_memtable_count(int64_t table_id,
+                                                          const PUniqueId* load_id,
+                                                          int64_t* table_pending,
+                                                          int64_t* load_pending) {
+    *table_pending = 0;
+    *load_pending = 0;
     for (const auto& writer : _writers) {
         auto writer_sptr = writer.lock();
-        if (writer_sptr == nullptr) {
+        if (writer_sptr == nullptr || writer_sptr->table_id() != table_id) {
             continue;
         }
-        if (writer_sptr->table_id() == table_id) {
-            pending_memtables += writer_sptr->flush_pending_memtable_count();
+        int64_t pending = writer_sptr->flush_pending_memtable_count();
+        *table_pending += pending;
+        if (load_id != nullptr && writer_sptr->load_id().hi() == load_id->hi() &&
+            writer_sptr->load_id().lo() == load_id->lo()) {
+            *load_pending += pending;
         }
     }
-    return pending_memtables;
 }
 
 void MemTableMemoryLimiter::handle_table_memtable_backpressure(std::function<bool()> cancel_check,
-                                                               int64_t table_id) {
+                                                               int64_t table_id,
+                                                               const PUniqueId* load_id) {
     if (!config::enable_table_memtable_flush_backpressure) {
         return;
     }
@@ -175,26 +182,42 @@ void MemTableMemoryLimiter::handle_table_memtable_backpressure(std::function<boo
     timer.start();
     // Both the pending-count gate and the memory gate are re-evaluated on every wake-up. The
     // memory gate stops applying once its bounded wait is used up.
-    auto should_wait = [&](int64_t pending_count) {
+    //
+    // With load_memory_backpressure_wait_on_own_load the memory gate only holds a write while its
+    // own load has flushes pending. Otherwise, with many loads into one table, the table almost
+    // always has a pending flush, so a write waits until process memory drops or the bounded
+    // wait runs out, whatever its own load is doing.
+    const PUniqueId* memory_scope_load_id =
+            config::load_memory_backpressure_wait_on_own_load ? load_id : nullptr;
+    int64_t pending_count = 0;
+    int64_t load_pending_count = 0;
+    auto refresh_pending = [&]() {
+        _flush_pending_memtable_count(table_id, memory_scope_load_id, &pending_count,
+                                      &load_pending_count);
+    };
+    auto should_wait = [&]() {
         bool memory_wait = LoadMemoryBackpressure::memory_wait_allowed(
                 memory_enabled, timer.elapsed_time() / 1000 / 1000, max_wait_ms);
+        int64_t memory_pending_count =
+                memory_scope_load_id != nullptr ? load_pending_count : pending_count;
         return LoadMemoryBackpressure::table_write_should_wait(
-                pending_count, pending_count_limit, memory_wait,
+                pending_count, pending_count_limit, memory_wait, memory_pending_count,
                 _queue_mem_usage + _flush_mem_usage, pending_bytes_limit,
                 GlobalMemoryArbitrator::process_memory_usage(), watermark);
     };
 
     std::unique_lock<std::mutex> l(_lock);
-    int64_t pending_count = _table_flush_pending_memtable_count(table_id);
-    if (!should_wait(pending_count)) {
+    refresh_pending();
+    if (!should_wait()) {
         return;
     }
 
     g_memtable_table_backpressure_waiting_threads << 1;
-    while (should_wait(pending_count)) {
+    while (should_wait()) {
         g_memtable_table_backpressure_pending_count.set_value(pending_count);
         LOG_EVERY_T(INFO, 1) << "table memtable flush backpressure: table_id=" << table_id
                              << ", pending_memtables=" << pending_count
+                             << ", load_pending_memtables=" << load_pending_count
                              << ", limit=" << pending_count_limit << ", pending_bytes="
                              << PrettyPrinter::print_bytes(_queue_mem_usage + _flush_mem_usage)
                              << ", pending_bytes_limit="
@@ -210,7 +233,7 @@ void MemTableMemoryLimiter::handle_table_memtable_backpressure(std::function<boo
             return;
         }
         static_cast<void>(_hard_limit_end_cond.wait_for(l, std::chrono::milliseconds(100)));
-        pending_count = _table_flush_pending_memtable_count(table_id);
+        refresh_pending();
     }
     g_memtable_table_backpressure_pending_count.set_value(pending_count);
     g_memtable_table_backpressure_waiting_threads << -1;

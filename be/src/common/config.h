@@ -930,6 +930,8 @@ DECLARE_mInt32(load_memory_backpressure_process_mem_percent);
 DECLARE_mInt32(load_memtable_pending_mem_limit_percent);
 // Upper bound of one memory-driven load wait.
 DECLARE_mInt64(load_memory_backpressure_max_wait_ms);
+// Scope the memory part of the per-table write gate to the writer's own load.
+DECLARE_mBool(load_memory_backpressure_wait_on_own_load);
 // Process GC frees only the overshoot plus this percent of mem_limit from loads. -1 disables it.
 DECLARE_mInt32(load_memory_gc_free_extra_percent);
 
