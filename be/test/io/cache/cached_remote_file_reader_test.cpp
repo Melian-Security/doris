@@ -1067,6 +1067,15 @@ TEST_F(BlockFileCacheTest, direct_read_drops_evicted_block_and_maps_replacement)
     settings.max_query_cache_size = 0;
     ASSERT_TRUE(
             FileCacheFactory::instance()->create_file_cache(local_cache_base_path, settings).ok());
+    // Until the async open finishes, get_or_set lazily re-creates DOWNLOADED cells from the meta
+    // store, whose deletes are applied asynchronously, so the evicted block could come back with
+    // its file gone. Wait for the open so the test exercises only the direct-read map.
+    auto* cache = FileCacheFactory::instance()->get_by_path(local_cache_base_path);
+    ASSERT_NE(cache, nullptr);
+    for (int i = 0; i < 3000 && !cache->get_async_open_success(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache->get_async_open_success());
 
     io::FileReaderOptions opts;
     opts.cache_type = io::cache_type_from_string("file_block_cache");
