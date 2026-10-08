@@ -40,7 +40,9 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class CreateStorageVaultCommandTest extends TestWithFeService {
     private String vaultName;
@@ -154,5 +156,136 @@ public class CreateStorageVaultCommandTest extends TestWithFeService {
             Config.cloud_unique_id = "";
             Config.meta_service_endpoint = originMetaServiceEndpoint;
         }
+    }
+
+    @Test
+    public void testRejectInvalidPathFormat(@Mocked AccessControllerManager accessManager) {
+        new Expectations() {
+            {
+                Env.getCurrentEnv().getAccessManager();
+                minTimes = 0;
+                result = accessManager;
+
+                accessManager.checkGlobalPriv((ConnectContext) any, PrivPredicate.ADMIN);
+                minTimes = 0;
+                result = true;
+            }
+        };
+
+        Config.cloud_unique_id = "not_empty_nereids";
+        try {
+            String[][] invalid = {
+                    {"1", "0"},       // version 1 divides by shard_num
+                    {"1", "-8"},
+                    {"1", "65537"},   // above the bound
+                    {"1", null},      // version 1 without shard_num
+                    {"2", "16"},      // unknown version
+                    {"-1", null},
+                    {"abc", null},    // not an integer
+                    {"1", "1k"},
+                    {null, "16"},     // shard_num without version 1
+            };
+            for (String[] pathFormat : invalid) {
+                CreateStorageVaultCommand command =
+                        new CreateStorageVaultCommand(false, "s3_invalid", s3Properties(pathFormat[0], pathFormat[1]));
+                Assertions.assertThrows(AnalysisException.class, command::validate,
+                        "path_version=" + pathFormat[0] + " shard_num=" + pathFormat[1]);
+            }
+
+            String[][] valid = {{"1", "1"}, {"1", "65536"}, {"0", null}, {"0", "0"}, {null, null}};
+            for (String[] pathFormat : valid) {
+                CreateStorageVaultCommand command =
+                        new CreateStorageVaultCommand(false, "s3_valid", s3Properties(pathFormat[0], pathFormat[1]));
+                Assertions.assertDoesNotThrow(command::validate,
+                        "path_version=" + pathFormat[0] + " shard_num=" + pathFormat[1]);
+            }
+        } finally {
+            Config.cloud_unique_id = "";
+        }
+    }
+
+    @Test
+    public void testHdfsVaultWithPathFormat(@Mocked AccessControllerManager accessManager) {
+        new Expectations() {
+            {
+                Env.getCurrentEnv().getAccessManager();
+                minTimes = 0;
+                result = accessManager;
+
+                accessManager.checkGlobalPriv((ConnectContext) any, PrivPredicate.ADMIN);
+                minTimes = 0;
+                result = true;
+            }
+        };
+
+        Config.cloud_unique_id = "not_empty_nereids";
+        try {
+            // Each property alone and both together; the command path precedes type dispatch.
+            String[][] cases = {{"1", "64", "1", "64"}, {"0", null, "0", "0"}, {null, null, "0", "0"}};
+            for (String[] c : cases) {
+                Map<String, String> properties = new HashMap<>();
+                properties.put("type", "hdfs");
+                properties.put("fs.defaultFS", "hdfs://127.0.0.1:8020");
+                if (c[0] != null) {
+                    properties.put("path_version", c[0]);
+                }
+                if (c[1] != null) {
+                    properties.put("shard_num", c[1]);
+                }
+                CreateStorageVaultCommand command =
+                        new CreateStorageVaultCommand(false, "hdfs_sharded", ImmutableMap.copyOf(properties));
+                Assertions.assertDoesNotThrow(command::validate);
+                Assertions.assertEquals(StorageVault.StorageVaultType.HDFS, command.getVaultType());
+                Assertions.assertEquals(Integer.parseInt(c[2]), command.getPathVersion());
+                Assertions.assertEquals(Integer.parseInt(c[3]), command.getNumShard());
+                Assertions.assertFalse(command.getProperties().containsKey("path_version"));
+                Assertions.assertFalse(command.getProperties().containsKey("shard_num"));
+                Assertions.assertEquals("hdfs://127.0.0.1:8020", command.getProperties().get("fs.defaultFS"));
+            }
+            Map<String, String> invalid = new HashMap<>();
+            invalid.put("type", "hdfs");
+            invalid.put("path_version", "1");
+            invalid.put("shard_num", "0");
+            CreateStorageVaultCommand command =
+                    new CreateStorageVaultCommand(false, "hdfs_invalid", ImmutableMap.copyOf(invalid));
+            Assertions.assertThrows(AnalysisException.class, command::validate);
+        } finally {
+            Config.cloud_unique_id = "";
+        }
+    }
+
+    @Test
+    public void testShowStorageVaultPathFormat() {
+        Cloud.StorageVaultPB.Builder vault = Cloud.StorageVaultPB.newBuilder()
+                .setName("s3_vault")
+                .setId("3")
+                .setObjInfo(Cloud.ObjectStoreInfoPB.newBuilder().setBucket("b").setPrefix("p")
+                        .setUsePathStyle(true));
+        String v0 = StorageVault.convertToShowStorageVaultProperties(vault.build()).get(2);
+        Assertions.assertEquals("bucket: \"b\" prefix: \"p\" use_path_style: true", v0);
+
+        vault.setPathFormat(Cloud.StorageVaultPB.PathFormat.newBuilder().setPathVersion(0).setShardNum(0));
+        Assertions.assertEquals(v0, StorageVault.convertToShowStorageVaultProperties(vault.build()).get(2));
+
+        vault.setPathFormat(Cloud.StorageVaultPB.PathFormat.newBuilder().setPathVersion(1).setShardNum(1024));
+        Assertions.assertEquals(v0 + " path_version: 1 shard_num: 1024",
+                StorageVault.convertToShowStorageVaultProperties(vault.build()).get(2));
+    }
+
+    private static Map<String, String> s3Properties(String pathVersion, String shardNum) {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("type", "S3");
+        properties.put("s3.endpoint", "s3.us-east-1.amazonaws.com");
+        properties.put("s3.region", "us-east-1");
+        properties.put("s3.root.path", "vault_root");
+        properties.put("s3.bucket", "vault_bucket");
+        properties.put("provider", "S3");
+        if (pathVersion != null) {
+            properties.put("path_version", pathVersion);
+        }
+        if (shardNum != null) {
+            properties.put("shard_num", shardNum);
+        }
+        return ImmutableMap.copyOf(properties);
     }
 }

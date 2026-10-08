@@ -36,6 +36,7 @@ import org.apache.doris.qe.StmtExecutor;
 
 import com.google.common.collect.ImmutableMap;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -43,6 +44,9 @@ import java.util.Map;
  * PROPERTIES (key1 = value1, ...)
  */
 public class CreateStorageVaultCommand extends Command implements ForwardWithSync, NeedAuditEncryption {
+    // Upper bound of shard_num, kept equal to the meta-service's bound.
+    public static final int MAX_SHARD_NUM = 65536;
+
     private static final String PATH_VERSION = "path_version";
 
     private static final String SHARD_NUM = "shard_num";
@@ -113,18 +117,20 @@ public class CreateStorageVaultCommand extends Command implements ForwardWithSyn
 
         final String pathVersionString = properties.get(PATH_VERSION);
         if (pathVersionString != null) {
-            this.pathVersion = Integer.parseInt(pathVersionString);
+            this.pathVersion = parseIntProperty(PATH_VERSION, pathVersionString);
         }
         final String numShardString = properties.get(SHARD_NUM);
         if (numShardString != null) {
-            this.numShard = Integer.parseInt(numShardString);
+            this.numShard = parseIntProperty(SHARD_NUM, numShardString);
         }
+        validatePathFormat(pathVersion, numShard);
         if (pathVersionString != null || numShardString != null) {
-            // properties is an ImmutableMap, so the path format keys are dropped by rebuilding it:
-            // they travel to the meta-service as StorageVaultPB.PathFormat, not as resource properties.
-            properties = properties.entrySet().stream()
-                    .filter(e -> !e.getKey().equals(PATH_VERSION) && !e.getKey().equals(SHARD_NUM))
-                    .collect(ImmutableMap.toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
+            // The path format travels to the meta-service as StorageVaultPB.PathFormat, not as a
+            // resource property. properties stays immutable, so drop the keys from a working copy.
+            Map<String, String> workingProperties = new HashMap<>(properties);
+            workingProperties.remove(PATH_VERSION);
+            workingProperties.remove(SHARD_NUM);
+            properties = ImmutableMap.copyOf(workingProperties);
         }
         setAsDefault = Boolean.parseBoolean(properties.getOrDefault(SET_AS_DEFAULT, "false"));
         setStorageVaultType(StorageVault.StorageVaultType.fromString(type));
@@ -135,6 +141,32 @@ public class CreateStorageVaultCommand extends Command implements ForwardWithSyn
                     .putAll(properties)
                     .put(S3Properties.USE_PATH_STYLE, "true")
                     .build();
+        }
+    }
+
+    private static int parseIntProperty(String key, String value) throws AnalysisException {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AnalysisException("Invalid " + key + ": '" + value + "', it must be an integer");
+        }
+    }
+
+    /**
+     * Version 0 keys objects as data/{tablet_id}/{rowset_id}_{seg}.dat and ignores shard_num.
+     * Version 1 keys them as data/{murmur64(tablet_id) % shard_num}/{tablet_id}/{rowset_id}/{seg}.dat,
+     * so it needs a positive shard_num.
+     */
+    private static void validatePathFormat(int pathVersion, int numShard) throws AnalysisException {
+        if (pathVersion != 0 && pathVersion != 1) {
+            throw new AnalysisException("Invalid " + PATH_VERSION + ": " + pathVersion + ", it must be 0 or 1");
+        }
+        if (pathVersion == 1 && (numShard <= 0 || numShard > MAX_SHARD_NUM)) {
+            throw new AnalysisException("Invalid " + SHARD_NUM + ": " + numShard + ", it must be in [1, "
+                    + MAX_SHARD_NUM + "] when " + PATH_VERSION + " is 1");
+        }
+        if (pathVersion == 0 && numShard != 0) {
+            throw new AnalysisException(SHARD_NUM + " requires " + PATH_VERSION + " = 1");
         }
     }
 

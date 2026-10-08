@@ -233,10 +233,19 @@ public abstract class StorageVault {
                 // There is no `use_path_style` field in old version, think `use_path_style` false
                 builder.setUsePathStyle(false);
             }
-            row.add(printer.shortDebugString(builder));
+            row.add(printer.shortDebugString(builder) + pathFormatSuffix(vault));
         }
         row.add("false");
         return row;
+    }
+
+    // Shown only for a non-default layout, so rows of version-0 vaults are unchanged.
+    private static String pathFormatSuffix(Cloud.StorageVaultPB vault) {
+        if (!vault.hasPathFormat() || vault.getPathFormat().getPathVersion() == 0) {
+            return "";
+        }
+        return " path_version: " + vault.getPathFormat().getPathVersion()
+                + " shard_num: " + vault.getPathFormat().getShardNum();
     }
 
     public static void setDefaultVaultToShowVaultResult(List<List<String>> rows, String vaultId) {
