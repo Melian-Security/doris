@@ -127,14 +127,19 @@ void HttpBodyFlowControl::resume() {
 
 void HttpBodyFlowControl::_resume_on_loop(evutil_socket_t /*fd*/, short /*events*/, void* arg) {
     std::unique_ptr<ResumeTask> task(static_cast<ResumeTask*>(arg));
-    auto self = task->flow_control.lock();
-    // The request is freed on this thread, so it stays alive for the rest of this callback.
-    if (self == nullptr || self->_request_alive.expired() || !self->_paused) {
+    if (auto self = task->flow_control.lock()) {
+        self->resume_on_loop();
+    }
+}
+
+void HttpBodyFlowControl::resume_on_loop() {
+    // The request is freed on this thread, so it stays alive for the rest of this call.
+    if (_request_alive.expired() || !_paused) {
         return;
     }
-    self->_paused = false;
-    if (!self->_body_complete) {
-        self->_set_read_enabled(true);
+    _paused = false;
+    if (!_body_complete) {
+        _set_read_enabled(true);
     }
 }
 

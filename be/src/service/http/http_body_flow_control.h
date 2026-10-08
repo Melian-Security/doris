@@ -64,6 +64,8 @@ public:
 
     void pause();
     void resume();
+    // Event loop thread: re-enables the read before returning to the loop, unlike resume().
+    void resume_on_loop();
     void body_complete() { _body_complete = true; }
 
     bool paused() const { return _paused; }
