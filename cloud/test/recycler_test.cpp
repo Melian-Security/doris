@@ -3119,6 +3119,214 @@ TEST(RecyclerTest, recycle_tablet) {
     check_delete_bitmap_file_size(accessor, tablet_id, 0);
 }
 
+TEST(RecyclerTest, vault_path_v1_keys) {
+    VaultPathFormat v1;
+    v1.set_path_version(1);
+    v1.set_shard_num(16);
+    const VaultPathFormat v0;
+
+    // murmur_hash64A(tablet_id) % shard_num; BE's StorageResourceTest pins the same values.
+    EXPECT_EQ(vault_shard_of_tablet(10003, 16), 13);
+    EXPECT_EQ(vault_shard_of_tablet(10004, 16), 9);
+    EXPECT_EQ(vault_shard_of_tablet(10003, 1024), 173);
+    EXPECT_EQ(vault_shard_of_tablet(1, 1024), 194);
+    EXPECT_EQ(vault_shard_of_tablet(123456789, 1024), 933);
+    EXPECT_EQ(vault_shard_of_tablet(-1, 1024), 21);
+    EXPECT_EQ(vault_shard_of_tablet(10003, 1), 0);
+
+    EXPECT_EQ(segment_path(v1, 10003, "rs", 2), "data/13/10003/rs/2.dat");
+    EXPECT_EQ(inverted_index_path_v2(v1, 10003, "rs", 2), "data/13/10003/rs/2.idx");
+    EXPECT_EQ(inverted_index_path_v1(v1, 10003, "rs", 2, 7, ""), "data/13/10003/rs/2_7.idx");
+    EXPECT_EQ(inverted_index_path_v1(v1, 10003, "rs", 2, 7, "sfx"),
+              "data/13/10003/rs/2_7@sfx.idx");
+    EXPECT_EQ(delete_bitmap_path(v1, 10003, "rs"), "data/13/10003/rs_delete_bitmap.db");
+    EXPECT_EQ(rowset_path_prefix(v1, 10003, "rs"), "data/13/10003/rs");
+    EXPECT_EQ(tablet_path_prefix(v1, 10003), "data/13/10003/");
+
+    // Version 0 keys are unchanged, with or without an explicit path format.
+    EXPECT_EQ(segment_path(10003, "rs", 2), "data/10003/rs_2.dat");
+    EXPECT_EQ(segment_path(v0, 10003, "rs", 2), "data/10003/rs_2.dat");
+    EXPECT_EQ(inverted_index_path_v2(v0, 10003, "rs", 2), "data/10003/rs_2.idx");
+    EXPECT_EQ(inverted_index_path_v1(v0, 10003, "rs", 2, 7, "sfx"), "data/10003/rs_2_7@sfx.idx");
+    EXPECT_EQ(delete_bitmap_path(v0, 10003, "rs"), "data/10003/rs_delete_bitmap.db");
+    EXPECT_EQ(rowset_path_prefix(v0, 10003, "rs"), "data/10003/rs_");
+    EXPECT_EQ(tablet_path_prefix(v0, 10003), "data/10003/");
+
+    EXPECT_EQ(to_path_v0_layout(v1, "data/13/10003/rs/2_7@sfx.idx"), "data/10003/rs_2_7@sfx.idx");
+    EXPECT_EQ(to_path_v0_layout(v1, "data/13/10003/rs/2.dat"), "data/10003/rs_2.dat");
+    EXPECT_EQ(to_path_v0_layout(v1, "data/13/10003/rs_delete_bitmap.db"),
+              "data/10003/rs_delete_bitmap.db");
+    EXPECT_EQ(to_path_v0_layout(v1, "data/packed_file/3/x.bin"), "data/packed_file/3/x.bin");
+    EXPECT_EQ(to_path_v0_layout(v0, "data/13/10003/rs/2.dat"), "data/13/10003/rs/2.dat");
+
+    EXPECT_TRUE(is_supported_path_format(v0));
+    EXPECT_TRUE(is_supported_path_format(v1));
+    VaultPathFormat bad;
+    bad.set_path_version(1);
+    EXPECT_FALSE(is_supported_path_format(bad));
+    bad.set_path_version(2);
+    bad.set_shard_num(16);
+    EXPECT_FALSE(is_supported_path_format(bad));
+}
+
+// A version-1 vault next to a version-0 one: rowset and tablet recycling delete exactly the sharded
+// keys in the first and the plain keys in the second.
+TEST(RecyclerTest, recycle_path_v1_vault) {
+    config::retention_seconds = 0;
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    InstanceInfoPB instance;
+    instance.set_instance_id(instance_id);
+    auto obj_info = instance.add_obj_info();
+    obj_info->set_id("v0_vault");
+    obj_info->set_ak(config::test_s3_ak);
+    obj_info->set_sk(config::test_s3_sk);
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("recycle_path_v1_vault");
+
+    InstanceRecycler recycler(txn_kv, instance, thread_group,
+                              std::make_shared<TxnLazyCommitter>(txn_kv));
+    ASSERT_EQ(recycler.init(), 0);
+    auto v0_accessor = recycler.accessor_map_.at("v0_vault");
+    auto v1_accessor = std::make_shared<MockAccessor>();
+    VaultPathFormat v1;
+    v1.set_path_version(1);
+    v1.set_shard_num(16);
+    recycler.TEST_add_accessor("v1_vault", v1_accessor);
+    recycler.TEST_set_vault_path_format("v1_vault", v1);
+    // Receives the version-0 objects the shared helpers below write; only kv state matters.
+    auto scratch = std::make_shared<MockAccessor>();
+
+    auto list_objects = [](StorageVaultAccessor* accessor) {
+        std::unique_ptr<ListIterator> it;
+        EXPECT_EQ(accessor->list_all(&it), 0);
+        std::set<std::string> objects;
+        for (auto file = it->next(); file.has_value(); file = it->next()) {
+            objects.insert(file->path);
+        }
+        return objects;
+    };
+
+    doris::TabletSchemaCloudPB schema;
+    schema.set_schema_version(1);
+    schema.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+    auto* index = schema.add_index();
+    index->set_index_id(7);
+    index->set_index_type(IndexType::INVERTED);
+
+    // Objects of other tablets, and version-0 keys of the recycled tablets, must survive.
+    const std::set<std::string> untouched_v1 = {"data/9/10004/02000000000000000000000000000001/0.dat",
+                                                "data/10003/rowset_0.dat",
+                                                "data/20003/rowset_0.dat"};
+    for (const auto& path : untouched_v1) {
+        v1_accessor->put_file(path, "");
+    }
+
+    // 1. Rowset recycle. Tablet 10003 (shard 13) on the version-1 vault, 40003 on the version-0 one.
+    constexpr int64_t v1_tablet_id = 10003, v0_tablet_id = 40003, index_id = 10001;
+    for (int i = 0; i < 4; ++i) {
+        auto rowset = create_rowset("v1_vault", v1_tablet_id, index_id, 2, schema);
+        ASSERT_EQ(0, create_recycle_rowset(txn_kv.get(), scratch.get(), rowset,
+                                           RecycleRowsetPB::COMPACT, false, true));
+        const auto& rs = rowset.rowset_id_v2();
+        for (int seg = 0; seg < 2; ++seg) {
+            v1_accessor->put_file(fmt::format("data/13/10003/{}/{}.dat", rs, seg), "");
+            v1_accessor->put_file(fmt::format("data/13/10003/{}/{}_7.idx", rs, seg), "");
+        }
+        v1_accessor->put_file(fmt::format("data/13/10003/{}_delete_bitmap.db", rs), "");
+
+        auto v0_rowset = create_rowset("v0_vault", v0_tablet_id, index_id, 2, schema);
+        ASSERT_EQ(0, create_recycle_rowset(txn_kv.get(), v0_accessor.get(), v0_rowset,
+                                           RecycleRowsetPB::COMPACT, false, true));
+    }
+    ASSERT_EQ(list_objects(v1_accessor.get()).size(), untouched_v1.size() + 4 * 5);
+    ASSERT_EQ(list_objects(v0_accessor.get()).size(), 4 * 5);
+
+    ASSERT_EQ(recycler.recycle_rowsets(), 0);
+    EXPECT_EQ(list_objects(v1_accessor.get()), untouched_v1);
+    EXPECT_TRUE(list_objects(v0_accessor.get()).empty());
+
+    // 2. Tablet recycle (DROP) of tablet 20003 (shard 13) on the version-1 vault.
+    constexpr int64_t table_id = 30000, drop_index_id = 30001, partition_id = 30002,
+                      drop_tablet_id = 20003;
+    ASSERT_EQ(0, create_tablet(txn_kv.get(), table_id, drop_index_id, partition_id,
+                               drop_tablet_id));
+    for (int version = 2; version < 5; ++version) {
+        ASSERT_EQ(0, create_committed_rowset(txn_kv.get(), scratch.get(), "v1_vault",
+                                             drop_tablet_id, version, drop_index_id));
+    }
+    ASSERT_EQ(create_partition_version_kv(txn_kv.get(), table_id, partition_id), 0);
+    for (const auto* path : {"data/13/20003/02000000000000000000000000000002/0.dat",
+                             "data/13/20003/02000000000000000000000000000002/0_0.idx",
+                             "data/13/20003/02000000000000000000000000000002_delete_bitmap.db"}) {
+        v1_accessor->put_file(path, "");
+    }
+
+    ASSERT_EQ(0, recycler.recycle_tablets(table_id, drop_index_id, ctx));
+    EXPECT_EQ(list_objects(v1_accessor.get()), untouched_v1);
+}
+
+// Rowsets of aborted loads on a version-1 vault are deleted under their sharded keys.
+TEST(RecyclerTest, recycle_tmp_rowsets_path_v1_vault) {
+    config::retention_seconds = 0;
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+    InstanceInfoPB instance;
+    instance.set_instance_id(instance_id);
+    instance.set_multi_version_status(MULTI_VERSION_WRITE_ONLY);
+    auto obj_info = instance.add_obj_info();
+    obj_info->set_id("recycle_tmp_rowsets_path_v1_vault");
+    obj_info->set_ak(config::test_s3_ak);
+    obj_info->set_sk(config::test_s3_sk);
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("recycle_tmp_rowsets_path_v1_vault");
+
+    InstanceRecycler recycler(txn_kv, instance, thread_group,
+                              std::make_shared<TxnLazyCommitter>(txn_kv));
+    ASSERT_EQ(recycler.init(), 0);
+    auto v1_accessor = std::make_shared<MockAccessor>();
+    VaultPathFormat v1;
+    v1.set_path_version(1);
+    v1.set_shard_num(16);
+    recycler.TEST_add_accessor("v1_vault", v1_accessor);
+    recycler.TEST_set_vault_path_format("v1_vault", v1);
+    auto scratch = std::make_shared<MockAccessor>();
+
+    doris::TabletSchemaCloudPB schema;
+    schema.set_schema_version(1);
+    schema.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
+    auto* index = schema.add_index();
+    index->set_index_id(3);
+    index->set_index_type(IndexType::INVERTED);
+
+    const std::string untouched = "data/9/10004/02000000000000000000000000000003/0.dat";
+    v1_accessor->put_file(untouched, "");
+    for (int i = 0; i < 3; ++i) {
+        auto rowset = create_rowset("v1_vault", 10003, 10001, 2, schema, 515150 + i);
+        ASSERT_EQ(0, create_tmp_rowset(txn_kv.get(), scratch.get(), rowset, false, true));
+        const auto& rs = rowset.rowset_id_v2();
+        for (int seg = 0; seg < 2; ++seg) {
+            v1_accessor->put_file(fmt::format("data/13/10003/{}/{}.dat", rs, seg), "");
+            v1_accessor->put_file(fmt::format("data/13/10003/{}/{}.idx", rs, seg), "");
+        }
+    }
+
+    ASSERT_EQ(recycler.recycle_tmp_rowsets(), 0);
+    ASSERT_EQ(recycler.recycle_tmp_rowsets(), 0);
+    std::unique_ptr<ListIterator> it;
+    ASSERT_EQ(v1_accessor->list_all(&it), 0);
+    std::vector<std::string> remaining;
+    for (auto file = it->next(); file.has_value(); file = it->next()) {
+        remaining.push_back(file->path);
+    }
+    EXPECT_EQ(remaining, std::vector<std::string> {untouched});
+}
+
 TEST(RecyclerTest, recycle_tablet_packed_file_ref_count) {
     auto txn_kv = std::make_shared<MemTxnKv>();
     ASSERT_EQ(txn_kv->init(), 0);
@@ -5695,6 +5903,65 @@ TEST(CheckerTest, normal) {
         }
     }
     ASSERT_EQ(checker.do_check(), 0);
+}
+
+// The checker looks for the objects of a version-1 vault under their sharded keys: present ones
+// are not reported as lost, missing ones are, and leaked ones are found by the inverted check.
+TEST(CheckerTest, path_v1_vault) {
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    StorageVaultPB vault;
+    vault.set_id("v1");
+    vault.set_name("v1_vault");
+    vault.mutable_obj_info()->set_id("v1");
+    vault.mutable_path_format()->set_path_version(1);
+    vault.mutable_path_format()->set_shard_num(16);
+    InstanceInfoPB instance;
+    instance.set_instance_id(instance_id);
+    instance.add_resource_ids(vault.id());
+    instance.add_storage_vault_names(vault.name());
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        txn->put(storage_vault_key({instance_id, vault.id()}), vault.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    InstanceChecker checker(txn_kv, instance_id);
+    ASSERT_EQ(checker.init(instance), 0);
+    ASSERT_EQ(checker.accessor_map_.size(), 1);
+    auto accessor = checker.accessor_map_.at("v1");
+    ASSERT_EQ(checker.vault_path_format("v1").path_version(), 1);
+    auto scratch = std::make_shared<MockAccessor>();
+
+    constexpr int64_t tablet_id = 10003, index_id = 10001; // shard 13 of 16
+    std::vector<std::string> segments;
+    for (int64_t version = 2; version < 5; ++version) {
+        ASSERT_EQ(0, create_committed_rowset(txn_kv.get(), scratch.get(), "v1", tablet_id, version,
+                                             index_id, 1, 1));
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        ASSERT_EQ(txn->get(meta_rowset_key({instance_id, tablet_id, version}), &val),
+                  TxnErrorCode::TXN_OK);
+        doris::RowsetMetaCloudPB rowset;
+        ASSERT_TRUE(rowset.ParseFromString(val));
+        const auto& rs = rowset.rowset_id_v2();
+        segments.push_back(fmt::format("data/13/10003/{}/0.dat", rs));
+        accessor->put_file(segments.back(), "");
+        accessor->put_file(fmt::format("data/13/10003/{}/0_0.idx", rs), "");
+    }
+
+    EXPECT_EQ(checker.do_check(), 0);
+    EXPECT_EQ(checker.do_inverted_check(), 0);
+
+    accessor->put_file("data/13/10003/02000000000000000000000000000009/0.dat", "");
+    EXPECT_EQ(checker.do_inverted_check(), 1);
+    accessor->delete_file("data/13/10003/02000000000000000000000000000009/0.dat");
+
+    accessor->delete_file(segments.front());
+    EXPECT_EQ(checker.do_check(), 1);
 }
 
 TEST(CheckerTest, abnormal) {

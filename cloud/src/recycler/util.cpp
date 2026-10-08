@@ -19,7 +19,11 @@
 
 #include <glog/logging.h>
 
+#include <bit>
 #include <cstdint>
+#include <cstring>
+#include <string_view>
+#include <vector>
 
 #include "common/util.h"
 #include "meta-service/meta_service_schema.h"
@@ -303,5 +307,49 @@ int get_tablet_meta(TxnKv* txn_kv, const std::string& instance_id, int64_t table
         return -1;
     }
     return 0;
+}
+
+int64_t vault_shard_of_tablet(int64_t tablet_id, int64_t shard_num) {
+    // MurmurHash64A over the 8 in-memory bytes of tablet_id with the BE's seed; this is exactly
+    // BE `HashUtil::murmur_hash64A(&tablet_id, sizeof(tablet_id), HashUtil::MURMUR_SEED)`.
+    static_assert(std::endian::native == std::endian::little);
+    constexpr uint64_t m = 0xc6a4a7935bd1e995ULL;
+    constexpr int r = 47;
+    constexpr uint32_t seed = 0xadc83b19U;
+    uint64_t h = seed ^ (sizeof(tablet_id) * m);
+    uint64_t k = 0;
+    std::memcpy(&k, &tablet_id, sizeof(k));
+    k *= m;
+    k ^= k >> r;
+    k *= m;
+    h ^= k;
+    h *= m;
+    h ^= h >> r;
+    h *= m;
+    h ^= h >> r;
+    return static_cast<int64_t>(h % static_cast<uint64_t>(shard_num));
+}
+
+std::string to_path_v0_layout(const VaultPathFormat& path_format, const std::string& path) {
+    if (path_format.path_version() != 1) {
+        return path;
+    }
+    std::vector<std::string_view> parts;
+    std::string_view rest = path;
+    for (size_t pos = rest.find('/'); pos != std::string_view::npos; pos = rest.find('/')) {
+        parts.push_back(rest.substr(0, pos));
+        rest.remove_prefix(pos + 1);
+    }
+    parts.push_back(rest);
+    if (parts.size() < 4 || parts[0] != "data" || parts[1] == "packed_file") {
+        return path;
+    }
+    if (parts.size() == 5) { // data/<shard>/<tablet_id>/<rowset_id>/<file>
+        return fmt::format("data/{}/{}_{}", parts[2], parts[3], parts[4]);
+    }
+    if (parts.size() == 4) { // data/<shard>/<tablet_id>/<file>
+        return fmt::format("data/{}/{}", parts[2], parts[3]);
+    }
+    return path;
 }
 } // namespace doris::cloud

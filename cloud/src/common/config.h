@@ -303,6 +303,11 @@ CONF_String(kerberos_krb5_conf_path, "/etc/krb5.conf");
 
 CONF_mBool(enable_distinguish_hdfs_path, "true");
 
+// Accept storage vaults with path_version=1 (sharded object keys). Enable only after every BE,
+// meta-service and recycler/checker of the cluster understands that layout: an older BE builds
+// S3 vaults as path version 0 and would read and write keys of the wrong layout.
+CONF_mBool(enable_storage_vault_path_version_1, "false");
+
 // If enabled, the txn status will be checked when preapre/commit rowset
 CONF_mBool(enable_load_txn_status_check, "true");
 

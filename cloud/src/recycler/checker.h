@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 #include "recycler/storage_vault_accessor.h"
+#include "recycler/util.h"
 #include "recycler/white_black_list.h"
 #include "snapshot/snapshot_manager.h"
 
@@ -152,6 +153,9 @@ public:
         accessor_map_.insert({std::string(id), std::move(accessor)});
     }
 
+    // Object key layout of the vault `resource_id`; version 0 unless the vault declares another.
+    const VaultPathFormat& vault_path_format(const std::string& resource_id) const;
+
     // If there are multiple buckets, return the minimum lifecycle; if there are no buckets (i.e.
     // all accessors are HdfsAccessor), return INT64_MAX.
     // Return 0 if success, otherwise error
@@ -252,6 +256,8 @@ private:
     std::string instance_id_;
     // id -> accessor
     std::unordered_map<std::string, std::shared_ptr<StorageVaultAccessor>> accessor_map_;
+    // Path formats of the vaults in `accessor_map_` whose layout is not version 0.
+    std::unordered_map<std::string, VaultPathFormat> vault_path_formats_;
     std::shared_ptr<SnapshotManager> snapshot_manager_;
     std::shared_ptr<ResourceManager> resource_mgr_;
 };

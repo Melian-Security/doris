@@ -29,7 +29,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -10749,6 +10751,153 @@ TEST(MetaServiceTest, CreateS3VaultWithIamRole) {
     LOG(INFO) << "instance:" << instance.ShortDebugString();
     SyncPoint::get_instance()->disable_processing();
     SyncPoint::get_instance()->clear_all_call_backs();
+}
+
+TEST(MetaServiceTest, S3VaultPathFormat) {
+    auto sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->set_call_back("encrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* ret = try_any_cast<int*>(args[0]);
+        *ret = 0;
+        auto* key = try_any_cast<std::string*>(args[1]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* key_id = try_any_cast<int64_t*>(args[2]);
+        *key_id = 1;
+    });
+    sp->set_call_back("decrypt_ak_sk:get_encryption_key", [](auto&& args) {
+        auto* key = try_any_cast<std::string*>(args[0]);
+        *key = "selectdbselectdbselectdbselectdb";
+        auto* ret = try_any_cast<int*>(args[1]);
+        *ret = 0;
+    });
+    DORIS_CLOUD_DEFER {
+        SyncPoint::get_instance()->disable_processing();
+        SyncPoint::get_instance()->clear_all_call_backs();
+    };
+
+    auto meta_service = get_meta_service();
+
+    // A vault-mode instance without vaults; ak/sk of the vaults added below are encrypted.
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string key;
+        instance_key({"test_instance"}, &key);
+        InstanceInfoPB instance;
+        instance.set_instance_id("S3VaultPathFormatInstance");
+        instance.set_enable_storage_vault(true);
+        txn->put(key, instance.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    auto add_s3_vault = [&](const std::string& name, std::optional<std::pair<int64_t, int64_t>>
+                                                             path_format) {
+        AlterObjStoreInfoRequest req;
+        req.set_cloud_unique_id("test_cloud_unique_id");
+        req.set_op(AlterObjStoreInfoRequest::ADD_S3_VAULT);
+        StorageVaultPB vault;
+        vault.mutable_obj_info()->set_endpoint("s3.us-east-1.amazonaws.com");
+        vault.mutable_obj_info()->set_region("us-east-1");
+        vault.mutable_obj_info()->set_bucket("bucket_" + name);
+        vault.mutable_obj_info()->set_prefix("prefix_" + name);
+        vault.mutable_obj_info()->set_ak("ak");
+        vault.mutable_obj_info()->set_sk("sk");
+        vault.mutable_obj_info()->set_provider(ObjectStoreInfoPB::S3);
+        vault.set_name(name);
+        if (path_format.has_value()) {
+            vault.mutable_path_format()->set_path_version(path_format->first);
+            vault.mutable_path_format()->set_shard_num(path_format->second);
+        }
+        req.mutable_vault()->CopyFrom(vault);
+        brpc::Controller cntl;
+        AlterObjStoreInfoResponse res;
+        meta_service->alter_storage_vault(
+                reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res, nullptr);
+        return res;
+    };
+
+    auto get_vaults = [&]() {
+        brpc::Controller cntl;
+        GetObjStoreInfoRequest req;
+        req.set_cloud_unique_id("test_cloud_unique_id");
+        GetObjStoreInfoResponse res;
+        meta_service->get_obj_store_info(
+                reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res, nullptr);
+        EXPECT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+        std::map<std::string, StorageVaultPB> vaults;
+        for (const auto& vault : res.storage_vault()) {
+            vaults[vault.name()] = vault;
+        }
+        return vaults;
+    };
+
+    // Version 1 is gated until the whole cluster supports it.
+    const bool old_enable_v1 = config::enable_storage_vault_path_version_1;
+    DORIS_CLOUD_DEFER {
+        config::enable_storage_vault_path_version_1 = old_enable_v1;
+    };
+    config::enable_storage_vault_path_version_1 = false;
+    auto res = add_s3_vault("gated_vault", std::make_pair(1, 1024));
+    ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    config::enable_storage_vault_path_version_1 = true;
+
+    // Version 1 is persisted and returned to BE / FE.
+    res = add_s3_vault("sharded_vault", std::make_pair(1, 1024));
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+    const std::string sharded_id = res.storage_vault_id();
+    // Version 0 (what the FE sends by default) and no path format both store no path format.
+    res = add_s3_vault("plain_vault", std::make_pair(0, 0));
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+    res = add_s3_vault("legacy_request_vault", std::nullopt);
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+    // Upper bound.
+    res = add_s3_vault("max_shard_vault", std::make_pair(1, 65536));
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+
+    // Layouts that BE / recycler cannot address are rejected.
+    for (auto [version, shard_num] : std::vector<std::pair<int64_t, int64_t>> {
+                 {1, 0}, {1, -1}, {1, 65537}, {2, 16}, {-1, 0}}) {
+        res = add_s3_vault(fmt::format("bad_vault_{}_{}", version, shard_num),
+                           std::make_pair(version, shard_num));
+        ASSERT_EQ(res.status().code(), MetaServiceCode::INVALID_ARGUMENT)
+                << version << " " << shard_num;
+    }
+
+    auto vaults = get_vaults();
+    ASSERT_EQ(vaults.size(), 4);
+    ASSERT_TRUE(vaults.contains("sharded_vault"));
+    const auto& sharded = vaults["sharded_vault"];
+    EXPECT_EQ(sharded.id(), sharded_id);
+    EXPECT_EQ(sharded.obj_info().id(), sharded_id);
+    ASSERT_TRUE(sharded.has_path_format());
+    EXPECT_EQ(sharded.path_format().path_version(), 1);
+    EXPECT_EQ(sharded.path_format().shard_num(), 1024);
+    EXPECT_EQ(sharded.obj_info().bucket(), "bucket_sharded_vault");
+    EXPECT_EQ(vaults["max_shard_vault"].path_format().shard_num(), 65536);
+    EXPECT_FALSE(vaults["plain_vault"].has_path_format());
+    EXPECT_FALSE(vaults["legacy_request_vault"].has_path_format());
+
+    // Altering a vault keeps its path format.
+    {
+        AlterObjStoreInfoRequest req;
+        req.set_cloud_unique_id("test_cloud_unique_id");
+        req.set_op(AlterObjStoreInfoRequest::ALTER_S3_VAULT);
+        req.mutable_vault()->set_name("sharded_vault");
+        req.mutable_vault()->set_alter_name("sharded_vault_renamed");
+        req.mutable_vault()->mutable_obj_info()->set_ak("new_ak");
+        req.mutable_vault()->mutable_obj_info()->set_sk("new_sk");
+        brpc::Controller cntl;
+        AlterObjStoreInfoResponse res;
+        meta_service->alter_storage_vault(
+                reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().msg();
+    }
+    vaults = get_vaults();
+    ASSERT_TRUE(vaults.contains("sharded_vault_renamed"));
+    const auto& renamed = vaults["sharded_vault_renamed"];
+    EXPECT_EQ(renamed.id(), sharded_id);
+    EXPECT_EQ(renamed.path_format().path_version(), 1);
+    EXPECT_EQ(renamed.path_format().shard_num(), 1024);
 }
 
 TEST(MetaServiceTest, AddObjInfoWithRole) {

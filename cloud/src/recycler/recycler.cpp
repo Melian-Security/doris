@@ -698,6 +698,16 @@ int InstanceRecycler::init_storage_vault_accessors() {
                 continue;
             }
         }
+        if (!is_supported_path_format(vault.path_format())) {
+            LOG(WARNING) << "skip storage vault with unsupported path format, instance_id="
+                         << instance_id_ << " resource_id=" << vault.id()
+                         << " name=" << vault.name()
+                         << " path_format=" << vault.path_format().ShortDebugString();
+            continue;
+        }
+        if (vault.path_format().path_version() != 0) {
+            vault_path_formats_[vault.id()] = vault.path_format();
+        }
         TEST_SYNC_POINT_CALLBACK("InstanceRecycler::init_storage_vault_accessors.mock_vault",
                                  &accessor_map_, &vault);
         if (vault.has_hdfs_info()) {
@@ -755,6 +765,12 @@ int InstanceRecycler::init_storage_vault_accessors() {
              instance_id_);
 
     return 0;
+}
+
+const VaultPathFormat& InstanceRecycler::vault_path_format(const std::string& resource_id) const {
+    static const VaultPathFormat path_v0;
+    auto it = vault_path_formats_.find(resource_id);
+    return it == vault_path_formats_.end() ? path_v0 : it->second;
 }
 
 int InstanceRecycler::init() {
@@ -3621,20 +3637,23 @@ int InstanceRecycler::delete_rowset_data(const RowsetMetaCloudPB& rs_meta_pb) {
 
     int64_t tablet_id = rs_meta_pb.tablet_id();
     const auto& rowset_id = rs_meta_pb.rowset_id_v2();
+    const auto& path_format = vault_path_format(rs_meta_pb.resource_id());
     for (int64_t i = 0; i < num_segments; ++i) {
-        add_file_to_delete_if_not_packed(rs_meta_pb, segment_path(tablet_id, rowset_id, i),
+        add_file_to_delete_if_not_packed(rs_meta_pb,
+                                         segment_path(path_format, tablet_id, rowset_id, i),
                                          &file_paths);
         if (index_format == InvertedIndexStorageFormatPB::V1) {
             for (const auto& index_id : index_ids) {
                 add_file_to_delete_if_not_packed(
                         rs_meta_pb,
-                        inverted_index_path_v1(tablet_id, rowset_id, i, index_id.first,
-                                               index_id.second),
+                        inverted_index_path_v1(path_format, tablet_id, rowset_id, i,
+                                               index_id.first, index_id.second),
                         &file_paths);
             }
         } else if (!index_ids.empty()) {
             add_file_to_delete_if_not_packed(
-                    rs_meta_pb, inverted_index_path_v2(tablet_id, rowset_id, i), &file_paths);
+                    rs_meta_pb, inverted_index_path_v2(path_format, tablet_id, rowset_id, i),
+                    &file_paths);
         }
     }
 
@@ -3649,7 +3668,7 @@ int InstanceRecycler::delete_rowset_data(const RowsetMetaCloudPB& rs_meta_pb) {
         return -1;
     }
     if (delete_bitmap_storage_type == DeleteBitmapStorageType::STANDALONE_FILE) {
-        file_paths.push_back(delete_bitmap_path(tablet_id, rowset_id));
+        file_paths.push_back(delete_bitmap_path(path_format, tablet_id, rowset_id));
     }
     // TODO(AlexYue): seems could do do batch
     return accessor->delete_files(file_paths);
@@ -4287,6 +4306,7 @@ int InstanceRecycler::delete_rowset_data(
         auto& file_paths = resource_file_paths[rs.resource_id()];
         const auto& rowset_id = rs.rowset_id_v2();
         int64_t tablet_id = rs.tablet_id();
+        const auto& path_format = vault_path_format(rs.resource_id());
         LOG_INFO("recycle rowset merge index size")
                 .tag("instance_id", instance_id_)
                 .tag("tablet_id", tablet_id)
@@ -4309,7 +4329,7 @@ int InstanceRecycler::delete_rowset_data(
             continue;
         }
         if (delete_bitmap_storage_type == DeleteBitmapStorageType::STANDALONE_FILE) {
-            file_paths.push_back(delete_bitmap_path(tablet_id, rowset_id));
+            file_paths.push_back(delete_bitmap_path(path_format, tablet_id, rowset_id));
         }
 
         // Process inverted indexes
@@ -4377,14 +4397,14 @@ int InstanceRecycler::delete_rowset_data(
             continue;
         }
         for (int64_t i = 0; i < num_segments; ++i) {
-            add_file_to_delete_if_not_packed(rs, segment_path(tablet_id, rowset_id, i),
+            add_file_to_delete_if_not_packed(rs, segment_path(path_format, tablet_id, rowset_id, i),
                                              &file_paths);
             if (index_format == InvertedIndexStorageFormatPB::V1) {
                 for (const auto& index_id : index_ids) {
                     add_file_to_delete_if_not_packed(
                             rs,
-                            inverted_index_path_v1(tablet_id, rowset_id, i, index_id.first,
-                                                   index_id.second),
+                            inverted_index_path_v1(path_format, tablet_id, rowset_id, i,
+                                                   index_id.first, index_id.second),
                             &file_paths);
                 }
             } else if (!index_ids.empty() || inverted_index_get_ret == 1) {
@@ -4395,10 +4415,11 @@ int InstanceRecycler::delete_rowset_data(
                     LOG_INFO("delete rowset data schema kv not found, try to delete index file")
                             .tag("instance_id", instance_id_)
                             .tag("inverted index v2 path",
-                                 inverted_index_path_v2(tablet_id, rowset_id, i));
+                                 inverted_index_path_v2(path_format, tablet_id, rowset_id, i));
                 }
                 add_file_to_delete_if_not_packed(
-                        rs, inverted_index_path_v2(tablet_id, rowset_id, i), &file_paths);
+                        rs, inverted_index_path_v2(path_format, tablet_id, rowset_id, i),
+                        &file_paths);
             }
         }
     }
@@ -4433,7 +4454,11 @@ int InstanceRecycler::delete_rowset_data(
                                   std::vector<std::string> str;
                                   butil::SplitString(path, '/', &str);
                                   std::string rowset_id;
-                                  if (auto pos = str.back().find('_'); pos != std::string::npos) {
+                                  if (str.size() >= 2 && rowsets.contains(str[str.size() - 2])) {
+                                      // path version 1: .../<rowset_id>/<file>
+                                      rowset_id = str[str.size() - 2];
+                                  } else if (auto pos = str.back().find('_');
+                                             pos != std::string::npos) {
                                       rowset_id = str.back().substr(0, pos);
                                   } else {
                                       if (path.find("packed_file/") != std::string::npos) {
@@ -4501,7 +4526,8 @@ int InstanceRecycler::delete_rowset_data(const std::string& resource_id, int64_t
         return -1;
     }
     auto& accessor = it->second;
-    return accessor->delete_prefix(rowset_path_prefix(tablet_id, rowset_id));
+    return accessor->delete_prefix(
+            rowset_path_prefix(vault_path_format(resource_id), tablet_id, rowset_id));
 }
 
 bool InstanceRecycler::is_tablet_recycled(int64_t tablet_id) {
@@ -5023,7 +5049,8 @@ int InstanceRecycler::recycle_tablet(int64_t tablet_id, RecyclerMetricsContext& 
         concurrent_delete_executor.add(
                 [&, rs_id = resource_id,
                  accessor_ptr = accessor_map_[resource_id]]() -> decltype(auto) {
-                    int res = accessor_ptr->delete_directory(tablet_path_prefix(tablet_id));
+                    int res = accessor_ptr->delete_directory(
+                            tablet_path_prefix(vault_path_format(rs_id), tablet_id));
                     if (res != 0) {
                         LOG(WARNING) << "failed to delete rowset data of tablet " << tablet_id
                                      << " path=" << accessor_ptr->uri()
