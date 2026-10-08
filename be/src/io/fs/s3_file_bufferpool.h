@@ -193,6 +193,10 @@ struct UploadFileBuffer final : public FileBuffer {
         _upload_to_remote = std::move(cb);
     }
 
+    // CRC32C of the appended bytes; on_upload() verifies it against the buffer before
+    // the upload callback runs, so the callback may send it as the body checksum.
+    uint32_t crc32c() const { return _crc_value; }
+
 private:
     std::function<void(UploadFileBuffer&)> _upload_to_remote = nullptr;
     std::shared_ptr<std::iostream> _stream_ptr; // point to _buffer.get_data()

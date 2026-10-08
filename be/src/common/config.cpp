@@ -1624,6 +1624,10 @@ DEFINE_mInt32(max_s3_client_retry, "10");
 DEFINE_mInt32(s3_read_base_wait_time_ms, "100");
 DEFINE_mInt32(s3_read_max_wait_time_ms, "800");
 DEFINE_mBool(enable_s3_object_check_after_upload, "true");
+DEFINE_mString(s3_upload_content_md5, "md5");
+DEFINE_Validator(s3_upload_content_md5, [](const std::string& config) -> bool {
+    return config == "md5" || config == "crc32c" || config == "none";
+});
 DEFINE_mInt32(aws_client_request_timeout_ms, "30000");
 
 DEFINE_mBool(enable_s3_rate_limiter, "false");

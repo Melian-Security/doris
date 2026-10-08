@@ -60,10 +60,13 @@
 #include <aws/s3/model/PutObjectResult.h>
 #include <aws/s3/model/UploadPartRequest.h>
 #include <aws/s3/model/UploadPartResult.h>
+#include <crc32c/crc32c.h>
 
 #include <algorithm>
+#include <mutex>
 #include <ranges>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
 #include "cpp/obj_retry_strategy.h"
@@ -96,11 +99,79 @@ using namespace Aws::S3::Model;
 
 static constexpr int S3_REQUEST_THRESHOLD_MS = 5000;
 
+ObjectUploadChecksum s3_upload_checksum_from_config() {
+    std::string mode;
+    {
+        std::lock_guard<std::mutex> lock(*config::get_mutable_string_config_lock());
+        mode = config::s3_upload_content_md5;
+    }
+    if (mode == "crc32c") {
+        return ObjectUploadChecksum::CRC32C;
+    }
+    if (mode == "none") {
+        return ObjectUploadChecksum::NONE;
+    }
+    return ObjectUploadChecksum::MD5;
+}
+
+std::string s3_crc32c_base64(uint32_t crc) {
+    Aws::Utils::ByteBuffer bytes(4);
+    bytes[0] = static_cast<unsigned char>(crc >> 24);
+    bytes[1] = static_cast<unsigned char>(crc >> 16);
+    bytes[2] = static_cast<unsigned char>(crc >> 8);
+    bytes[3] = static_cast<unsigned char>(crc);
+    return Aws::Utils::HashingUtils::Base64Encode(bytes);
+}
+
+namespace {
+// With no ChecksumAlgorithm set, PutObject/UploadPart report "md5" from
+// GetChecksumAlgorithmName() and AWSClient::AddChecksumToRequest hashes the whole body
+// again, on top of any Content-MD5 already set. An empty name skips that pass; the
+// checksum header is set by apply_body_checksum instead.
+class PutObjectRequestNoSdkChecksum final : public PutObjectRequest {
+public:
+    Aws::String GetChecksumAlgorithmName() const override { return {}; }
+};
+
+class UploadPartRequestNoSdkChecksum final : public UploadPartRequest {
+public:
+    Aws::String GetChecksumAlgorithmName() const override { return {}; }
+};
+
+// Returns the base64 CRC32C it attached, if any.
+template <typename Request>
+std::optional<std::string> apply_body_checksum(Request& request,
+                                               const ObjectStoragePathOptions& opts,
+                                               std::string_view body) {
+    switch (opts.upload_checksum) {
+    case ObjectUploadChecksum::MD5: {
+        StringViewStream stream(body.data(), body.size());
+        Aws::Utils::ByteBuffer md5(Aws::Utils::HashingUtils::CalculateMD5(stream));
+        request.SetContentMD5(Aws::Utils::HashingUtils::Base64Encode(md5));
+        return std::nullopt;
+    }
+    case ObjectUploadChecksum::CRC32C: {
+        uint32_t crc = opts.body_crc32c.has_value() ? *opts.body_crc32c
+                                                    : crc32c::Crc32c(body.data(), body.size());
+        auto encoded = s3_crc32c_base64(crc);
+        request.SetChecksumCRC32C(encoded);
+        return encoded;
+    }
+    case ObjectUploadChecksum::NONE:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+} // namespace
+
 ObjectStorageUploadResponse S3ObjStorageClient::create_multipart_upload(
         const ObjectStoragePathOptions& opts) {
     CreateMultipartUploadRequest request;
     request.WithBucket(opts.bucket).WithKey(opts.key);
     request.SetContentType("application/octet-stream");
+    if (opts.upload_checksum == ObjectUploadChecksum::CRC32C) {
+        request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32C);
+    }
 
     MonotonicStopWatch watch;
     watch.start();
@@ -136,11 +207,10 @@ ObjectStorageUploadResponse S3ObjStorageClient::create_multipart_upload(
 
 ObjectStorageResponse S3ObjStorageClient::put_object(const ObjectStoragePathOptions& opts,
                                                      std::string_view stream) {
-    Aws::S3::Model::PutObjectRequest request;
+    PutObjectRequestNoSdkChecksum request;
     request.WithBucket(opts.bucket).WithKey(opts.key);
     auto string_view_stream = std::make_shared<StringViewStream>(stream.data(), stream.size());
-    Aws::Utils::ByteBuffer part_md5(Aws::Utils::HashingUtils::CalculateMD5(*string_view_stream));
-    request.SetContentMD5(Aws::Utils::HashingUtils::Base64Encode(part_md5));
+    apply_body_checksum(request, opts, stream);
     request.SetBody(string_view_stream);
     request.SetContentLength(stream.size());
     request.SetContentType("application/octet-stream");
@@ -149,7 +219,7 @@ ObjectStorageResponse S3ObjStorageClient::put_object(const ObjectStoragePathOpti
     watch.start();
     auto outcome =
             SYNC_POINT_HOOK_RETURN_VALUE(_client->PutObject(request), "s3_file_writer::put_object",
-                                         std::cref(request).get(), &stream);
+                                         static_cast<const PutObjectRequest&>(request), &stream);
 
     watch.stop();
 
@@ -175,7 +245,7 @@ ObjectStorageResponse S3ObjStorageClient::put_object(const ObjectStoragePathOpti
 
 ObjectStorageUploadResponse S3ObjStorageClient::upload_part(const ObjectStoragePathOptions& opts,
                                                             std::string_view stream, int part_num) {
-    UploadPartRequest request;
+    UploadPartRequestNoSdkChecksum request;
     request.WithBucket(opts.bucket)
             .WithKey(opts.key)
             .WithPartNumber(part_num)
@@ -183,18 +253,16 @@ ObjectStorageUploadResponse S3ObjStorageClient::upload_part(const ObjectStorageP
     auto string_view_stream = std::make_shared<StringViewStream>(stream.data(), stream.size());
 
     request.SetBody(string_view_stream);
-
-    Aws::Utils::ByteBuffer part_md5(Aws::Utils::HashingUtils::CalculateMD5(*string_view_stream));
-    request.SetContentMD5(Aws::Utils::HashingUtils::Base64Encode(part_md5));
+    auto checksum_crc32c = apply_body_checksum(request, opts, stream);
 
     request.SetContentLength(stream.size());
     request.SetContentType("application/octet-stream");
 
     MonotonicStopWatch watch;
     watch.start();
-    auto outcome = SYNC_POINT_HOOK_RETURN_VALUE(_client->UploadPart(request),
-                                                "s3_file_writer::upload_part",
-                                                std::cref(request).get(), &stream);
+    auto outcome = SYNC_POINT_HOOK_RETURN_VALUE(
+            _client->UploadPart(request), "s3_file_writer::upload_part",
+            static_cast<const UploadPartRequest&>(request), &stream);
 
     watch.stop();
 
@@ -223,7 +291,8 @@ ObjectStorageUploadResponse S3ObjStorageClient::upload_part(const ObjectStorageP
             << "UploadPart cost=" << watch.elapsed_time_milliseconds() << "ms"
             << ", request_id=" << request_id << ", bucket=" << opts.bucket << ", key=" << opts.key
             << ", part_num=" << part_num << ", upload_id=" << *opts.upload_id;
-    return ObjectStorageUploadResponse {.etag = outcome.GetResult().GetETag()};
+    return ObjectStorageUploadResponse {.etag = outcome.GetResult().GetETag(),
+                                        .checksum_crc32c = std::move(checksum_crc32c)};
 }
 
 ObjectStorageResponse S3ObjStorageClient::complete_multipart_upload(
@@ -234,11 +303,16 @@ ObjectStorageResponse S3ObjStorageClient::complete_multipart_upload(
 
     CompletedMultipartUpload completed_upload;
     std::vector<CompletedPart> complete_parts;
+    // An upload created with a checksum algorithm needs every part's checksum here.
+    const bool with_crc32c = opts.upload_checksum == ObjectUploadChecksum::CRC32C;
     std::ranges::transform(completed_parts, std::back_inserter(complete_parts),
-                           [](const ObjectCompleteMultiPart& part_ptr) {
+                           [with_crc32c](const ObjectCompleteMultiPart& part_ptr) {
                                CompletedPart part;
                                part.SetPartNumber(part_ptr.part_num);
                                part.SetETag(part_ptr.etag);
+                               if (with_crc32c) {
+                                   part.SetChecksumCRC32C(part_ptr.checksum_crc32c);
+                               }
                                return part;
                            });
     completed_upload.SetParts(std::move(complete_parts));

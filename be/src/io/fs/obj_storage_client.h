@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 
 #include "io/fs/file_system.h"
@@ -39,17 +40,33 @@ enum class ObjStorageType : uint8_t {
     TOS,
 };
 
+// Integrity checksum attached to each S3 PutObject/UploadPart body. S3 rejects a body whose
+// checksum does not match; NONE leaves integrity to TLS and the in-process buffer crc32c.
+enum class ObjectUploadChecksum : uint8_t {
+    MD5 = 0, // Content-MD5
+    CRC32C,  // x-amz-checksum-crc32c; multipart uploads are created with that algorithm
+    NONE,
+};
+
 struct ObjectStoragePathOptions {
     Path path = "";
     std::string bucket = std::string();                  // blob container in azure
     std::string key = std::string();                     // blob name in azure
     std::string prefix = std::string();                  // for batch delete and recursive delete
     std::optional<std::string> upload_id = std::nullopt; // only used for S3 upload
+    // S3 uploads only. One writer must use one mode for every request of an upload: a multipart
+    // upload created with CRC32C needs a CRC32C value on every part and in the complete request.
+    ObjectUploadChecksum upload_checksum = ObjectUploadChecksum::MD5;
+    // CRC32C of the body passed to put_object/upload_part, when the caller already has it.
+    // Used only in CRC32C mode; absent means the client computes it.
+    std::optional<uint32_t> body_crc32c = std::nullopt;
 };
 
 struct ObjectCompleteMultiPart {
     int part_num = 0;
     std::string etag = std::string();
+    // Base64 CRC32C sent with the part; set only for CRC32C uploads.
+    std::string checksum_crc32c = std::string();
 };
 
 struct ObjectStorageStatus {
@@ -76,6 +93,8 @@ struct ObjectStorageUploadResponse {
     ObjectStorageResponse resp {};
     std::optional<std::string> upload_id = std::nullopt;
     std::optional<std::string> etag = std::nullopt;
+    // Base64 CRC32C sent with an uploaded part; set only for CRC32C uploads.
+    std::optional<std::string> checksum_crc32c = std::nullopt;
 };
 
 struct ObjectStorageHeadResponse : ObjectStorageResponse {

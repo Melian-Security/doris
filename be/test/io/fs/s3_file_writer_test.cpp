@@ -53,6 +53,7 @@
 #include "io/fs/file_system.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "io/fs/s3_common.h"
 #include "io/fs/s3_file_bufferpool.h"
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_obj_storage_client.h"
@@ -84,6 +85,12 @@ public:
         upload_id = ss.str();
         bucket = request.GetBucket();
         key = request.GetKey();
+        {
+            std::unique_lock lck {latch};
+            upload_checksum_algorithm = request.GetChecksumAlgorithm();
+            part_checksums.clear();
+            part_had_md5.clear();
+        }
         auto result = Aws::S3::Model::CreateMultipartUploadResult();
         result.SetUploadId(upload_id);
         auto outcome = Aws::S3::Model::CreateMultipartUploadOutcome(std::move(result));
@@ -121,6 +128,24 @@ public:
                         false));
             }
         }
+        // Like S3: a part of an upload created with CRC32C must carry a matching CRC32C.
+        if (upload_checksum_algorithm == Aws::S3::Model::ChecksumAlgorithm::CRC32C &&
+            !request.ChecksumCRC32CHasBeenSet()) {
+            return Aws::S3::Model::UploadPartOutcome(Aws::Client::AWSError<Aws::S3::S3Errors>(
+                    Aws::S3::S3Errors::INVALID_PARAMETER_VALUE, "missing crc32c", "missing crc32c",
+                    false));
+        }
+        if (request.ChecksumCRC32CHasBeenSet() && request.GetChecksumCRC32C() != sdk_crc32c(buf)) {
+            return Aws::S3::Model::UploadPartOutcome(Aws::Client::AWSError<Aws::S3::S3Errors>(
+                    Aws::S3::S3Errors::INVALID_OBJECT_STATE, "wrong crc32c", "crc32c not match",
+                    false));
+        }
+        {
+            std::unique_lock lck {latch};
+            part_had_md5[request.GetPartNumber()] = request.ContentMD5HasBeenSet();
+            part_checksums[request.GetPartNumber()] =
+                    request.ChecksumCRC32CHasBeenSet() ? request.GetChecksumCRC32C() : "";
+        }
         {
             Slice slice {buf.data(), buf.size()};
             std::string str;
@@ -156,6 +181,18 @@ public:
                                 Aws::S3::S3Errors::INVALID_OBJECT_STATE, "part num not coutinous",
                                 "part num not coutinous", false));
             }
+            const auto& part = multi_part_upload.GetParts().at(i);
+            std::string expected;
+            {
+                std::unique_lock lck {latch};
+                expected = part_checksums[part.GetPartNumber()];
+            }
+            if (part.GetChecksumCRC32C() != expected) {
+                return Aws::S3::Model::CompleteMultipartUploadOutcome(
+                        Aws::Client::AWSError<Aws::S3::S3Errors>(
+                                Aws::S3::S3Errors::INVALID_PARAMETER_VALUE, "crc32c mismatch",
+                                "part crc32c not match", false));
+            }
         }
         exists = true;
         return Aws::S3::Model::CompleteMultipartUploadOutcome(
@@ -167,6 +204,22 @@ public:
         exists = true;
         file_size = request.GetContentLength();
         key = request.GetKey();
+        put_had_md5 = request.ContentMD5HasBeenSet();
+        put_checksum = request.ChecksumCRC32CHasBeenSet() ? request.GetChecksumCRC32C() : "";
+        if (put_had_md5) {
+            StringViewStream body(buf.data(), buf.size());
+            if (request.GetContentMD5() != Aws::Utils::HashingUtils::Base64Encode(
+                                                   Aws::Utils::HashingUtils::CalculateMD5(body))) {
+                return Aws::S3::Model::PutObjectOutcome(Aws::Client::AWSError<Aws::S3::S3Errors>(
+                        Aws::S3::S3Errors::INVALID_OBJECT_STATE, "wrong md5", "md5 not match",
+                        false));
+            }
+        }
+        if (!put_checksum.empty() && put_checksum != sdk_crc32c(buf)) {
+            return Aws::S3::Model::PutObjectOutcome(Aws::Client::AWSError<Aws::S3::S3Errors>(
+                    Aws::S3::S3Errors::INVALID_OBJECT_STATE, "wrong crc32c", "crc32c not match",
+                    false));
+        }
         bucket = request.GetBucket();
         Slice s {buf.data(), buf.size()};
         std::string str;
@@ -190,6 +243,20 @@ public:
     }
 
     [[nodiscard]] const std::map<int64_t, std::string>& contents() const { return uploaded_parts; }
+
+    // The SDK's own CRC32C encoding, independent of the code under test.
+    static std::string sdk_crc32c(std::string_view buf) {
+        StringViewStream body(buf.data(), buf.size());
+        return Aws::Utils::HashingUtils::Base64Encode(
+                Aws::Utils::HashingUtils::CalculateCRC32C(body));
+    }
+
+    Aws::S3::Model::ChecksumAlgorithm upload_checksum_algorithm {
+            Aws::S3::Model::ChecksumAlgorithm::NOT_SET};
+    std::map<int, std::string> part_checksums;
+    std::map<int, bool> part_had_md5;
+    bool put_had_md5 {false};
+    std::string put_checksum;
 
 private:
     std::mutex latch;
@@ -1551,6 +1618,175 @@ TEST_F(S3FileWriterTest, test_empty_file) {
             std::move(file_writer), false);
     EXPECT_TRUE(index_file_writer->begin_close().ok());
     EXPECT_TRUE(index_file_writer->finish_close().ok());
+}
+
+namespace {
+struct UploadChecksumConfigGuard {
+    std::string saved = config::s3_upload_content_md5;
+    ~UploadChecksumConfigGuard() {
+        std::ignore = config::set_config("s3_upload_content_md5", saved, false, true);
+    }
+};
+
+void set_upload_checksum(const std::string& mode) {
+    auto st = config::set_config("s3_upload_content_md5", mode, false, true);
+    ASSERT_TRUE(st.ok()) << st;
+}
+
+// Writes all_types_100000.txt (several write buffers, so a multipart upload) and calls
+// `mid_upload` once half of it has been appended.
+void write_multipart_file(const std::string& name, const std::function<void()>& mid_upload) {
+    io::FileReaderSPtr local_file_reader;
+    auto st = io::global_local_filesystem()->open_file(
+            "./be/test/storage/test_data/all_types_100000.txt", &local_file_reader);
+    ASSERT_TRUE(st.ok()) << st;
+    io::FileWriterOptions opts;
+    io::FileWriterPtr writer;
+    st = s3_fs->create_file(name, &writer, &opts);
+    ASSERT_TRUE(st.ok()) << st;
+
+    constexpr size_t buf_size = 8192;
+    char buf[buf_size];
+    Slice slice(buf, buf_size);
+    size_t offset = 0;
+    size_t bytes_read = 0;
+    const size_t file_size = local_file_reader->size();
+    bool mid_called = false;
+    while (offset < file_size) {
+        st = local_file_reader->read_at(offset, slice, &bytes_read);
+        ASSERT_TRUE(st.ok()) << st;
+        st = writer->append(Slice(buf, bytes_read));
+        ASSERT_TRUE(st.ok()) << st;
+        offset += bytes_read;
+        if (!mid_called && offset >= file_size / 2) {
+            mid_called = true;
+            mid_upload();
+        }
+    }
+    st = writer->close();
+    ASSERT_TRUE(st.ok()) << st;
+}
+
+void write_small_file(const std::string& name) {
+    io::FileWriterOptions opts;
+    io::FileWriterPtr writer;
+    auto st = s3_fs->create_file(name, &writer, &opts);
+    ASSERT_TRUE(st.ok()) << st;
+    st = writer->append(Slice("123456789"));
+    ASSERT_TRUE(st.ok()) << st;
+    st = writer->close();
+    ASSERT_TRUE(st.ok()) << st;
+}
+} // namespace
+
+// A separate suite: write_buffer_boundary clears every sync point callback, and the
+// inherited SetUpTestSuite installs the mock S3 callbacks again.
+class S3FileWriterChecksumTest : public S3FileWriterTest {};
+
+TEST_F(S3FileWriterChecksumTest, crc32c_encoding_matches_sdk) {
+    // CRC-32C check value of "123456789" is 0xE3069283.
+    EXPECT_EQ(io::s3_crc32c_base64(0xE3069283), "4waSgw==");
+    EXPECT_EQ(io::s3_crc32c_base64(0xE3069283), MockS3Client::sdk_crc32c("123456789"));
+}
+
+TEST_F(S3FileWriterChecksumTest, config_parsing) {
+    UploadChecksumConfigGuard guard;
+    set_upload_checksum("md5");
+    EXPECT_EQ(io::s3_upload_checksum_from_config(), io::ObjectUploadChecksum::MD5);
+    set_upload_checksum("crc32c");
+    EXPECT_EQ(io::s3_upload_checksum_from_config(), io::ObjectUploadChecksum::CRC32C);
+    set_upload_checksum("none");
+    EXPECT_EQ(io::s3_upload_checksum_from_config(), io::ObjectUploadChecksum::NONE);
+    EXPECT_FALSE(config::set_config("s3_upload_content_md5", "sha256", false, true).ok());
+    EXPECT_EQ(config::s3_upload_content_md5, "none");
+}
+
+TEST_F(S3FileWriterChecksumTest, md5_multipart) {
+    UploadChecksumConfigGuard guard;
+    set_upload_checksum("md5");
+    mock_client = std::make_shared<MockS3Client>();
+    write_multipart_file("upload_checksum_md5_multipart", [] {});
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::NOT_SET);
+    ASSERT_GE(mock_client->part_had_md5.size(), 2);
+    for (const auto& [part, had_md5] : mock_client->part_had_md5) {
+        EXPECT_TRUE(had_md5) << part;
+        EXPECT_EQ(mock_client->part_checksums[part], "") << part;
+    }
+}
+
+TEST_F(S3FileWriterChecksumTest, crc32c_multipart) {
+    UploadChecksumConfigGuard guard;
+    set_upload_checksum("crc32c");
+    mock_client = std::make_shared<MockS3Client>();
+    // The mock rejects a missing or wrong part crc32c and a complete request whose part
+    // crc32c differs from the uploaded one, so a successful close covers both.
+    write_multipart_file("upload_checksum_crc32c_multipart", [] {});
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::CRC32C);
+    ASSERT_GE(mock_client->part_checksums.size(), 2);
+    for (const auto& [part, crc] : mock_client->part_checksums) {
+        EXPECT_FALSE(crc.empty()) << part;
+        EXPECT_FALSE(mock_client->part_had_md5[part]) << part;
+    }
+}
+
+TEST_F(S3FileWriterChecksumTest, none_multipart) {
+    UploadChecksumConfigGuard guard;
+    set_upload_checksum("none");
+    mock_client = std::make_shared<MockS3Client>();
+    write_multipart_file("upload_checksum_none_multipart", [] {});
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::NOT_SET);
+    ASSERT_GE(mock_client->part_checksums.size(), 2);
+    for (const auto& [part, crc] : mock_client->part_checksums) {
+        EXPECT_EQ(crc, "") << part;
+        EXPECT_FALSE(mock_client->part_had_md5[part]) << part;
+    }
+}
+
+TEST_F(S3FileWriterChecksumTest, put_object_per_mode) {
+    UploadChecksumConfigGuard guard;
+    mock_client = std::make_shared<MockS3Client>();
+
+    set_upload_checksum("md5");
+    write_small_file("upload_checksum_put_md5");
+    EXPECT_TRUE(mock_client->put_had_md5);
+    EXPECT_EQ(mock_client->put_checksum, "");
+
+    set_upload_checksum("crc32c");
+    write_small_file("upload_checksum_put_crc32c");
+    EXPECT_FALSE(mock_client->put_had_md5);
+    EXPECT_EQ(mock_client->put_checksum, "4waSgw==");
+
+    set_upload_checksum("none");
+    write_small_file("upload_checksum_put_none");
+    EXPECT_FALSE(mock_client->put_had_md5);
+    EXPECT_EQ(mock_client->put_checksum, "");
+}
+
+TEST_F(S3FileWriterChecksumTest, mode_change_mid_upload_does_not_mix) {
+    UploadChecksumConfigGuard guard;
+    set_upload_checksum("crc32c");
+    mock_client = std::make_shared<MockS3Client>();
+    write_multipart_file("upload_checksum_mid_upload_crc32c", [] { set_upload_checksum("none"); });
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::CRC32C);
+    ASSERT_GE(mock_client->part_checksums.size(), 2);
+    for (const auto& [part, crc] : mock_client->part_checksums) {
+        EXPECT_FALSE(crc.empty()) << part;
+    }
+
+    // The reverse: a writer opened under "none" keeps sending no checksum.
+    mock_client = std::make_shared<MockS3Client>();
+    write_multipart_file("upload_checksum_mid_upload_none", [] { set_upload_checksum("crc32c"); });
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::NOT_SET);
+    ASSERT_GE(mock_client->part_checksums.size(), 2);
+    for (const auto& [part, crc] : mock_client->part_checksums) {
+        EXPECT_EQ(crc, "") << part;
+        EXPECT_FALSE(mock_client->part_had_md5[part]) << part;
+    }
+
+    // A writer opened after the change uses the new mode.
+    mock_client = std::make_shared<MockS3Client>();
+    write_multipart_file("upload_checksum_after_change", [] {});
+    EXPECT_EQ(mock_client->upload_checksum_algorithm, Aws::S3::Model::ChecksumAlgorithm::CRC32C);
 }
 
 } // namespace doris
