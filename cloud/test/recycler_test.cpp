@@ -3217,7 +3217,8 @@ TEST(RecyclerTest, recycle_path_v1_vault) {
     index->set_index_id(7);
     index->set_index_type(IndexType::INVERTED);
 
-    // Objects of other tablets, and version-0 keys of the recycled tablets, must survive.
+    // Objects of other tablets, and version-0 keys of tablets whose rowsets are recycled, must
+    // survive rowset recycling.
     const std::set<std::string> untouched_v1 = {"data/9/10004/02000000000000000000000000000001/0.dat",
                                                 "data/10003/rowset_0.dat",
                                                 "data/20003/rowset_0.dat"};
@@ -3266,7 +3267,10 @@ TEST(RecyclerTest, recycle_path_v1_vault) {
     }
 
     ASSERT_EQ(0, recycler.recycle_tablets(table_id, drop_index_id, ctx));
-    EXPECT_EQ(list_objects(v1_accessor.get()), untouched_v1);
+    // The stray version-0 object of the dropped tablet is swept too; other tablets' objects stay.
+    EXPECT_EQ(list_objects(v1_accessor.get()),
+              (std::set<std::string> {"data/9/10004/02000000000000000000000000000001/0.dat",
+                                      "data/10003/rowset_0.dat"}));
 }
 
 // Rowsets of aborted loads on a version-1 vault are deleted under their sharded keys.

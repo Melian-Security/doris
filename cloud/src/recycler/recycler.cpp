@@ -5049,8 +5049,15 @@ int InstanceRecycler::recycle_tablet(int64_t tablet_id, RecyclerMetricsContext& 
         concurrent_delete_executor.add(
                 [&, rs_id = resource_id,
                  accessor_ptr = accessor_map_[resource_id]]() -> decltype(auto) {
+                    const auto& path_format = vault_path_format(rs_id);
                     int res = accessor_ptr->delete_directory(
-                            tablet_path_prefix(vault_path_format(rs_id), tablet_id));
+                            tablet_path_prefix(path_format, tablet_id));
+                    if (res == 0 && path_format.path_version() != 0) {
+                        // Only objects of this tablet can live under its version-0 prefix, so
+                        // sweeping it also removes any object written there with the wrong
+                        // layout, which no rowset-level delete would ever reach.
+                        res = accessor_ptr->delete_directory(tablet_path_prefix(tablet_id));
+                    }
                     if (res != 0) {
                         LOG(WARNING) << "failed to delete rowset data of tablet " << tablet_id
                                      << " path=" << accessor_ptr->uri()
