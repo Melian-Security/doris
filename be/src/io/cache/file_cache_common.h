@@ -20,6 +20,8 @@
 
 #pragma once
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/config.h"
@@ -306,5 +308,14 @@ struct FileCacheInfo {
 };
 
 std::optional<int64_t> get_tablet_id(std::string file_path);
+
+// Name under which a remote Doris table file (segment, index, delete bitmap) is cached; the file
+// cache key is its hash. It is the file name, except for a path-version-1 vault path
+// `.../data/<shard>/<tablet_id>/<rowset_id>/<file>.{dat,idx}`: there file names such as `0.dat`
+// repeat in every rowset, so the name is `<rowset_id>_<file>`. That is the version-0 file name of
+// the same file, so names built from a rowset id (`Segment::file_cache_key`,
+// `Rowset::get_index_file_names`) key the same cache entry under both versions, and version-0
+// names are unchanged.
+std::string remote_file_cache_name(std::string_view path);
 
 } // namespace doris::io

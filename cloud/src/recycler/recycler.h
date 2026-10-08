@@ -41,6 +41,7 @@
 #include "recycler/snapshot_chain_compactor.h"
 #include "recycler/snapshot_data_migrator.h"
 #include "recycler/storage_vault_accessor.h"
+#include "recycler/util.h"
 #include "snapshot/snapshot_manager.h"
 
 namespace brpc {
@@ -446,6 +447,13 @@ public:
         accessor_map_.insert({std::string(id), std::move(accessor)});
     }
 
+    void TEST_set_vault_path_format(std::string_view id, const VaultPathFormat& path_format) {
+        vault_path_formats_[std::string(id)] = path_format;
+    }
+
+    // Object key layout of the vault `resource_id`; version 0 unless the vault declares another.
+    const VaultPathFormat& vault_path_format(const std::string& resource_id) const;
+
     // Recycle snapshot meta and data, return 0 for success otherwise error.
     int recycle_snapshot_meta_and_data(const std::string& instance_id,
                                        const std::string& resource_id,
@@ -657,6 +665,8 @@ private:
 
     // TODO(plat1ko): Add new accessor to map in runtime for new created storage vaults
     std::unordered_map<std::string, std::shared_ptr<StorageVaultAccessor>> accessor_map_;
+    // Path formats of the vaults in `accessor_map_` whose layout is not version 0.
+    std::unordered_map<std::string, VaultPathFormat> vault_path_formats_;
     using InvertedIndexInfo =
             std::pair<InvertedIndexStorageFormatPB, std::vector<std::pair<int64_t, std::string>>>;
 

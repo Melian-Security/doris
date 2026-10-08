@@ -825,6 +825,48 @@ static void create_object_info_with_encrypt(const InstanceInfoPB& instance, Obje
     obj->set_sse_enabled(sse_enabled);
 }
 
+// Upper bound of StorageVaultPB.PathFormat.shard_num, kept equal to the FE's bound.
+constexpr int64_t kMaxVaultShardNum = 65536;
+
+namespace detail {
+
+// Version 0 keys a segment as `data/<tablet_id>/<rowset_id>_<seg>.dat`; version 1 as
+// `data/<murmur64(tablet_id) % shard_num>/<tablet_id>/<rowset_id>/<seg>.dat`. BE, recycler and
+// checker reject any other version, and version 1 divides by shard_num, so nothing else may be
+// persisted. Version 0 ignores shard_num (the FE always sends 0 for it).
+bool check_vault_path_format(const StorageVaultPB& vault, MetaServiceCode& code,
+                             std::string& msg) {
+    if (!vault.has_path_format()) {
+        return true;
+    }
+    const auto& path_format = vault.path_format();
+    switch (path_format.path_version()) {
+    case 0:
+        return true;
+    case 1:
+        if (!config::enable_storage_vault_path_version_1) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "path_version=1 is disabled, set enable_storage_vault_path_version_1=true on "
+                  "the meta-service once all BEs, meta-services and recyclers support it";
+            return false;
+        }
+        if (path_format.shard_num() > 0 && path_format.shard_num() <= kMaxVaultShardNum) {
+            return true;
+        }
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        msg = fmt::format("invalid shard_num={} for path_version=1, it must be in [1, {}]",
+                          path_format.shard_num(), kMaxVaultShardNum);
+        return false;
+    default:
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        msg = fmt::format("invalid path_version={}, it must be 0 or 1",
+                          path_format.path_version());
+        return false;
+    }
+}
+
+} // namespace detail
+
 static int add_vault_into_instance(InstanceInfoPB& instance, Transaction* txn,
                                    StorageVaultPB& vault_param, MetaServiceCode& code,
                                    std::string& msg) {
@@ -833,6 +875,10 @@ static int add_vault_into_instance(InstanceInfoPB& instance, Transaction* txn,
         instance.storage_vault_names().end()) {
         code = MetaServiceCode::ALREADY_EXISTED;
         msg = fmt::format("vault_name={} already created", vault_param.name());
+        return -1;
+    }
+
+    if (!detail::check_vault_path_format(vault_param, code, msg)) {
         return -1;
     }
 
@@ -1476,6 +1522,9 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
             msg = "Storage vault doesn't support storage vault";
             return;
         }
+        if (!detail::check_vault_path_format(request->vault(), code, msg)) {
+            return;
+        }
         auto& obj = request->has_obj() ? request->obj() : request->vault().obj_info();
         if (!obj.has_provider()) {
             code = MetaServiceCode::INVALID_ARGUMENT;
@@ -1538,6 +1587,11 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
         *instance.mutable_resource_ids()->Add() = vault.id();
         *instance.mutable_storage_vault_names()->Add() = vault.name();
         vault.mutable_obj_info()->MergeFrom(last_item);
+        // A version-0 path format stays unset so such vaults serialize exactly as before.
+        if (request->vault().has_path_format() &&
+            request->vault().path_format().path_version() != 0) {
+            vault.mutable_path_format()->CopyFrom(request->vault().path_format());
+        }
         auto vault_key = storage_vault_key({instance.instance_id(), last_item.id()});
         txn->put(vault_key, vault.SerializeAsString());
         if (request->has_set_as_default_storage_vault() &&

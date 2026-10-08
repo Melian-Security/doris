@@ -521,6 +521,16 @@ int InstanceChecker::init_storage_vault_accessors(const InstanceInfoPB& instance
             LOG(WARNING) << "malformed storage vault, unable to deserialize key=" << hex(k);
             return -1;
         }
+        if (!is_supported_path_format(vault.path_format())) {
+            LOG(WARNING) << "skip storage vault with unsupported path format, instance_id="
+                         << instance_id_ << " resource_id=" << vault.id()
+                         << " name=" << vault.name()
+                         << " path_format=" << vault.path_format().ShortDebugString();
+            continue;
+        }
+        if (vault.path_format().path_version() != 0) {
+            vault_path_formats_[vault.id()] = vault.path_format();
+        }
         TEST_SYNC_POINT_CALLBACK("InstanceRecycler::init_storage_vault_accessors.mock_vault",
                                  &accessor_map_, &vault);
         if (vault.has_hdfs_info()) {
@@ -566,6 +576,12 @@ int InstanceChecker::init_storage_vault_accessors(const InstanceInfoPB& instance
         return -1;
     }
     return 0;
+}
+
+const VaultPathFormat& InstanceChecker::vault_path_format(const std::string& resource_id) const {
+    static const VaultPathFormat path_v0;
+    auto it = vault_path_formats_.find(resource_id);
+    return it == vault_path_formats_.end() ? path_v0 : it->second;
 }
 
 int InstanceChecker::do_check() {
@@ -618,6 +634,7 @@ int InstanceChecker::do_check() {
         };
 
         ++num_scanned_with_segment;
+        const auto& path_format = vault_path_format(rs_meta.resource_id());
         if (tablet_files_cache.tablet_id != rs_meta.tablet_id()) {
             long tablet_volume = 0;
             // Clear cache
@@ -635,8 +652,8 @@ int InstanceChecker::do_check() {
             }
 
             std::unique_ptr<ListIterator> list_iter;
-            int ret = find_it->second->list_directory(tablet_path_prefix(rs_meta.tablet_id()),
-                                                      &list_iter);
+            int ret = find_it->second->list_directory(
+                    tablet_path_prefix(path_format, rs_meta.tablet_id()), &list_iter);
             if (ret != 0) { // No need to log, because S3Accessor has logged this error
                 check_ret = -1;
                 return;
@@ -651,7 +668,7 @@ int InstanceChecker::do_check() {
         }
 
         for (int i = 0; i < rs_meta.num_segments(); ++i) {
-            auto path = segment_path(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i);
+            auto path = segment_path(path_format, rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i);
 
             // Skip check if segment is already packed into a larger file
             const auto& index_map = rs_meta.packed_slice_locations();
@@ -723,13 +740,13 @@ int InstanceChecker::do_check() {
                                   << " rowset_id=" << rs_meta.rowset_id_v2() << " segment_id=" << i
                                   << " index_id=" << index_id.first
                                   << " index_suffix_name=" << index_id.second;
-                        index_path_v.emplace_back(
-                                inverted_index_path_v1(rs_meta.tablet_id(), rs_meta.rowset_id_v2(),
-                                                       i, index_id.first, index_id.second));
+                        index_path_v.emplace_back(inverted_index_path_v1(
+                                path_format, rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i,
+                                index_id.first, index_id.second));
                     }
                 } else {
-                    index_path_v.emplace_back(
-                            inverted_index_path_v2(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i));
+                    index_path_v.emplace_back(inverted_index_path_v2(
+                            path_format, rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i));
                 }
 
                 if (std::ranges::all_of(index_path_v, [&](const auto& idx_file_path) {
@@ -984,12 +1001,13 @@ int InstanceChecker::do_inverted_check() {
     // so we choose to skip here.
     TEST_SYNC_POINT_RETURN_WITH_VALUE("InstanceChecker::do_inverted_check", (int)0);
 
-    for (auto& [_, accessor] : accessor_map_) {
+    for (auto& [resource_id, accessor] : accessor_map_) {
         std::unique_ptr<ListIterator> list_iter;
         int ret = accessor->list_directory("data", &list_iter);
         if (ret != 0) {
             return -1;
         }
+        const auto& path_format = vault_path_format(resource_id);
 
         for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
             const auto& path = file->path;
@@ -997,7 +1015,9 @@ int InstanceChecker::do_inverted_check() {
                 continue; // packed_file has dedicated check logic
             }
             ++num_scanned;
-            int ret = check_segment_file(path);
+            // The checks below parse version-0 paths.
+            const std::string path_v0 = to_path_v0_layout(path_format, path);
+            int ret = check_segment_file(path_v0);
             if (ret != 0) {
                 LOG(WARNING) << "failed to check segment file, uri=" << accessor->uri()
                              << " path=" << path;
@@ -1007,7 +1027,7 @@ int InstanceChecker::do_inverted_check() {
                     check_ret = -1;
                 }
             }
-            ret = check_inverted_index_file(path);
+            ret = check_inverted_index_file(path_v0);
             if (ret != 0) {
                 LOG(WARNING) << "failed to check index file, uri=" << accessor->uri()
                              << " path=" << path;

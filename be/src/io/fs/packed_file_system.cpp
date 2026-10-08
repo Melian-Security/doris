@@ -147,7 +147,7 @@ Status PackedFileSystem::open_file_impl(const Path& file, FileReaderSPtr* reader
 
         // If cache is requested, wrap PackedFileReader with CachedRemoteFileReader
         // This ensures:
-        // 1. Cache key = hash(segment_path.filename()) - matches cleanup key
+        // 1. Cache key = hash(remote_file_cache_name(segment_path)) - matches cleanup key
         // 2. Cache size = segment size - correct boundary
         // 3. Each segment has independent cache entry - no interference during cleanup
         if (opts && opts->cache_type != FileCachePolicy::NO_CACHE) {
