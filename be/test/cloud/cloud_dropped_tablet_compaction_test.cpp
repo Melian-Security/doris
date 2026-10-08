@@ -37,6 +37,7 @@
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet/tablet_meta.h"
+#include "util/time.h"
 
 namespace doris {
 
@@ -137,6 +138,49 @@ TEST_F(CloudDroppedTabletCompactionTest, max_score_metric_falls_once_backlog_is_
 
     tablet->mark_dropped();
     _engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true);
+    EXPECT_EQ(gauge->value(), 0);
+}
+
+// A tablet loaded from a dropped partition that compaction skips (here: a recent failure; in
+// production also a frozen or warm-up loaded tablet) never makes a compaction job RPC. The
+// producer probes it, and the gauge publishes 0 once the dropped backlog is gone.
+TEST_F(CloudDroppedTabletCompactionTest, skipped_dropped_tablet_is_probed_and_gauge_reaches_zero) {
+    auto tablet = make_tablet(20008);
+    tablet->_approximate_cumu_num_deltas = 669;
+    tablet->set_last_cumu_compaction_failure_time(UnixMillis());
+    _engine.tablet_mgr().put_tablet_for_UT(tablet);
+    auto* gauge = DorisMetrics::instance()->tablet_cumulative_max_compaction_score;
+
+    int probes = 0;
+    cloud::MetaServiceCode code = cloud::INVALID_ARGUMENT;
+    SyncPoint::get_instance()->set_call_back(
+            "CloudMetaMgr::lease_tablet_job", [&probes, &code](auto&& outcome) {
+                ++probes;
+                auto* pairs = try_any_cast_ret<Status>(outcome);
+                pairs->first = Status::InternalError<false>("probe");
+                pairs->second = true;
+                auto* resp = try_any_cast<cloud::FinishTabletJobResponse*>(outcome[1]);
+                resp->mutable_status()->set_code(code);
+            });
+
+    // Live tablet: the probe answers "no such job", the tablet keeps counting.
+    auto picked =
+            _engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true);
+    EXPECT_TRUE(picked.empty());
+    EXPECT_EQ(probes, 1);
+    EXPECT_FALSE(tablet->is_dropped());
+    EXPECT_EQ(gauge->value(), 669);
+
+    // Rate limited per tablet.
+    _engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true);
+    EXPECT_EQ(probes, 1);
+
+    // Partition truncated: the next probe marks the tablet and the same round publishes 0.
+    code = cloud::TABLET_NOT_FOUND;
+    tablet->last_drop_probe_ms = 0;
+    _engine._generate_cloud_compaction_tasks(CompactionType::CUMULATIVE_COMPACTION, true);
+    EXPECT_EQ(probes, 2);
+    EXPECT_TRUE(tablet->is_dropped());
     EXPECT_EQ(gauge->value(), 0);
 }
 

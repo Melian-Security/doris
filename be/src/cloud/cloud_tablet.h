@@ -374,6 +374,8 @@ public:
     int64_t last_base_compaction_success_time_ms = 0;
     int64_t last_cumu_compaction_success_time_ms = 0;
     int64_t last_cumu_no_suitable_version_ms = 0;
+    // When the compaction producer last asked the meta service whether this tablet was dropped.
+    int64_t last_drop_probe_ms = 0;
     int64_t last_access_time_ms = 0;
 
     std::atomic<int64_t> local_read_time_us = 0;

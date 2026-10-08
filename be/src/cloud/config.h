@@ -86,6 +86,14 @@ DECLARE_mDouble(empty_rowset_compaction_min_ratio);
 DECLARE_mInt64(base_compaction_freeze_interval_s);
 DECLARE_mInt64(compaction_load_max_freeze_interval_s);
 DECLARE_mInt64(cumu_compaction_interval_s);
+// A tablet whose partition was dropped (e.g. by TRUNCATE) stays loadable from the meta service
+// until the recycler deletes it, and the BE only learns of the drop from a compaction job RPC.
+// Tablets that keep a backlog score but are skipped by compaction never make such a call, so
+// the compaction producer asks the meta service about up to this many of the highest-scoring
+// skipped tablets per round. 0 disables the check.
+DECLARE_mInt32(cloud_dropped_tablet_probe_batch);
+// Minimum seconds between two drop checks of the same tablet.
+DECLARE_mInt64(cloud_dropped_tablet_probe_interval_s);
 
 DECLARE_mInt32(compaction_timeout_seconds);
 DECLARE_mInt32(lease_compaction_interval_seconds);

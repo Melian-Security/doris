@@ -735,11 +735,26 @@ std::vector<CloudTabletSPtr> CloudStorageEngine::_generate_cloud_compaction_task
     bool scored = false;
     do {
         std::vector<CloudTabletSPtr> tablets;
+        std::vector<CloudTabletSPtr> skipped;
+        const auto probe_batch =
+                static_cast<size_t>(std::max(0, config::cloud_dropped_tablet_probe_batch));
         auto st = tablet_mgr().get_topn_tablets_to_compact(n, compaction_type, filter_out, &tablets,
-                                                           &max_compaction_score);
+                                                           &max_compaction_score, &skipped,
+                                                           probe_batch);
         if (!st.ok()) {
             LOG(WARNING) << "failed to get tablets to compact, err=" << st;
             break;
+        }
+        // A dropped tablet that compaction skips never reaches the meta service, so without a
+        // probe it keeps its backlog score in the gauge for as long as it stays cached.
+        if (_probe_dropped_tablets(skipped)) {
+            std::vector<CloudTabletSPtr> rescored;
+            st = tablet_mgr().get_topn_tablets_to_compact(0, compaction_type, filter_out, &rescored,
+                                                          &max_compaction_score);
+            if (!st.ok()) {
+                LOG(WARNING) << "failed to rescore tablets to compact, err=" << st;
+                break;
+            }
         }
         scored = true;
         if (!need_pick_tablet) break;
@@ -759,6 +774,43 @@ std::vector<CloudTabletSPtr> CloudStorageEngine::_generate_cloud_compaction_task
     }
 
     return tablets_compaction;
+}
+
+bool CloudStorageEngine::_probe_dropped_tablets(const std::vector<CloudTabletSPtr>& tablets) {
+    const int64_t now = duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    bool any_dropped = false;
+    for (const auto& tablet : tablets) {
+        if (tablet->is_dropped() || now - tablet->last_drop_probe_ms <
+                                            config::cloud_dropped_tablet_probe_interval_s * 1000) {
+            continue;
+        }
+        tablet->last_drop_probe_ms = now;
+        // A lease of a job id that cannot exist: the meta service checks the drop state before it
+        // looks the job up, answers TABLET_NOT_FOUND for a dropped tablet and otherwise rejects
+        // the request without writing anything.
+        cloud::TabletJobInfoPB job;
+        auto* idx = job.mutable_idx();
+        idx->set_tablet_id(tablet->tablet_id());
+        idx->set_table_id(tablet->table_id());
+        idx->set_index_id(tablet->index_id());
+        idx->set_partition_id(tablet->partition_id());
+        auto* compaction_job = job.add_compaction();
+        compaction_job->set_id("dropped-tablet-probe");
+        compaction_job->set_lease(now / 1000);
+        cloud::FinishTabletJobResponse resp;
+        static_cast<void>(meta_mgr().lease_tablet_job(job, &resp));
+        if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
+            LOG_INFO("tablet is dropped, stop scoring it for compaction")
+                    .tag("tablet_id", tablet->tablet_id())
+                    .tag("partition_id", tablet->partition_id());
+            tablet->mark_dropped();
+            tablet->clear_cache();
+            any_dropped = true;
+        }
+    }
+    return any_dropped;
 }
 
 Status CloudStorageEngine::_request_tablet_global_compaction_lock(

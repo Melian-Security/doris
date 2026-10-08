@@ -219,6 +219,11 @@ private:
     void _lease_compaction_thread_callback();
     void _check_tablet_delete_bitmap_score_callback();
 
+    // Asks the meta service whether each tablet, at most once per
+    // cloud_dropped_tablet_probe_interval_s, was dropped; marks and evicts the dropped ones.
+    // Returns whether any was dropped.
+    bool _probe_dropped_tablets(const std::vector<CloudTabletSPtr>& tablets);
+
     std::atomic_bool _stopped {false};
 
     std::unique_ptr<cloud::CloudMetaMgr> _meta_mgr;

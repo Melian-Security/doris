@@ -80,12 +80,16 @@ public:
      *                   whether skipping the tablet, true for skip
      * @param tablets output param
      * @param max_score output param, max score of existed tablets
+     * @param skipped optional output param, the up to max_skipped highest-scoring tablets that
+     *                the compaction policy skipped, highest first
      * @return status of this call
      */
     Status get_topn_tablets_to_compact(int n, CompactionType compaction_type,
                                        const std::function<bool(CloudTablet*)>& filter_out,
                                        std::vector<std::shared_ptr<CloudTablet>>* tablets,
-                                       int64_t* max_score);
+                                       int64_t* max_score,
+                                       std::vector<std::shared_ptr<CloudTablet>>* skipped = nullptr,
+                                       size_t max_skipped = 0);
 
     /**
      * Gets tablets info and total tablet num that are reported
