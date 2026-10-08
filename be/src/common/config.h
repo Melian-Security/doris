@@ -127,6 +127,10 @@ DECLARE_Bool(enable_arrow_input_validation);
 DECLARE_mBool(enable_arrow_stream_load_streaming_read);
 // Row cap of one block from the Arrow stream load reader. <= 0 uses the load's batch_size.
 DECLARE_mInt32(arrow_stream_load_block_rows);
+// Decompress an Arrow stream load's IPC buffers on the scanner thread itself. Arrow's default
+// fans every record batch's buffer decompression out to its single process-wide CPU pool, whose
+// one mutex and condition variable serialize hundreds of concurrent loads.
+DECLARE_mBool(arrow_stream_load_decompress_inline);
 
 // port for cdc client scan oltp cdc data
 DECLARE_Int32(cdc_client_port);

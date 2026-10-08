@@ -79,6 +79,7 @@ DEFINE_Bool(enable_arrow_input_validation, "true");
 // decoded batch plus the whole load as one block. When false it reads the whole stream first.
 DEFINE_mBool(enable_arrow_stream_load_streaming_read, "true");
 DEFINE_mInt32(arrow_stream_load_block_rows, "0");
+DEFINE_mBool(arrow_stream_load_decompress_inline, "true");
 
 DEFINE_Int32(cdc_client_port, "9096");
 

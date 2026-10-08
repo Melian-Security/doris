@@ -95,10 +95,12 @@ protected:
     void SetUp() override {
         _saved_streaming = config::enable_arrow_stream_load_streaming_read;
         _saved_rows = config::arrow_stream_load_block_rows;
+        _saved_inline = config::arrow_stream_load_decompress_inline;
     }
     void TearDown() override {
         config::enable_arrow_stream_load_streaming_read = _saved_streaming;
         config::arrow_stream_load_block_rows = _saved_rows;
+        config::arrow_stream_load_decompress_inline = _saved_inline;
     }
 
     // Reads the whole pipe and returns the row count of each returned block. Every row is
@@ -140,6 +142,7 @@ protected:
 
     bool _saved_streaming = true;
     int32_t _saved_rows = 0;
+    bool _saved_inline = true;
     int32_t _total_rows = 0;
 };
 
@@ -182,6 +185,18 @@ TEST_F(ArrowStreamReaderStreamingTest, EmptyStreamIsEof) {
     auto blocks = read_all(make_pipe({}));
     EXPECT_TRUE(blocks.empty());
     EXPECT_EQ(_total_rows, 0);
+}
+
+TEST_F(ArrowStreamReaderStreamingTest, InlineAndPooledDecompressionReadTheSameRows) {
+    config::enable_arrow_stream_load_streaming_read = true;
+    config::arrow_stream_load_block_rows = 1000;
+    for (bool decompress_inline : {true, false}) {
+        config::arrow_stream_load_decompress_inline = decompress_inline;
+        auto blocks = read_all(make_pipe({300, 2500, 0, 700}));
+        EXPECT_EQ(_total_rows, 3500) << "inline=" << decompress_inline;
+        EXPECT_EQ(blocks, (std::vector<size_t> {1000, 1000, 1000, 500}))
+                << "inline=" << decompress_inline;
+    }
 }
 
 } // namespace doris

@@ -83,8 +83,9 @@ Status ArrowStreamReader::_open_stream(bool* opened) {
         *opened = false;
         return Status::OK();
     }
-    auto res_open = arrow::ipc::RecordBatchStreamReader::Open(
-            _pip_stream.get(), arrow::ipc::IpcReadOptions::Defaults());
+    auto read_options = arrow::ipc::IpcReadOptions::Defaults();
+    read_options.use_threads = !config::arrow_stream_load_decompress_inline;
+    auto res_open = arrow::ipc::RecordBatchStreamReader::Open(_pip_stream.get(), read_options);
     if (!res_open.ok()) {
         LOG(WARNING) << "failed to open stream reader: " << res_open.status().message();
         return Status::InternalError("failed to open stream reader: {}",
