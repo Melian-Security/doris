@@ -90,6 +90,11 @@ private:
 
     ObjectStoragePathOptions _obj_storage_path_opts;
 
+    // config::s3_write_buffer_size when the writer was created. Every part, the buffers that hold
+    // them and the expected part count use this value, so a live config change cannot mix part
+    // sizes within one file.
+    const size_t _buffer_size;
+
     // Current Part Num for CompletedPart
     int _cur_part_num = 1;
     std::mutex _completed_lock;

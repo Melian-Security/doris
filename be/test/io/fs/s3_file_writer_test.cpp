@@ -1528,6 +1528,44 @@ TEST_F(S3FileWriterTest, write_buffer_boundary) {
     // clang-format on
 }
 
+// A live change of s3_write_buffer_size must not affect a writer that is already open: its parts,
+// its buffers and its expected part count all keep the size it was created with.
+TEST_F(S3FileWriterTest, buffer_size_change_mid_write) {
+    bool enable_file_cache = config::enable_file_cache;
+    config::enable_file_cache = false;
+    auto origin_buffer_size = config::s3_write_buffer_size;
+    Defer defer {[&]() {
+        config::enable_file_cache = enable_file_cache;
+        config::s3_write_buffer_size = origin_buffer_size;
+    }};
+    auto sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    sp->clear_all_call_backs();
+
+    constexpr size_t MB = 1024 * 1024;
+    auto run = [](size_t open_size, size_t first, size_t changed_size, size_t second,
+                  int expected_parts, const std::string& filename) {
+        config::s3_write_buffer_size = open_size;
+        auto [mock_client, s3_file_writer] = create_s3_client(filename);
+        std::string head = generate_test_string('h', first);
+        std::string tail = generate_test_string('t', second);
+        ASSERT_EQ(s3_file_writer->append(head), Status::OK());
+        config::s3_write_buffer_size = changed_size;
+        ASSERT_EQ(s3_file_writer->append(tail), Status::OK());
+        ASSERT_EQ(s3_file_writer->close(), Status::OK());
+        std::string expected_path = get_s3_path(filename);
+        EXPECT_EQ(mock_client->upload_part_count, expected_parts) << filename;
+        EXPECT_EQ(mock_client->complete_multipart_count, 1) << filename;
+        ASSERT_EQ(mock_client->objects[expected_path].size(), first + second) << filename;
+        EXPECT_EQ(mock_client->objects[expected_path].front(), 'h') << filename;
+        EXPECT_EQ(mock_client->objects[expected_path].back(), 't') << filename;
+    };
+    // Grown while a part is half full: 5 + 5 + 3 MB, not an overrun of the 5 MB buffer.
+    run(5 * MB, 7 * MB, 8 * MB, 6 * MB, 3, "buffer_size_grows_mid_write.dat");
+    // Shrunk below the bytes already buffered: 8 + 2 MB, not a size underflow.
+    run(8 * MB, 6 * MB, 5 * MB, 4 * MB, 2, "buffer_size_shrinks_mid_write.dat");
+}
+
 TEST_F(S3FileWriterTest, test_empty_file) {
     std::vector<StorePath> paths;
     paths.emplace_back(std::string("tmp_dir"), 1024000000);
