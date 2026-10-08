@@ -20,6 +20,12 @@
 
 #include "io/cache/file_cache_common.h"
 
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <string_view>
+#include <vector>
+
 #include "common/config.h"
 #include "exec/common/hex.h"
 #include "io/cache/block_file_cache.h"
@@ -238,6 +244,29 @@ std::optional<int64_t> get_tablet_id(std::string file_path) {
     }
 
     return std::nullopt;
+}
+
+std::string remote_file_cache_name(std::string_view path) {
+    std::vector<std::string_view> parts;
+    for (size_t pos = path.find('/'); pos != std::string_view::npos; pos = path.find('/')) {
+        parts.push_back(path.substr(0, pos));
+        path.remove_prefix(pos + 1);
+    }
+    parts.push_back(path);
+
+    const std::string_view file_name = parts.back();
+    const size_t n = parts.size();
+    auto is_number = [](std::string_view s) {
+        return !s.empty() && std::ranges::all_of(s, [](char c) { return c >= '0' && c <= '9'; });
+    };
+    // data/<shard>/<tablet_id>/<rowset_id>/<file>. A version-0 path never matches: its
+    // component two levels above the file is `data`, not a number.
+    if (n >= 5 && parts[n - 5] == DATA_PREFIX && is_number(parts[n - 4]) &&
+        is_number(parts[n - 3]) && !parts[n - 2].empty() &&
+        (file_name.ends_with(".dat") || file_name.ends_with(".idx"))) {
+        return fmt::format("{}_{}", parts[n - 2], file_name);
+    }
+    return std::string(file_name);
 }
 
 } // namespace doris::io

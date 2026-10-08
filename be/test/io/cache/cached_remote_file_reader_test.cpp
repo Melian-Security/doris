@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <future>
+#include <string>
 
 #include "block_file_cache_test_common.h"
 #include "cloud/config.h"
@@ -1609,6 +1612,112 @@ TEST_F(BlockFileCacheTest, cache_write_mode_is_resolved_for_each_read_context) {
     EXPECT_EQ(sync_reader->_resolve_cache_write_mode(&context), CacheWriteMode::SYNC_WRITE);
     context.cache_write_mode_override = CacheWriteMode::ASYNC_WRITE;
     EXPECT_EQ(sync_reader->_resolve_cache_write_mode(&context), CacheWriteMode::ASYNC_WRITE);
+}
+
+namespace {
+
+// Remote source with a fixed path and in-memory contents.
+class InMemoryRemoteFileReader final : public FileReader {
+public:
+    InMemoryRemoteFileReader(std::string path, std::string contents)
+            : _path(std::move(path)), _contents(std::move(contents)) {}
+
+    Status close() override {
+        _closed = true;
+        return Status::OK();
+    }
+    const Path& path() const override { return _path; }
+    size_t size() const override { return _contents.size(); }
+    bool closed() const override { return _closed; }
+    int64_t mtime() const override { return 0; }
+    size_t read_count() const { return _read_count; }
+
+protected:
+    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                        const IOContext* /*io_ctx*/) override {
+        ++_read_count;
+        const size_t n = offset >= _contents.size()
+                                 ? 0
+                                 : std::min(result.size, _contents.size() - offset);
+        std::memcpy(result.data, _contents.data() + offset, n);
+        *bytes_read = n;
+        return Status::OK();
+    }
+
+private:
+    Path _path;
+    std::string _contents;
+    bool _closed {false};
+    std::atomic<size_t> _read_count {0};
+};
+
+} // namespace
+
+// Path-version-1 vaults name every segment `<seg>.dat`. Two rowsets of two tablets that both have
+// segment 0 must keep separate cache entries: reading one must never return the other's bytes.
+TEST_F(AsyncCachedRemoteFileReaderTest, path_v1_segment_zero_of_two_rowsets_does_not_collide) {
+    create_cache("cached_remote_reader_path_v1_segment_zero");
+    const std::string rowset_a = "0200000000001cc2224124562e7dfd4834d031b13c0210be";
+    const std::string rowset_b = "0200000000001cc3224124562e7dfd4834d031b13c0210be";
+    const std::string path_a = "s3://bucket/prefix/data/13/10003/" + rowset_a + "/0.dat";
+    const std::string path_b = "s3://bucket/prefix/data/9/10004/" + rowset_b + "/0.dat";
+    const std::string contents_a(64 * 1024, 'a');
+    const std::string contents_b(64 * 1024, 'b');
+
+    auto remote_a = std::make_shared<InMemoryRemoteFileReader>(path_a, contents_a);
+    auto remote_b = std::make_shared<InMemoryRemoteFileReader>(path_b, contents_b);
+    auto reader_a = create_reader(remote_a);
+    auto reader_b = create_reader(remote_b);
+
+    // One logical identity per segment, shared with the writer, warm-up and eviction paths.
+    EXPECT_NE(reader_a->_cache_hash, reader_b->_cache_hash);
+    EXPECT_EQ(reader_a->_cache_hash, BlockFileCache::hash(rowset_a + "_0.dat"));
+    EXPECT_EQ(reader_b->_cache_hash, BlockFileCache::hash(rowset_b + "_0.dat"));
+
+    auto read_all = [](CachedRemoteFileReader& reader) {
+        std::string buffer(reader.size(), '\0');
+        FileCacheStatistics stats;
+        IOContext context;
+        context.file_cache_stats = &stats;
+        size_t bytes_read = 0;
+        EXPECT_TRUE(reader.read_at(0, Slice(buffer.data(), buffer.size()), &bytes_read, &context)
+                            .ok());
+        EXPECT_EQ(bytes_read, buffer.size());
+        return std::make_pair(buffer, stats.bytes_read_from_remote);
+    };
+
+    EXPECT_EQ(read_all(*reader_a).first, contents_a);
+    wait_for_async_writes();
+    EXPECT_EQ(read_all(*reader_b).first, contents_b);
+    wait_for_async_writes();
+    const size_t remote_reads_a = remote_a->read_count();
+    const size_t remote_reads_b = remote_b->read_count();
+    ASSERT_GT(remote_reads_a, 0);
+    ASSERT_GT(remote_reads_b, 0);
+
+    // Served from the cache, each with its own bytes.
+    auto [cached_a, remote_bytes_a] = read_all(*reader_a);
+    auto [cached_b, remote_bytes_b] = read_all(*reader_b);
+    EXPECT_EQ(cached_a, contents_a);
+    EXPECT_EQ(cached_b, contents_b);
+    EXPECT_EQ(remote_bytes_a, 0);
+    EXPECT_EQ(remote_bytes_b, 0);
+    EXPECT_EQ(remote_a->read_count(), remote_reads_a);
+    EXPECT_EQ(remote_b->read_count(), remote_reads_b);
+
+    // A fresh reader of rowset b's segment (e.g. after a BE restart) hits b's entry.
+    auto reopened_b = create_reader(
+            std::make_shared<InMemoryRemoteFileReader>(path_b, std::string(64 * 1024, 'x')));
+    EXPECT_EQ(read_all(*reopened_b).first, contents_b);
+}
+
+// Version-0 paths keep the plain file name as their cache identity.
+TEST_F(AsyncCachedRemoteFileReaderTest, path_v0_cache_identity_is_the_file_name) {
+    create_cache("cached_remote_reader_path_v0_identity");
+    const std::string rowset = "0200000000001cc2224124562e7dfd4834d031b13c0210be";
+    auto reader = create_reader(std::make_shared<InMemoryRemoteFileReader>(
+            "s3://bucket/prefix/data/10003/" + rowset + "_0.dat", std::string(16, 'a')));
+    EXPECT_EQ(reader->_cache_hash, BlockFileCache::hash(rowset + "_0.dat"));
 }
 
 } // namespace doris::io
