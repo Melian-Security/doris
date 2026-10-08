@@ -59,6 +59,8 @@ Status DeleteBitmapFileWriter::init() {
     }
     _path = _storage_resource->remote_delete_bitmap_path(_tablet_id, _rowset_id);
     io::FileWriterOptions opts;
+    // txn_id > 0 only for load; compaction and schema change store bitmaps without one.
+    opts.background_write = _txn_id <= 0;
 
     if (_enable_packed_file) {
         // Create underlying file writer

@@ -92,7 +92,10 @@ Status PackedFileSystem::create_file_impl(const Path& file, FileWriterPtr* write
     FileWriterPtr inner_writer;
     RETURN_IF_ERROR(_inner_fs->create_file(file, &inner_writer, opts));
 
-    if (!should_use_packed_writer(file.filename().native())) {
+    // A packed file is shared by every small file appended to it and is uploaded on the
+    // load pools, so background (compaction / schema change) output is written directly.
+    if (!should_use_packed_writer(file.filename().native()) ||
+        (opts != nullptr && opts->background_write)) {
         *writer = std::move(inner_writer);
         return Status::OK();
     }

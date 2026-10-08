@@ -57,12 +57,15 @@
 #include "io/fs/file_system.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "io/fs/packed_file_system.h"
+#include "io/fs/packed_file_writer.h"
 #include "io/fs/s3_file_bufferpool.h"
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_obj_storage_client.h"
 #include "io/io_common.h"
 #include "runtime/exec_env.h"
 #include "storage/index/index_file_writer.h"
+#include "storage/rowset/rowset_writer_context.h"
 #include "util/defer_op.h"
 #include "util/slice.h"
 #include "util/thread.h"
@@ -1896,6 +1899,74 @@ TEST_F(S3FileWriterPoolTest, saturated_compaction_pool_does_not_delay_load_close
     auto [shared_fast, shared_pending] = run(false);
     EXPECT_FALSE(shared_fast);
     EXPECT_TRUE(shared_pending);
+}
+
+// Every file a compaction writes - segment, inverted index, and the small segment-0 files
+// that load would route through a shared packed file - must reach S3 on the compaction pools.
+TEST_F(S3FileWriterPoolTest, compaction_segment_index_and_packed_files_use_compaction_pool) {
+    install_compaction_pools(4, 2);
+    auto packed_fs = std::make_shared<io::PackedFileSystem>(s3_fs);
+    std::string part(config::s3_write_buffer_size, 'p');
+
+    auto options_for = [](DataWriteType type, FileType file_type) {
+        RowsetWriterContext ctx;
+        ctx.write_type = type;
+        return ctx.get_file_writer_options(file_type);
+    };
+    for (auto type : {DataWriteType::TYPE_COMPACTION, DataWriteType::TYPE_SCHEMA_CHANGE}) {
+        EXPECT_TRUE(options_for(type, FileType::SEGMENT_FILE).background_write);
+        EXPECT_TRUE(options_for(type, FileType::INVERTED_INDEX_FILE).background_write);
+    }
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_DIRECT, FileType::SEGMENT_FILE).background_write);
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_DIRECT, FileType::INVERTED_INDEX_FILE)
+                         .background_write);
+
+    struct Case {
+        std::string path;
+        FileType file_type;
+        size_t bytes;
+    };
+    std::vector<Case> cases {
+            {"compaction_rs_0.dat", FileType::SEGMENT_FILE, 2 * part.size() + 7}, // packed-eligible
+            {"compaction_rs_0.idx", FileType::INVERTED_INDEX_FILE, 1024}, // small, packed-eligible
+            {"compaction_rs_3.dat", FileType::SEGMENT_FILE, 2 * part.size()},
+            {"compaction_rs_3.idx", FileType::INVERTED_INDEX_FILE, 1024},
+    };
+    for (const auto& c : cases) {
+        auto opts = options_for(DataWriteType::TYPE_COMPACTION, c.file_type);
+        io::FileWriterPtr file_writer;
+        ASSERT_TRUE(packed_fs->create_file(c.path, &file_writer, &opts).ok());
+        auto* s3_writer = dynamic_cast<S3FileWriter*>(file_writer.get());
+        ASSERT_NE(s3_writer, nullptr) << c.path << " was wrapped in a shared packed file";
+        EXPECT_TRUE(s3_writer->uses_background_pools()) << c.path;
+
+        auto client = std::make_shared<PoolRecordingMockClient>();
+        auto holder = std::make_shared<ObjClientHolder>(S3ClientConf {});
+        holder->_client = client;
+        s3_writer->_obj_client = holder;
+        for (size_t left = c.bytes; left > 0;) {
+            size_t n = std::min(left, part.size());
+            ASSERT_TRUE(file_writer->append(Slice(part.data(), n)).ok());
+            left -= n;
+        }
+        ASSERT_TRUE(file_writer->close(true).ok());
+        ASSERT_TRUE(file_writer->close().ok());
+        EXPECT_TRUE(all_start_with(client->upload_thread_names(), "TestCompactionUpload"))
+                << c.path;
+        auto completes = client->complete_thread_names();
+        if (!completes.empty()) {
+            EXPECT_TRUE(all_start_with(completes, "TestCompactionClose")) << c.path;
+        }
+    }
+
+    // The same segment-0 files written by a load still join the packed file.
+    for (auto file_type : {FileType::SEGMENT_FILE, FileType::INVERTED_INDEX_FILE}) {
+        auto opts = options_for(DataWriteType::TYPE_DIRECT, file_type);
+        io::FileWriterPtr file_writer;
+        auto path = file_type == FileType::SEGMENT_FILE ? "load_rs_0.dat" : "load_rs_0.idx";
+        ASSERT_TRUE(packed_fs->create_file(path, &file_writer, &opts).ok());
+        EXPECT_NE(dynamic_cast<io::PackedFileWriter*>(file_writer.get()), nullptr) << path;
+    }
 }
 
 } // namespace doris

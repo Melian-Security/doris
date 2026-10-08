@@ -55,6 +55,8 @@ bvar::Adder<uint64_t> s3_file_being_written("s3_file_writer_file_being_written")
 bvar::Adder<uint64_t> s3_file_writer_async_close_queuing("s3_file_writer_async_close_queuing");
 bvar::Adder<uint64_t> s3_file_writer_async_close_processing(
         "s3_file_writer_async_close_processing");
+bvar::Adder<uint64_t> s3_file_writer_load_parts("s3_file_writer_load_parts");
+bvar::Adder<uint64_t> s3_file_writer_background_parts("s3_file_writer_background_parts");
 bvar::Adder<uint64_t> s3_file_writer_compaction_async_close_queuing(
         "s3_file_writer_compaction_async_close_queuing");
 bvar::Adder<uint64_t> s3_file_writer_compaction_async_close_processing(
@@ -300,6 +302,9 @@ Status S3FileWriter::_submit_upload_buffer(const std::shared_ptr<FileBuffer>& bu
         // Taken before add_count(): the permits this may wait on belong to already
         // submitted buffers, which complete without this writer making progress.
         buf->set_inflight_permit(UploadBufferInflightLimiter::compaction()->acquire());
+        s3_file_writer_background_parts << 1;
+    } else {
+        s3_file_writer_load_parts << 1;
     }
     _countdown_event.add_count();
     DBUG_EXECUTE_IF("S3FileWriter.submit_upload_buffer.inject_error", {
