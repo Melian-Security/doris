@@ -94,6 +94,13 @@ private:
     T* _t = nullptr;
 };
 
+// Page codec for a segment written with write_type: config::load_segment_compression_type for
+// loads, UNKNOWN_COMPRESSION (the table's codec) otherwise and when the config is empty.
+segment_v2::CompressionTypePB load_segment_compression_type(DataWriteType write_type);
+
+// ZSTD level for the pages of a segment written with write_type; 0 keeps the current level.
+int load_segment_zstd_compression_level(DataWriteType write_type);
+
 class SegmentFlusher {
 public:
     SegmentFlusher(RowsetWriterContext& context, SegmentFileCollection& seg_files,

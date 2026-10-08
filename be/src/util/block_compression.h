@@ -90,4 +90,23 @@ Status get_block_compression_codec(tparquet::CompressionCodec::type parquet_code
 // TODO: refactor code as CompressionOutputStream and CompressionInputStream
 Status get_block_compression_codec(TFileCompressType::type type, BlockCompressionCodec** codec);
 
+// The ZSTD level that ZSTD block compression on the calling thread uses: the innermost live
+// ScopedZstdCompressionLevel, otherwise config::zstd_compression_level.
+int current_zstd_compression_level();
+
+// Sets the ZSTD level of every ZSTD block compression the constructing thread performs while the
+// scope is alive. A level of 0 leaves the current level in effect. Scopes nest; the destructor
+// restores the enclosing level, so a scope must end on the thread that created it.
+class ScopedZstdCompressionLevel {
+public:
+    explicit ScopedZstdCompressionLevel(int level);
+    ~ScopedZstdCompressionLevel();
+
+    ScopedZstdCompressionLevel(const ScopedZstdCompressionLevel&) = delete;
+    ScopedZstdCompressionLevel& operator=(const ScopedZstdCompressionLevel&) = delete;
+
+private:
+    int _previous_level;
+};
+
 } // namespace doris

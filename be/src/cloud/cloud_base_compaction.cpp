@@ -59,6 +59,10 @@ Status CloudBaseCompaction::prepare_compact() {
         st = Status::InternalError("invalid tablet state. tablet_id={}", _tablet->tablet_id());
         return st;
     }
+    if (_tablet->is_dropped()) {
+        st = Status::InternalError("tablet {} is dropped", _tablet->tablet_id());
+        return st;
+    }
 
     bool need_sync_tablet = true;
     {
@@ -139,6 +143,7 @@ Status CloudBaseCompaction::request_global_lock() {
             cloud_tablet()->last_sync_time_s = 0;
         } else if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
             // tablet not found
+            cloud_tablet()->mark_dropped();
             cloud_tablet()->clear_cache();
         } else if (resp.status().code() == cloud::JOB_CHECK_ALTER_VERSION) {
             auto* cloud_tablet = (static_cast<CloudTablet*>(_tablet.get()));
@@ -278,6 +283,13 @@ Status CloudBaseCompaction::pick_rowsets_to_compact() {
 }
 
 Status CloudBaseCompaction::execute_compact() {
+    // The job may have waited in the pool queue since prepare. Renewing its lease now also tells
+    // whether the tablet was dropped meanwhile, before any input is read.
+    do_lease();
+    if (_tablet->is_dropped()) {
+        cloud_tablet()->clear_cache();
+        return Status::InternalError("tablet {} is dropped", _tablet->tablet_id());
+    }
 #ifndef __APPLE__
     if (config::enable_base_compaction_idle_sched) {
         Thread::set_idle_sched();
@@ -399,6 +411,7 @@ Status CloudBaseCompaction::modify_rowsets() {
     }
     if (!st.ok()) {
         if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
+            cloud_tablet()->mark_dropped();
             cloud_tablet()->clear_cache();
         } else if (resp.status().code() == cloud::JOB_CHECK_ALTER_VERSION) {
             auto* cloud_tablet = (static_cast<CloudTablet*>(_tablet.get()));
@@ -494,8 +507,13 @@ void CloudBaseCompaction::do_lease() {
     int64_t lease_time = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() +
                          config::lease_compaction_interval_seconds * 4;
     compaction_job->set_lease(lease_time);
-    auto st = _engine.meta_mgr().lease_tablet_job(job);
+    cloud::FinishTabletJobResponse resp;
+    auto st = _engine.meta_mgr().lease_tablet_job(job, &resp);
     if (!st.ok()) {
+        if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
+            // The partition or index was dropped. A running merge stops at its next block.
+            _tablet->mark_dropped();
+        }
         LOG_WARNING("failed to lease compaction job")
                 .tag("job_id", _uuid)
                 .tag("tablet_id", _tablet->tablet_id())

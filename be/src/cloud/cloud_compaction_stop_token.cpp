@@ -47,8 +47,13 @@ void CloudCompactionStopToken::do_lease() {
     int64_t lease_time = duration_cast<seconds>(system_clock::now().time_since_epoch()).count() +
                          (config::lease_compaction_interval_seconds * 4);
     compaction_job->set_lease(lease_time);
-    auto st = _engine.meta_mgr().lease_tablet_job(job);
+    cloud::FinishTabletJobResponse resp;
+    auto st = _engine.meta_mgr().lease_tablet_job(job, &resp);
     if (!st.ok()) {
+        if (resp.status().code() == cloud::TABLET_NOT_FOUND) {
+            // The partition or index was dropped. A running merge stops at its next block.
+            _tablet->mark_dropped();
+        }
         LOG_WARNING("failed to lease compaction stop token")
                 .tag("job_id", _uuid)
                 .tag("delete_bitmap_lock_initiator", _initiator)

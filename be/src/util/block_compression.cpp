@@ -1037,6 +1037,27 @@ public:
     }
 };
 
+namespace {
+// 0 means no ScopedZstdCompressionLevel is live on this thread.
+thread_local int tls_zstd_compression_level = 0;
+} // namespace
+
+int current_zstd_compression_level() {
+    return tls_zstd_compression_level != 0 ? tls_zstd_compression_level
+                                           : config::zstd_compression_level;
+}
+
+ScopedZstdCompressionLevel::ScopedZstdCompressionLevel(int level)
+        : _previous_level(tls_zstd_compression_level) {
+    if (level != 0) {
+        tls_zstd_compression_level = level;
+    }
+}
+
+ScopedZstdCompressionLevel::~ScopedZstdCompressionLevel() {
+    tls_zstd_compression_level = _previous_level;
+}
+
 // for ZSTD compression and decompression, with BOTH fast and high compression ratio
 class ZstdBlockCompression : public BlockCompressionCodec {
 private:
@@ -1124,9 +1145,8 @@ public:
                 compressed_buf.size = max_len;
             }
 
-            // set compression level to default 3
             auto ret = ZSTD_CCtx_setParameter(context->ctx, ZSTD_c_compressionLevel,
-                                              ZSTD_CLEVEL_DEFAULT);
+                                              current_zstd_compression_level());
             if (ZSTD_isError(ret)) {
                 return Status::InvalidArgument("ZSTD_CCtx_setParameter compression level error: {}",
                                                ZSTD_getErrorString(ZSTD_getErrorCode(ret)));

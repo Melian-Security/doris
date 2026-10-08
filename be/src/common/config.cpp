@@ -1040,6 +1040,22 @@ DEFINE_Int32(send_batch_thread_pool_queue_size, "102400");
 DEFINE_mInt32(max_segment_num_per_rowset, "1000");
 DEFINE_mInt32(segment_compression_threshold_kb, "256");
 
+DEFINE_mString(load_segment_compression_type, "");
+DEFINE_Validator(load_segment_compression_type, [](const std::string& config) -> bool {
+    std::string upper = config;
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+    return upper.empty() || upper == "NO_COMPRESSION" || upper == "SNAPPY" || upper == "LZ4" ||
+           upper == "LZ4F" || upper == "LZ4HC" || upper == "ZLIB" || upper == "ZSTD";
+});
+
+// 3 is ZSTD_CLEVEL_DEFAULT. Negative levels are ZSTD's fast levels.
+DEFINE_mInt32(zstd_compression_level, "3");
+DEFINE_Validator(zstd_compression_level,
+                 [](const int config) -> bool { return config >= -7 && config <= 22; });
+DEFINE_mInt32(load_segment_zstd_compression_level, "0");
+DEFINE_Validator(load_segment_zstd_compression_level,
+                 [](const int config) -> bool { return config >= -7 && config <= 22; });
+
 // Time to clean up useless JDBC connection pool cache
 DEFINE_mInt32(jdbc_connection_pool_cache_clear_time_sec, "28800");
 

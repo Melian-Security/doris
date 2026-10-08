@@ -426,7 +426,8 @@ void CloudTabletMgr::sync_tablets(const CountDownLatch& stop_latch) {
 
 Status CloudTabletMgr::get_topn_tablets_to_compact(
         int n, CompactionType compaction_type, const std::function<bool(CloudTablet*)>& filter_out,
-        std::vector<std::shared_ptr<CloudTablet>>* tablets, int64_t* max_score) {
+        std::vector<std::shared_ptr<CloudTablet>>* tablets, int64_t* max_score,
+        std::vector<std::shared_ptr<CloudTablet>>* skipped, size_t max_skipped) {
     DCHECK(compaction_type == CompactionType::BASE_COMPACTION ||
            compaction_type == CompactionType::CUMULATIVE_COMPACTION);
     *max_score = 0;
@@ -483,9 +484,14 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     auto weak_tablets = get_weak_tablets();
     std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> buf;
     buf.reserve(n + 1);
+    std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> skipped_buf;
+    if (skipped != nullptr) { skipped_buf.reserve(max_skipped + 1); }
     for (auto& weak_tablet : weak_tablets) {
         auto t = weak_tablet.lock();
         if (t == nullptr) { continue; }
+        // A dropped tablet stays reachable here while anything still holds it, and its score
+        // stays as high as the backlog it was dropped with.
+        if (t->is_dropped()) { continue; }
 
         int64_t s = score(t.get());
         if (s <= 0) { continue; }
@@ -496,7 +502,15 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
 
         if (filter_out(t.get())) { ++num_filtered; continue; }
         if (disable(t.get())) { ++num_disabled; continue; }
-        if (skip(t.get())) { ++num_skipped; continue; }
+        if (skip(t.get())) {
+            ++num_skipped;
+            if (skipped != nullptr && max_skipped > 0) {
+                skipped_buf.emplace_back(std::move(t), s);
+                std::sort(skipped_buf.begin(), skipped_buf.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                if (skipped_buf.size() > max_skipped) { skipped_buf.pop_back(); }
+            }
+            continue;
+        }
 
         buf.emplace_back(std::move(t), s);
         std::sort(buf.begin(), buf.end(), [](auto& a, auto& b) { return a.second > b.second; });
@@ -515,6 +529,12 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     tablets->reserve(n + 1);
     for (auto& [t, _] : buf) {
         tablets->emplace_back(std::move(t));
+    }
+    if (skipped != nullptr) {
+        skipped->clear();
+        for (auto& [t, _] : skipped_buf) {
+            skipped->emplace_back(std::move(t));
+        }
     }
 
     return Status::OK();
@@ -631,8 +651,8 @@ void CloudTabletMgr::put_tablet_in_cache_for_UT(std::shared_ptr<CloudTablet> tab
     auto tablet_id_str = std::to_string(tablet->tablet_id());
     CacheKey key(tablet_id_str);
     auto value = std::make_unique<CacheValue>(tablet, *_tablet_map);
-    auto* handle = _cache->insert(key, value.release(), 1, sizeof(CloudTablet),
-                                  CachePriority::NORMAL);
+    auto* handle =
+            _cache->insert(key, value.release(), 1, sizeof(CloudTablet), CachePriority::NORMAL);
     _cache->release(handle);
     _tablet_map->put(std::move(tablet));
 }

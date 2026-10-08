@@ -46,6 +46,8 @@ DEFINE_mInt64(min_compaction_failure_interval_ms, "5000");
 DEFINE_mInt64(base_compaction_freeze_interval_s, "1800");
 DEFINE_mInt64(compaction_load_max_freeze_interval_s, "1200");
 DEFINE_mInt64(cumu_compaction_interval_s, "1800");
+DEFINE_mInt32(cloud_dropped_tablet_probe_batch, "8");
+DEFINE_mInt64(cloud_dropped_tablet_probe_interval_s, "60");
 
 DEFINE_mInt32(compaction_timeout_seconds, "86400");
 DEFINE_mInt32(lease_compaction_interval_seconds, "20");

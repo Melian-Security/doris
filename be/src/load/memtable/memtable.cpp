@@ -438,7 +438,11 @@ void MemTable::_sort_one_column(DorisVector<std::shared_ptr<RowInBlock>>& row_in
     while (iter.next()) {
         pdqsort(std::next(row_in_blocks.begin(), static_cast<int>(iter.left())),
                 std::next(row_in_blocks.begin(), static_cast<int>(iter.right())),
-                [&cmp](auto lhs, auto rhs) -> bool { return cmp(lhs.get(), rhs.get()) < 0; });
+                // By reference: a by-value shared_ptr parameter costs two atomic reference count
+                // updates per side on every comparison.
+                [&cmp](const auto& lhs, const auto& rhs) -> bool {
+                    return cmp(lhs.get(), rhs.get()) < 0;
+                });
         tie[iter.left()] = 0;
         for (auto i = iter.left() + 1; i < iter.right(); i++) {
             tie[i] = (cmp(row_in_blocks[i - 1].get(), row_in_blocks[i].get()) == 0);
