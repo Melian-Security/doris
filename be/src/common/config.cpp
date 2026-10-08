@@ -460,6 +460,7 @@ DEFINE_mBool(enable_vertical_compaction, "true");
 DEFINE_mBool(enable_ordered_data_compaction, "true");
 // In vertical compaction, column number for every group
 DEFINE_mInt32(vertical_compaction_num_columns_per_group, "5");
+DEFINE_mBool(enable_vertical_compaction_gather_copy, "true");
 // In vertical compaction, max memory usage for row_source_buffer
 DEFINE_Int32(vertical_compaction_max_row_source_memory_mb, "1024");
 // In vertical compaction, max dest segment file size
