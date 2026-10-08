@@ -1834,6 +1834,19 @@ DECLARE_mInt64(hdfs_jni_write_sleep_milliseconds);
 // The max retry times when hdfs write failed
 DECLARE_mInt64(hdfs_jni_write_max_retry_time);
 
+// Route compaction and schema change S3 part uploads and async closes to dedicated
+// pools so a compaction burst cannot queue ahead of load segment closes. Read when a
+// writer is created; flipping it affects writers opened afterwards.
+DECLARE_mBool(enable_separate_compaction_s3_upload_pool);
+// Max threads of CompactionS3FileUploadThreadPool. 0 means the number of cores.
+DECLARE_Int64(compaction_s3_upload_thread_num);
+// Max threads of CompactionNonBlockCloseThreadPool. 0 means the number of cores.
+DECLARE_Int64(compaction_nonblock_close_thread_num);
+// Upper bound on compaction / schema change upload parts submitted but not yet uploaded,
+// per BE. Each part holds one s3_write_buffer_size buffer, so this bounds that memory.
+// A writer that hits the bound blocks before submitting. <= 0 disables the bound.
+DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
+
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);
 // The max thread num for NonBlockCloseThreadPool
