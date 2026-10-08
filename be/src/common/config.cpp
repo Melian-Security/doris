@@ -636,6 +636,14 @@ DEFINE_Int32(webserver_num_workers, "128");
 DEFINE_mBool(enable_stream_load_finish_off_event_loop, "true");
 // Upper bound of threads waiting for stream loads to finish; idle threads exit.
 DEFINE_Int32(stream_load_finish_thread_num, "1024");
+// When true, a stream load whose pipe is full stops reading its HTTP body (EV_READ is disabled on
+// the connection, so TCP flow control holds back the sender) and resumes once the scanner drained
+// the pipe to half its capacity. When false, the event loop thread blocks until the pipe has room,
+// which stalls every other connection on that loop. Read when a load's headers arrive.
+DEFINE_mBool(enable_stream_load_receive_flow_control, "true");
+// Capacity of the pipe between a streaming stream load's HTTP receiver and its scanner. A larger
+// pipe absorbs longer scanner stalls before the receiver pauses, at this much memory per load.
+DEFINE_mInt64(stream_load_pipe_buffer_bytes, "4194304");
 
 DEFINE_Bool(enable_single_replica_load, "true");
 // Number of download workers for single replica load

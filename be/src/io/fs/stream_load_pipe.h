@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -52,6 +53,18 @@ public:
     Status append(std::unique_ptr<PDataRow>&& row);
     Status append(const char* data, size_t size) override;
     Status append(const ByteBufferPtr& buf) override;
+
+    // Queues `buf` without waiting for the consumer, so the buffered bytes may exceed the
+    // capacity by what the producer hands in before it stops. Sets `*full` when the pipe is at or
+    // above its capacity; the drain callback then runs once the consumer brings the buffered
+    // bytes down to half the capacity, or the pipe is cancelled.
+    Status append_without_wait(const ByteBufferPtr& buf, bool* full);
+
+    // Set before the first append_without_wait(). The callback runs on the consumer's (or the
+    // canceller's) thread, without the pipe lock held.
+    void set_drain_callback(std::function<void()> callback) {
+        _drain_callback = std::move(callback);
+    }
 
     const Path& path() const override { return _path; }
 
@@ -102,6 +115,11 @@ private:
 
     Status _append(const ByteBufferPtr& buf, size_t proto_byte_size = 0);
 
+    // Called with _lock held after the consumer took bytes. Returns whether the drain callback
+    // must run once the lock is released.
+    bool _take_drain_signal_locked();
+    void _run_drain_callback(bool signal);
+
     // Blocking queue
     std::mutex _lock;
     size_t _buffered_bytes;
@@ -123,6 +141,10 @@ private:
     std::condition_variable _get_cond;
 
     ByteBufferPtr _write_buf;
+
+    std::function<void()> _drain_callback;
+    // Set by append_without_wait() when the pipe is full, cleared when the callback is due.
+    bool _drain_armed = false;
 
     // no use, only for compatibility with the `Path` interface
     Path _path = "";

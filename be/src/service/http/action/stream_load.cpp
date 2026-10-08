@@ -29,6 +29,7 @@
 #include <sys/time.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -55,6 +56,7 @@
 #include "load/stream_load/stream_load_recorder.h"
 #include "runtime/exec_env.h"
 #include "service/http/ev_http_server.h"
+#include "service/http/http_body_flow_control.h"
 #include "service/http/http_channel.h"
 #include "service/http/http_common.h"
 #include "service/http/http_headers.h"
@@ -118,6 +120,9 @@ void StreamLoadAction::handle(HttpRequest* req) {
             std::static_pointer_cast<StreamLoadContext>(req->handler_ctx());
     if (ctx == nullptr) {
         return;
+    }
+    if (ctx->body_flow_control != nullptr) {
+        ctx->body_flow_control->body_complete();
     }
 
     // Waiting for the load to finish takes as long as the write and commit. Done on the event
@@ -403,23 +408,34 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
     SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
 
     int64_t start_read_data_time = MonotonicNanos();
-    while (evbuffer_get_length(evbuf) > 0) {
-        ByteBufferPtr bb;
-        Status st = ByteBuffer::allocate(128 * 1024, &bb);
-        if (!st.ok()) {
-            ctx->status = st;
-            return;
-        }
-        auto remove_bytes = evbuffer_remove(evbuf, bb->ptr, bb->capacity);
-        bb->pos = remove_bytes;
-        bb->flip();
-        st = ctx->body_sink->append(bb);
+    if (ctx->body_flow_control != nullptr && ctx->pipe != nullptr) {
+        int64_t moved_bytes = 0;
+        Status st = ctx->body_flow_control->move_body_to_pipe(evbuf, ctx->pipe.get(), &moved_bytes);
+        ctx->receive_bytes += moved_bytes;
         if (!st.ok()) {
             LOG(WARNING) << "append body content failed. errmsg=" << st << ", " << ctx->brief();
             ctx->status = st;
             return;
         }
-        ctx->receive_bytes += remove_bytes;
+    } else {
+        while (evbuffer_get_length(evbuf) > 0) {
+            ByteBufferPtr bb;
+            Status st = ByteBuffer::allocate(128 * 1024, &bb);
+            if (!st.ok()) {
+                ctx->status = st;
+                return;
+            }
+            auto remove_bytes = evbuffer_remove(evbuf, bb->ptr, bb->capacity);
+            bb->pos = remove_bytes;
+            bb->flip();
+            st = ctx->body_sink->append(bb);
+            if (!st.ok()) {
+                LOG(WARNING) << "append body content failed. errmsg=" << st << ", " << ctx->brief();
+                ctx->status = st;
+                return;
+            }
+            ctx->receive_bytes += remove_bytes;
+        }
     }
     int64_t read_data_time = MonotonicNanos() - start_read_data_time;
     int64_t last_receive_and_read_data_cost_nanos = ctx->receive_and_read_data_cost_nanos;
@@ -463,14 +479,21 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     request.__set_loadId(ctx->id.to_thrift());
     if (ctx->use_streaming) {
         std::shared_ptr<io::StreamLoadPipe> pipe;
+        const auto pipe_bytes = static_cast<size_t>(std::max<int64_t>(
+                config::stream_load_pipe_buffer_bytes, static_cast<int64_t>(MIN_CHUNK_SIZE)));
         if (ctx->is_chunked_transfer) {
-            pipe = std::make_shared<io::StreamLoadPipe>(
-                    io::kMaxPipeBufferedBytes /* max_buffered_bytes */);
+            pipe = std::make_shared<io::StreamLoadPipe>(pipe_bytes /* max_buffered_bytes */);
             pipe->set_is_chunked_transfer(true);
         } else {
-            pipe = std::make_shared<io::StreamLoadPipe>(
-                    io::kMaxPipeBufferedBytes /* max_buffered_bytes */,
-                    MIN_CHUNK_SIZE /* min_chunk_size */, ctx->body_bytes /* total_length */);
+            pipe = std::make_shared<io::StreamLoadPipe>(pipe_bytes /* max_buffered_bytes */,
+                                                        MIN_CHUNK_SIZE /* min_chunk_size */,
+                                                        ctx->body_bytes /* total_length */);
+        }
+        if (config::enable_stream_load_receive_flow_control) {
+            ctx->body_flow_control = HttpBodyFlowControl::create(http_req);
+            if (ctx->body_flow_control != nullptr) {
+                ctx->body_flow_control->attach_pipe(pipe.get());
+            }
         }
         request.fileType = TFileType::FILE_STREAM;
         ctx->body_sink = pipe;
