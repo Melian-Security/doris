@@ -81,6 +81,9 @@ Status StreamLoadPipe::read_at_impl(size_t /*offset*/, Slice result, size_t* byt
             _buf_queue.pop_front();
             _buffered_bytes -= buf->limit;
             _put_cond.notify_one();
+            bool signal = _take_drain_signal_locked();
+            l.unlock();
+            _run_drain_callback(signal);
         }
     }
     DCHECK(*bytes_read == bytes_req)
@@ -194,7 +197,50 @@ Status StreamLoadPipe::_read_next_buffer(DorisUniqueBufferPtr<uint8_t>* data, si
         row_ptr.release();
     }
     _put_cond.notify_one();
+    bool signal = _take_drain_signal_locked();
+    l.unlock();
+    _run_drain_callback(signal);
     return Status::OK();
+}
+
+Status StreamLoadPipe::append_without_wait(const ByteBufferPtr& buf, bool* full) {
+    DCHECK(!_use_proto);
+    *full = false;
+    if (_write_buf != nullptr) {
+        _write_buf->flip();
+        ByteBufferPtr write_buf = std::move(_write_buf);
+        _write_buf.reset();
+        bool write_buf_full = false;
+        RETURN_IF_ERROR(append_without_wait(write_buf, &write_buf_full));
+    }
+    {
+        std::lock_guard<std::mutex> l(_lock);
+        if (_cancelled) {
+            return Status::Cancelled("cancelled: {}", _cancelled_reason);
+        }
+        _buf_queue.push_back(buf);
+        _buffered_bytes += buf->remaining();
+        if (_buffered_bytes >= _max_buffered_bytes) {
+            _drain_armed = true;
+            *full = true;
+        }
+    }
+    _get_cond.notify_one();
+    return Status::OK();
+}
+
+bool StreamLoadPipe::_take_drain_signal_locked() {
+    if (!_drain_armed || (!_cancelled && _buffered_bytes > _max_buffered_bytes / 2)) {
+        return false;
+    }
+    _drain_armed = false;
+    return true;
+}
+
+void StreamLoadPipe::_run_drain_callback(bool signal) {
+    if (signal && _drain_callback) {
+        _drain_callback();
+    }
 }
 
 Status StreamLoadPipe::_append(const ByteBufferPtr& buf, size_t proto_byte_size) {
@@ -243,13 +289,16 @@ Status StreamLoadPipe::finish() {
 
 // called when producer/consumer failed
 void StreamLoadPipe::cancel(const std::string& reason) {
+    bool signal = false;
     {
         std::lock_guard<std::mutex> l(_lock);
         _cancelled = true;
         _cancelled_reason = reason;
+        signal = _take_drain_signal_locked();
     }
     _get_cond.notify_all();
     _put_cond.notify_all();
+    _run_drain_callback(signal);
 }
 
 TUniqueId StreamLoadPipe::calculate_pipe_id(const UniqueId& query_id, int32_t fragment_id) {

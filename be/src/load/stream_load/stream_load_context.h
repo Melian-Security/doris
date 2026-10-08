@@ -46,6 +46,7 @@ namespace doris {
 namespace io {
 class StreamLoadPipe;
 } // namespace io
+class HttpBodyFlowControl;
 
 // kafka related info
 class KafkaLoadInfo {
@@ -199,6 +200,8 @@ public:
 
     std::shared_ptr<MessageBodySink> body_sink;
     std::shared_ptr<io::StreamLoadPipe> pipe;
+    // Set when the HTTP body is moved into `pipe` without blocking the event loop thread.
+    std::shared_ptr<HttpBodyFlowControl> body_flow_control;
 
     TStreamLoadPutResult put_result;
     TStreamLoadMultiTablePutResult multi_table_put_result;

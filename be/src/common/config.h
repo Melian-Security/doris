@@ -700,6 +700,11 @@ DECLARE_Int32(webserver_num_workers);
 // thread, which serves the bodies of other loads on the same keep-alive event loop.
 DECLARE_mBool(enable_stream_load_finish_off_event_loop);
 DECLARE_Int32(stream_load_finish_thread_num);
+// Pause reading a stream load's HTTP body while its pipe is full instead of blocking the event
+// loop thread, which serves the other connections on the same loop.
+DECLARE_mBool(enable_stream_load_receive_flow_control);
+// Bytes of a streaming stream load's body buffered between the HTTP receiver and the scanner.
+DECLARE_mInt64(stream_load_pipe_buffer_bytes);
 
 DECLARE_Bool(enable_single_replica_load);
 // Number of download workers for single replica load
