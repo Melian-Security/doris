@@ -114,12 +114,17 @@ public class CreateStorageVaultCommand extends Command implements ForwardWithSyn
         final String pathVersionString = properties.get(PATH_VERSION);
         if (pathVersionString != null) {
             this.pathVersion = Integer.parseInt(pathVersionString);
-            properties.remove(PATH_VERSION);
         }
         final String numShardString = properties.get(SHARD_NUM);
         if (numShardString != null) {
             this.numShard = Integer.parseInt(numShardString);
-            properties.remove(SHARD_NUM);
+        }
+        if (pathVersionString != null || numShardString != null) {
+            // properties is an ImmutableMap, so the path format keys are dropped by rebuilding it:
+            // they travel to the meta-service as StorageVaultPB.PathFormat, not as resource properties.
+            properties = properties.entrySet().stream()
+                    .filter(e -> !e.getKey().equals(PATH_VERSION) && !e.getKey().equals(SHARD_NUM))
+                    .collect(ImmutableMap.toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
         }
         setAsDefault = Boolean.parseBoolean(properties.getOrDefault(SET_AS_DEFAULT, "false"));
         setStorageVaultType(StorageVault.StorageVaultType.fromString(type));
