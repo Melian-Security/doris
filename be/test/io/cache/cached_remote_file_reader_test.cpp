@@ -1032,6 +1032,96 @@ TEST_F(BlockFileCacheTest,
     config::enable_read_cache_file_directly = false;
 }
 
+// A block the cache evicts while a reader still maps it for direct reads must cost the reader one
+// fallback through the normal path, after which the replacement block is mapped and read directly.
+TEST_F(BlockFileCacheTest, direct_read_drops_evicted_block_and_maps_replacement) {
+    std::string local_cache_base_path = caches_dir / "cache_direct_read_stale_entry" / "";
+    const bool old_enable_direct = config::enable_read_cache_file_directly;
+    const bool old_async_write = config::enable_async_file_cache_write;
+    config::enable_read_cache_file_directly = true;
+    config::enable_async_file_cache_write = false;
+    if (fs::exists(local_cache_base_path)) {
+        fs::remove_all(local_cache_base_path);
+    }
+    fs::create_directories(local_cache_base_path);
+    Defer restore {[&] {
+        FileCacheFactory::instance()->_caches.clear();
+        FileCacheFactory::instance()->_path_to_cache.clear();
+        FileCacheFactory::instance()->_capacity = 0;
+        if (fs::exists(local_cache_base_path)) {
+            fs::remove_all(local_cache_base_path);
+        }
+        config::enable_read_cache_file_directly = old_enable_direct;
+        config::enable_async_file_cache_write = old_async_write;
+    }};
+
+    io::FileCacheSettings settings;
+    settings.query_queue_size = 6291456;
+    settings.query_queue_elements = 6;
+    settings.index_queue_size = 1048576;
+    settings.index_queue_elements = 1;
+    settings.disposable_queue_size = 1048576;
+    settings.disposable_queue_elements = 1;
+    settings.capacity = 8388608;
+    settings.max_file_block_size = 1048576;
+    settings.max_query_cache_size = 0;
+    ASSERT_TRUE(
+            FileCacheFactory::instance()->create_file_cache(local_cache_base_path, settings).ok());
+
+    io::FileReaderOptions opts;
+    opts.cache_type = io::cache_type_from_string("file_block_cache");
+    opts.is_doris_table = true;
+    opts.tablet_id = 10086;
+
+    auto read_64k_at_100 = [](CachedRemoteFileReader& reader, FileCacheStatistics* stats) {
+        std::string buffer(64_kb, '\0');
+        IOContext io_ctx;
+        io_ctx.file_cache_stats = stats;
+        size_t bytes_read {0};
+        ASSERT_TRUE(reader.read_at(100, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx)
+                            .ok());
+        ASSERT_EQ(bytes_read, 64_kb);
+        ASSERT_EQ(std::string(64_kb, '0'), buffer);
+    };
+
+    {
+        FileReaderSPtr local_reader;
+        ASSERT_TRUE(global_local_filesystem()->open_file(tmp_file, &local_reader));
+        CachedRemoteFileReader seed_reader(local_reader, opts);
+        FileCacheStatistics stats;
+        read_64k_at_100(seed_reader, &stats);
+    }
+
+    FileReaderSPtr local_reader;
+    ASSERT_TRUE(global_local_filesystem()->open_file(tmp_file, &local_reader));
+    auto counting_remote = std::make_shared<CountingFileReader>(local_reader);
+    CachedRemoteFileReader reader(counting_remote, opts);
+    ASSERT_EQ(reader._cache_file_readers.size(), 1);
+    FileBlock* evicted_block = reader._cache_file_readers.at(0).get();
+    auto cached_blocks = [&] { return reader._cache->get_blocks_by_key(reader._cache_hash); };
+
+    // The reader's reference does not pin the block: the cache evicts it and deletes its file.
+    reader._cache->remove_if_cached(reader._cache_hash);
+    ASSERT_TRUE(cached_blocks().empty());
+
+    // One fallback: the stale entry is dropped, the range comes from remote and is cached again.
+    FileCacheStatistics first;
+    read_64k_at_100(reader, &first);
+    EXPECT_EQ(counting_remote->read_count(), 1);
+    auto cached = cached_blocks();
+    ASSERT_EQ(cached.size(), 1);
+    ASSERT_EQ(reader._cache_file_readers.size(), 1);
+    EXPECT_NE(reader._cache_file_readers.at(0).get(), evicted_block);
+    EXPECT_EQ(reader._cache_file_readers.at(0).get(), cached.at(0).get());
+
+    // Later reads are served directly from the replacement block.
+    FileCacheStatistics second;
+    read_64k_at_100(reader, &second);
+    EXPECT_EQ(counting_remote->read_count(), 1);
+    EXPECT_EQ(second.bytes_read_from_remote, 0);
+    EXPECT_EQ(reader._cache_file_readers.at(0).get(), cached.at(0).get());
+}
+
 TEST_F(BlockFileCacheTest, async_write_reuses_inflight_buffer_then_reads_downloaded_block) {
     const bool old_enable_async = config::enable_async_file_cache_write;
     const bool old_enable_inflight =
