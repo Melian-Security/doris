@@ -202,6 +202,18 @@ public:
     std::shared_ptr<io::StreamLoadPipe> pipe;
     // Set when the HTTP body is moved into `pipe` without blocking the event loop thread.
     std::shared_ptr<HttpBodyFlowControl> body_flow_control;
+    // Holds the HTTP read paused while begin txn, planning and fragment start run off the event
+    // loop thread, so that no body arrives before body_sink exists.
+    std::shared_ptr<HttpBodyFlowControl> header_flow_control;
+    // Event loop thread only. While true, a pool thread runs begin txn, planning and fragment
+    // start and owns body_sink, pipe, body_flow_control and status; the event loop thread reads
+    // them again only after the pool thread posted its completion back.
+    bool header_in_flight = false;
+    // Event loop thread only: libevent finished reading the body while the header work ran.
+    bool body_complete_during_header = false;
+    // Event loop thread only: body bytes libevent had already buffered with the headers, held
+    // until body_sink exists.
+    std::string pending_body;
 
     TStreamLoadPutResult put_result;
     TStreamLoadMultiTablePutResult multi_table_put_result;
@@ -229,6 +241,11 @@ public:
     int64_t write_data_cost_nanos = 0;
     int64_t receive_and_read_data_cost_nanos = 0;
     int64_t begin_receive_and_read_data_cost_nanos = 0;
+    // From handing the header work to the pool until its completion runs on the event loop
+    // thread: queueing, begin txn, planning, fragment start and the hop back. Zero when the
+    // header was handled on the event loop thread.
+    int64_t header_wait_cost_nanos = 0;
+    bool header_off_event_loop = false;
 
     std::string error_url = "";
     std::string first_error_msg = "";
