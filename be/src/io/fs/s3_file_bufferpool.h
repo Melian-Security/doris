@@ -263,6 +263,9 @@ struct UploadFileBuffer final : public FileBuffer {
     // nullptr means ExecEnv's shared S3FileUploadThreadPool.
     void set_upload_thread_pool(ThreadPool* pool) { _upload_thread_pool = pool; }
     ThreadPool* upload_thread_pool() const { return _upload_thread_pool; }
+    // CRC32C of the appended bytes; on_upload() verifies it against the buffer before
+    // the upload callback runs, so the callback may send it as the body checksum.
+    uint32_t crc32c() const { return _crc_value; }
 
 private:
     ThreadPool* _upload_thread_pool = nullptr;

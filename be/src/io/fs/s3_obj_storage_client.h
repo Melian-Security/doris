@@ -30,6 +30,11 @@ class CompletedPart;
 namespace doris::io {
 class ObjClientHolder;
 
+// Parses config::s3_upload_content_md5; unknown values map to MD5.
+ObjectUploadChecksum s3_upload_checksum_from_config();
+// Base64 of the big-endian CRC32C, the encoding of the x-amz-checksum-crc32c header.
+std::string s3_crc32c_base64(uint32_t crc);
+
 class S3ObjStorageClient final : public ObjStorageClient {
 public:
     S3ObjStorageClient(std::shared_ptr<Aws::S3::S3Client> client) : _client(std::move(client)) {}

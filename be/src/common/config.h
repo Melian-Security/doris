@@ -1768,6 +1768,11 @@ DECLARE_mInt32(max_s3_client_retry);
 DECLARE_mInt32(s3_read_base_wait_time_ms);
 DECLARE_mInt32(s3_read_max_wait_time_ms);
 DECLARE_mBool(enable_s3_object_check_after_upload);
+// Integrity checksum sent with each S3 PutObject/UploadPart body: "md5" (Content-MD5),
+// "crc32c" (x-amz-checksum-crc32c, reusing the write buffer's crc32c) or "none".
+// Each file writer reads it once, so a change applies to files opened afterwards.
+// Uploads completed by FE (S3 committer) fall back from crc32c to md5.
+DECLARE_mString(s3_upload_content_md5);
 DECLARE_mInt32(aws_client_request_timeout_ms);
 
 // write as inverted index tmp directory

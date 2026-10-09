@@ -80,6 +80,15 @@ S3FileWriter::S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string 
     s3_file_being_written << 1;
     Aws::Http::SetCompliantRfc3986Encoding(true);
 
+    // Read once so every request of this file uses one mode even if the config changes.
+    // A committer upload is completed by FE without per-part checksums, so it cannot use
+    // CRC32C, which S3 then requires on CompleteMultipartUpload.
+    _obj_storage_path_opts.upload_checksum = s3_upload_checksum_from_config();
+    if (_used_by_s3_committer &&
+        _obj_storage_path_opts.upload_checksum == ObjectUploadChecksum::CRC32C) {
+        _obj_storage_path_opts.upload_checksum = ObjectUploadChecksum::MD5;
+    }
+
     init_cache_builder(opts, _obj_storage_path_opts.path);
 }
 
@@ -429,7 +438,9 @@ void S3FileWriter::_upload_one_part(int part_num, UploadFileBuffer& buf) {
         buf.set_status(Status::InternalError<false>("invalid obj storage client"));
         return;
     }
-    auto resp = client->upload_part(_obj_storage_path_opts, buf.get_string_view_data(), part_num);
+    auto opts = _obj_storage_path_opts;
+    opts.body_crc32c = buf.crc32c();
+    auto resp = client->upload_part(opts, buf.get_string_view_data(), part_num);
     if (resp.resp.status.code != ErrorCode::OK) {
         LOG_WARNING("failed to upload part, key={}, part_num={}, status={}",
                     _obj_storage_path_opts.key, part_num, resp.resp.status.msg);
@@ -439,7 +450,8 @@ void S3FileWriter::_upload_one_part(int part_num, UploadFileBuffer& buf) {
     s3_bytes_written_total << buf.get_size();
 
     ObjectCompleteMultiPart completed_part {
-            static_cast<int>(part_num), resp.etag.has_value() ? std::move(resp.etag.value()) : ""};
+            static_cast<int>(part_num), resp.etag.has_value() ? std::move(resp.etag.value()) : "",
+            resp.checksum_crc32c.value_or("")};
 
     std::unique_lock<std::mutex> lck {_completed_lock};
     _completed_parts.emplace_back(std::move(completed_part));
@@ -593,7 +605,9 @@ void S3FileWriter::_put_object(UploadFileBuffer& buf) {
         return;
     }
     TEST_SYNC_POINT_RETURN_WITH_VOID("S3FileWriter::_put_object", this, &buf);
-    auto resp = client->put_object(_obj_storage_path_opts, buf.get_string_view_data());
+    auto opts = _obj_storage_path_opts;
+    opts.body_crc32c = buf.crc32c();
+    auto resp = client->put_object(opts, buf.get_string_view_data());
     timer.stop();
 
     if (resp.status.code != ErrorCode::OK) {
