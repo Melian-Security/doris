@@ -258,6 +258,8 @@ bvar::Adder<int64_t> g_bvar_txn_kv_commit_error_counter;
 bvar::Window<bvar::Adder<int64_t> > g_bvar_txn_kv_commit_error_counter_minute("txn_kv", "commit_error", &g_bvar_txn_kv_commit_error_counter, 60);
 bvar::Adder<int64_t> g_bvar_txn_kv_commit_conflict_counter;
 bvar::Window<bvar::Adder<int64_t> > g_bvar_txn_kv_commit_conflict_counter_minute("txn_kv", "commit_conflict", &g_bvar_txn_kv_commit_conflict_counter, 60);
+bvar::Adder<int64_t> g_bvar_ms_txn_conflict_retry("ms_txn_conflict_retry");
+bvar::Adder<int64_t> g_bvar_ms_txn_conflict_retry_exceeded("ms_txn_conflict_retry_exceeded");
 bvar::Adder<int64_t> g_bvar_delete_bitmap_lock_txn_put_conflict_counter;
 bvar::Window<bvar::Adder<int64_t> > g_bvar_delete_bitmap_lock_txn_put_conflict_counter_minute("delete_bitmap_lock", "txn_put_conflict", &g_bvar_delete_bitmap_lock_txn_put_conflict_counter, 60);
 bvar::Adder<int64_t> g_bvar_delete_bitmap_lock_txn_remove_conflict_by_fail_counter;

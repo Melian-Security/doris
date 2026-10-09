@@ -29,12 +29,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/config.h"
 #include "common/logging.h"
@@ -66,6 +68,8 @@ int main(int argc, char** argv) {
     config::enable_txn_store_retry = true;
     config::txn_store_retry_base_intervals_ms = 1;
     config::txn_store_retry_times = 20;
+    config::txn_conflict_retry_times = 20;
+    config::txn_conflict_retry_base_intervals_ms = 1;
     config::enable_check_instance_id = false;
 
     if (!doris::cloud::init_glog("meta_service_test")) {
@@ -8847,6 +8851,217 @@ TEST(MetaServiceTxnStoreRetryableTest, RetryReadMaybeCommittedCodeReturnsCommitE
     EXPECT_EQ(resp.status().actual_code(), MetaServiceCode::KV_TXN_COMMIT_ERR);
     EXPECT_EQ(resp.version(), 2);
     EXPECT_GE(index, static_cast<size_t>(config::txn_store_retry_times + 1));
+}
+
+TEST(MetaServiceTxnConflictRetryTest, BackoffIsJitteredAndCapped) {
+    for (uint64_t random : {0UL, 1UL, 7UL, 12345UL, UINT64_MAX}) {
+        // ceil doubles from the base until it reaches the cap
+        uint64_t expected_ceil[] = {20, 40, 80, 160, 320, 500, 500, 500};
+        for (int32_t n = 0; n < 8; ++n) {
+            uint64_t ms = txn_conflict_retry_backoff_ms(n, 20, 500, random);
+            EXPECT_GE(ms, expected_ceil[n] / 2) << "n=" << n << " random=" << random;
+            EXPECT_LE(ms, expected_ceil[n]) << "n=" << n << " random=" << random;
+        }
+    }
+    EXPECT_EQ(txn_conflict_retry_backoff_ms(0, 20, 500, 0), 10UL);
+    EXPECT_EQ(txn_conflict_retry_backoff_ms(0, 20, 500, 10), 20UL);
+    // a huge retry count must not overflow past the cap
+    EXPECT_LE(txn_conflict_retry_backoff_ms(1000, 20, 500, UINT64_MAX), 500UL);
+    EXPECT_EQ(txn_conflict_retry_backoff_ms(3, 0, 500, 99), 0UL);
+    EXPECT_EQ(txn_conflict_retry_backoff_ms(3, 20, 0, 99), 0UL);
+}
+
+namespace {
+struct ConflictRetryConfigGuard {
+    bool enable_retry_txn_conflict = config::enable_retry_txn_conflict;
+    int32_t txn_conflict_retry_times = config::txn_conflict_retry_times;
+    int32_t txn_conflict_retry_base_intervals_ms = config::txn_conflict_retry_base_intervals_ms;
+    int32_t txn_conflict_retry_max_intervals_ms = config::txn_conflict_retry_max_intervals_ms;
+    int32_t txn_store_retry_times = config::txn_store_retry_times;
+    ~ConflictRetryConfigGuard() {
+        config::enable_retry_txn_conflict = enable_retry_txn_conflict;
+        config::txn_conflict_retry_times = txn_conflict_retry_times;
+        config::txn_conflict_retry_base_intervals_ms = txn_conflict_retry_base_intervals_ms;
+        config::txn_conflict_retry_max_intervals_ms = txn_conflict_retry_max_intervals_ms;
+        config::txn_store_retry_times = txn_store_retry_times;
+        SyncPoint::get_instance()->disable_processing();
+        SyncPoint::get_instance()->clear_all_call_backs();
+    }
+};
+
+// Makes the first `num_conflicts` commit_txn attempts fail with a kv txn conflict before they
+// write anything, and records each retry sleep the proxy picks (the sleep itself is skipped).
+void inject_commit_txn_conflicts(int num_conflicts, int* attempts,
+                                 std::vector<uint64_t>* sleeps_ms) {
+    auto* sp = SyncPoint::get_instance();
+    sp->set_call_back("commit_txn_immediately::before_commit", [=](auto&& args) {
+        if ((*attempts)++ >= num_conflicts) {
+            return;
+        }
+        *try_any_cast<TxnErrorCode*>(args[0]) = TxnErrorCode::TXN_CONFLICT;
+        *try_any_cast<MetaServiceCode*>(args[1]) = MetaServiceCode::KV_TXN_CONFLICT;
+        *try_any_cast<bool*>(args.back()) = true;
+    });
+    sp->set_call_back("MetaServiceProxy::call_impl_duration_ms", [=](auto&& args) {
+        auto* duration_ms = try_any_cast<uint64_t*>(args[0]);
+        sleeps_ms->push_back(*duration_ms);
+        *duration_ms = 0;
+    });
+    sp->enable_processing();
+}
+} // namespace
+
+TEST(MetaServiceTxnConflictRetryTest, CommitTxnConflictUsesShortBackoff) {
+    ConflictRetryConfigGuard guard;
+    config::enable_retry_txn_conflict = true;
+    config::txn_conflict_retry_times = 10;
+    config::txn_conflict_retry_base_intervals_ms = 20;
+    config::txn_conflict_retry_max_intervals_ms = 500;
+
+    auto service = get_meta_service();
+    int64_t db_id = 7001, table_id = 7002, index_id = 7003, partition_id = 7004,
+            tablet_id = 7005;
+    create_tablet_with_db_id(service.get(), db_id, table_id, index_id, partition_id, tablet_id);
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(begin_txn_and_commit_rowset(service.get(), "conflict_short_backoff",
+                                                        db_id, table_id, partition_id,
+                                                        tablet_id, &txn_id));
+
+    int attempts = 0;
+    std::vector<uint64_t> sleeps_ms;
+    inject_commit_txn_conflicts(6, &attempts, &sleeps_ms);
+    int64_t retries_before = g_bvar_ms_txn_conflict_retry.get_value();
+
+    brpc::Controller cntl;
+    CommitTxnRequest req;
+    CommitTxnResponse res;
+    req.set_db_id(db_id);
+    req.set_txn_id(txn_id);
+    service->commit_txn(&cntl, &req, &res, nullptr);
+
+    ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    EXPECT_EQ(res.txn_info().status(), TxnStatusPB::TXN_STATUS_VISIBLE);
+    EXPECT_EQ(attempts, 7);
+    ASSERT_EQ(sleeps_ms.size(), 6UL);
+    uint64_t expected_ceil[] = {20, 40, 80, 160, 320, 500};
+    for (size_t i = 0; i < sleeps_ms.size(); ++i) {
+        EXPECT_GE(sleeps_ms[i], expected_ceil[i] / 2) << "retry " << i;
+        EXPECT_LE(sleeps_ms[i], expected_ceil[i]) << "retry " << i;
+    }
+    EXPECT_EQ(g_bvar_ms_txn_conflict_retry.get_value() - retries_before, 6);
+}
+
+// A commit that runs out of conflict retries was never written: the txn stays PREPARED, so the
+// load can be aborted and its label begun again.
+TEST(MetaServiceTxnConflictRetryTest, ConflictRetryExceededLeavesTxnAbortable) {
+    ConflictRetryConfigGuard guard;
+    config::enable_retry_txn_conflict = true;
+    config::txn_conflict_retry_times = 3;
+    config::txn_conflict_retry_base_intervals_ms = 20;
+    config::txn_conflict_retry_max_intervals_ms = 500;
+
+    auto service = get_meta_service();
+    int64_t db_id = 7101, table_id = 7102, index_id = 7103, partition_id = 7104,
+            tablet_id = 7105;
+    const std::string label = "conflict_retry_exceeded";
+    create_tablet_with_db_id(service.get(), db_id, table_id, index_id, partition_id, tablet_id);
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(begin_txn_and_commit_rowset(service.get(), label, db_id, table_id,
+                                                        partition_id, tablet_id, &txn_id));
+
+    int attempts = 0;
+    std::vector<uint64_t> sleeps_ms;
+    inject_commit_txn_conflicts(std::numeric_limits<int>::max(), &attempts, &sleeps_ms);
+    int64_t exceeded_before = g_bvar_ms_txn_conflict_retry_exceeded.get_value();
+
+    {
+        brpc::Controller cntl;
+        CommitTxnRequest req;
+        CommitTxnResponse res;
+        req.set_db_id(db_id);
+        req.set_txn_id(txn_id);
+        service->commit_txn(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES)
+                << res.ShortDebugString();
+    }
+    EXPECT_EQ(attempts, 4);
+    EXPECT_EQ(sleeps_ms.size(), 3UL);
+    EXPECT_EQ(g_bvar_ms_txn_conflict_retry_exceeded.get_value() - exceeded_before, 1);
+    SyncPoint::get_instance()->disable_processing();
+    SyncPoint::get_instance()->clear_all_call_backs();
+
+    {
+        brpc::Controller cntl;
+        GetTxnRequest req;
+        GetTxnResponse res;
+        req.set_db_id(db_id);
+        req.set_txn_id(txn_id);
+        service->get_txn(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+        EXPECT_EQ(res.txn_info().status(), TxnStatusPB::TXN_STATUS_PREPARED);
+    }
+    {
+        brpc::Controller cntl;
+        BeginTxnRequest req;
+        BeginTxnResponse res;
+        req.mutable_txn_info()->set_db_id(db_id);
+        req.mutable_txn_info()->set_label(label);
+        req.mutable_txn_info()->add_table_ids(table_id);
+        req.mutable_txn_info()->set_timeout_ms(36000);
+        service->begin_txn(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::TXN_LABEL_ALREADY_USED)
+                << res.ShortDebugString();
+    }
+    {
+        brpc::Controller cntl;
+        AbortTxnRequest req;
+        AbortTxnResponse res;
+        req.set_db_id(db_id);
+        req.set_txn_id(txn_id);
+        req.set_reason("commit conflict retries exceeded");
+        service->abort_txn(&cntl, &req, &res, nullptr);
+        ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.ShortDebugString();
+    }
+    int64_t retry_txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(begin_txn(service.get(), db_id, label, table_id, retry_txn_id));
+    EXPECT_NE(retry_txn_id, txn_id);
+}
+
+TEST(MetaServiceTxnConflictRetryTest, NegativeBaseKeepsTxnStoreRetryPolicy) {
+    ConflictRetryConfigGuard guard;
+    config::enable_retry_txn_conflict = true;
+    config::txn_conflict_retry_times = 10;
+    config::txn_conflict_retry_base_intervals_ms = -1;
+    config::txn_store_retry_times = 2;
+
+    auto service = get_meta_service();
+    int64_t db_id = 7201, table_id = 7202, index_id = 7203, partition_id = 7204,
+            tablet_id = 7205;
+    create_tablet_with_db_id(service.get(), db_id, table_id, index_id, partition_id, tablet_id);
+    int64_t txn_id = 0;
+    ASSERT_NO_FATAL_FAILURE(begin_txn_and_commit_rowset(service.get(), "conflict_negative_base",
+                                                        db_id, table_id, partition_id,
+                                                        tablet_id, &txn_id));
+
+    int attempts = 0;
+    std::vector<uint64_t> sleeps_ms;
+    inject_commit_txn_conflicts(std::numeric_limits<int>::max(), &attempts, &sleeps_ms);
+    int64_t retries_before = g_bvar_ms_txn_conflict_retry.get_value();
+
+    brpc::Controller cntl;
+    CommitTxnRequest req;
+    CommitTxnResponse res;
+    req.set_db_id(db_id);
+    req.set_txn_id(txn_id);
+    service->commit_txn(&cntl, &req, &res, nullptr);
+    ASSERT_EQ(res.status().code(), MetaServiceCode::KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES)
+            << res.ShortDebugString();
+    EXPECT_EQ(attempts, 3);
+    ASSERT_EQ(sleeps_ms.size(), 2UL);
+    // txn_store_retry_* backoff: (1 << n) * base + drift, with the test's base of 1 ms
+    EXPECT_LE(sleeps_ms[0], 2UL);
+    EXPECT_LE(sleeps_ms[1], 3UL);
+    EXPECT_EQ(g_bvar_ms_txn_conflict_retry.get_value(), retries_before);
 }
 
 TEST(MetaServiceTest, GetClusterStatusTest) {
