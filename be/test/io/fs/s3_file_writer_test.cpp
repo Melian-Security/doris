@@ -26,16 +26,20 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <any>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -53,13 +57,18 @@
 #include "io/fs/file_system.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "io/fs/packed_file_system.h"
+#include "io/fs/packed_file_writer.h"
 #include "io/fs/s3_file_bufferpool.h"
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_obj_storage_client.h"
 #include "io/io_common.h"
 #include "runtime/exec_env.h"
 #include "storage/index/index_file_writer.h"
+#include "storage/rowset/rowset_writer_context.h"
+#include "util/defer_op.h"
 #include "util/slice.h"
+#include "util/thread.h"
 #include "util/threadpool.h"
 #include "util/uuid_generator.h"
 
@@ -1551,6 +1560,413 @@ TEST_F(S3FileWriterTest, test_empty_file) {
             std::move(file_writer), false);
     EXPECT_TRUE(index_file_writer->begin_close().ok());
     EXPECT_TRUE(index_file_writer->finish_close().ok());
+}
+
+namespace {
+
+std::string current_pool_thread_name() {
+    auto* t = Thread::current_thread();
+    return t == nullptr ? std::string("<none>") : t->name();
+}
+
+// Records which pool thread served each upload / complete call, and optionally blocks
+// calls for keys containing `gate_marker` until release() or injects per-part latency.
+class PoolRecordingMockClient : public io::SimpleMockObjStorageClient {
+public:
+    io::ObjectStorageResponse put_object(const io::ObjectStoragePathOptions& opts,
+                                         std::string_view stream) override {
+        _on_upload(opts);
+        return SimpleMockObjStorageClient::put_object(opts, stream);
+    }
+
+    io::ObjectStorageUploadResponse upload_part(const io::ObjectStoragePathOptions& opts,
+                                                std::string_view stream, int part_num) override {
+        _on_upload(opts);
+        return SimpleMockObjStorageClient::upload_part(opts, stream, part_num);
+    }
+
+    io::ObjectStorageResponse complete_multipart_upload(
+            const io::ObjectStoragePathOptions& opts,
+            const std::vector<io::ObjectCompleteMultiPart>& completed_parts) override {
+        {
+            std::lock_guard lock(_record_mutex);
+            complete_threads.push_back(current_pool_thread_name());
+        }
+        return SimpleMockObjStorageClient::complete_multipart_upload(opts, completed_parts);
+    }
+
+    void release() {
+        {
+            std::lock_guard lock(_record_mutex);
+            _released = true;
+        }
+        _cv.notify_all();
+    }
+
+    std::vector<std::string> upload_thread_names() {
+        std::lock_guard lock(_record_mutex);
+        return upload_threads;
+    }
+    std::vector<std::string> complete_thread_names() {
+        std::lock_guard lock(_record_mutex);
+        return complete_threads;
+    }
+
+    std::string gate_marker;
+    std::chrono::milliseconds upload_latency {0};
+    std::atomic<int> concurrent_uploads {0};
+    std::atomic<int> peak_concurrent_uploads {0};
+    std::atomic<int> blocked_uploads {0};
+
+private:
+    void _on_upload(const io::ObjectStoragePathOptions& opts) {
+        {
+            std::lock_guard lock(_record_mutex);
+            upload_threads.push_back(current_pool_thread_name());
+        }
+        int now = ++concurrent_uploads;
+        int peak = peak_concurrent_uploads.load();
+        while (now > peak && !peak_concurrent_uploads.compare_exchange_weak(peak, now)) {
+        }
+        if (upload_latency.count() > 0) {
+            std::this_thread::sleep_for(upload_latency);
+        }
+        if (!gate_marker.empty() && opts.path.native().find(gate_marker) != std::string::npos) {
+            ++blocked_uploads;
+            std::unique_lock lock(_record_mutex);
+            _cv.wait(lock, [this] { return _released; });
+            --blocked_uploads;
+        }
+        --concurrent_uploads;
+    }
+
+    std::mutex _record_mutex;
+    std::condition_variable _cv;
+    bool _released = false;
+    std::vector<std::string> upload_threads;
+    std::vector<std::string> complete_threads;
+};
+
+std::unique_ptr<S3FileWriter> make_writer(const std::string& path, bool background,
+                                          const std::shared_ptr<io::ObjStorageClient>& client) {
+    io::FileWriterOptions opts;
+    opts.background_write = background;
+    io::FileWriterPtr file_writer;
+    auto st = s3_fs->create_file(path, &file_writer, &opts);
+    EXPECT_TRUE(st.ok()) << st;
+    std::unique_ptr<S3FileWriter> writer(static_cast<S3FileWriter*>(file_writer.release()));
+    auto holder = std::make_shared<ObjClientHolder>(S3ClientConf {});
+    holder->_client = client;
+    writer->_obj_client = holder;
+    return writer;
+}
+
+bool all_start_with(const std::vector<std::string>& names, const std::string& prefix) {
+    return !names.empty() && std::all_of(names.begin(), names.end(),
+                                         [&](const auto& n) { return n.rfind(prefix, 0) == 0; });
+}
+
+std::unique_ptr<ThreadPool> build_pool(const std::string& name, int threads) {
+    std::unique_ptr<ThreadPool> pool;
+    EXPECT_TRUE(ThreadPoolBuilder(name)
+                        .set_min_threads(threads)
+                        .set_max_threads(threads)
+                        .build(&pool)
+                        .ok());
+    return pool;
+}
+
+} // namespace
+
+class S3FileWriterPoolTest : public S3FileWriterTest {
+protected:
+    void SetUp() override {
+        _saved_enable_file_cache = config::enable_file_cache;
+        _saved_enable_separate = config::enable_separate_compaction_s3_upload_pool;
+        _saved_max_inflight = config::compaction_s3_upload_max_inflight_parts;
+        config::enable_file_cache = false;
+        config::enable_separate_compaction_s3_upload_pool = true;
+        config::compaction_s3_upload_max_inflight_parts = 0;
+        auto sp = SyncPoint::get_instance();
+        sp->enable_processing();
+        sp->clear_all_call_backs();
+    }
+    void TearDown() override {
+        ExecEnv::GetInstance()->set_compaction_s3_file_upload_thread_pool(nullptr);
+        ExecEnv::GetInstance()->set_compaction_non_block_close_thread_pool(nullptr);
+        config::enable_file_cache = _saved_enable_file_cache;
+        config::enable_separate_compaction_s3_upload_pool = _saved_enable_separate;
+        config::compaction_s3_upload_max_inflight_parts = _saved_max_inflight;
+    }
+    void install_compaction_pools(int upload_threads, int close_threads) {
+        ExecEnv::GetInstance()->set_compaction_s3_file_upload_thread_pool(
+                build_pool("TestCompactionUpload", upload_threads));
+        ExecEnv::GetInstance()->set_compaction_non_block_close_thread_pool(
+                build_pool("TestCompactionClose", close_threads));
+    }
+
+    bool _saved_enable_file_cache = false;
+    bool _saved_enable_separate = true;
+    int64_t _saved_max_inflight = 0;
+};
+
+TEST_F(S3FileWriterPoolTest, compaction_and_load_writers_use_separate_pools) {
+    install_compaction_pools(4, 2);
+    std::string part(config::s3_write_buffer_size, 'x');
+
+    auto run = [&](const std::string& path, bool background) {
+        auto client = std::make_shared<PoolRecordingMockClient>();
+        auto writer = make_writer(path, background, client);
+        for (int i = 0; i < 2; ++i) {
+            EXPECT_TRUE(writer->append(part).ok());
+        }
+        EXPECT_TRUE(writer->append(Slice("tail", 4)).ok());
+        EXPECT_TRUE(writer->close(true).ok());
+        EXPECT_TRUE(writer->close().ok());
+        EXPECT_EQ(client->upload_part_count, 3);
+        return std::make_tuple(writer->uses_background_pools(), client->upload_thread_names(),
+                               client->complete_thread_names());
+    };
+
+    auto [load_bg, load_uploads, load_completes] = run("load_seg.dat", false);
+    EXPECT_FALSE(load_bg);
+    EXPECT_TRUE(all_start_with(load_uploads, "s3_upload_file_thread_pool"));
+    EXPECT_TRUE(all_start_with(load_completes, "NonBlockCloseThreadPool"));
+
+    auto [comp_bg, comp_uploads, comp_completes] = run("compaction_seg.dat", true);
+    EXPECT_TRUE(comp_bg);
+    EXPECT_TRUE(all_start_with(comp_uploads, "TestCompactionUpload"));
+    EXPECT_TRUE(all_start_with(comp_completes, "TestCompactionClose"));
+
+    // Disabled: background writers fall back to the shared pools.
+    config::enable_separate_compaction_s3_upload_pool = false;
+    auto [off_bg, off_uploads, off_completes] = run("compaction_seg_off.dat", true);
+    EXPECT_FALSE(off_bg);
+    EXPECT_TRUE(all_start_with(off_uploads, "s3_upload_file_thread_pool"));
+    EXPECT_TRUE(all_start_with(off_completes, "NonBlockCloseThreadPool"));
+}
+
+TEST_F(S3FileWriterPoolTest, compaction_falls_back_when_pools_absent) {
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    auto writer = make_writer("compaction_no_pool.dat", true, client);
+    std::string part(config::s3_write_buffer_size, 'y');
+    EXPECT_TRUE(writer->append(part).ok());
+    EXPECT_TRUE(writer->append(part).ok());
+    EXPECT_TRUE(writer->close(true).ok());
+    EXPECT_TRUE(writer->close().ok());
+    EXPECT_TRUE(all_start_with(client->upload_thread_names(), "s3_upload_file_thread_pool"));
+    EXPECT_EQ(io::UploadBufferInflightLimiter::compaction()->inflight(), 0);
+}
+
+TEST_F(S3FileWriterPoolTest, inflight_limiter_blocks_at_limit) {
+    std::atomic<int64_t> limit {2};
+    io::UploadBufferInflightLimiter limiter([&] { return limit.load(); });
+    auto p1 = limiter.acquire();
+    auto p2 = limiter.acquire();
+    EXPECT_EQ(limiter.inflight(), 2);
+
+    std::atomic<bool> acquired {false};
+    std::thread t([&] {
+        auto p3 = limiter.acquire();
+        acquired = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(acquired.load());
+    EXPECT_EQ(limiter.waiters(), 1);
+    p1.reset();
+    t.join();
+    EXPECT_TRUE(acquired.load());
+    EXPECT_EQ(limiter.inflight(), 1);
+
+    // Raising the limit at runtime wakes a blocked waiter without any release.
+    limit = 1;
+    std::atomic<bool> acquired2 {false};
+    std::thread t2([&] {
+        auto p = limiter.acquire();
+        acquired2 = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(acquired2.load());
+    limit = 0; // unbounded
+    t2.join();
+    EXPECT_TRUE(acquired2.load());
+    p2.reset();
+    EXPECT_EQ(limiter.inflight(), 0);
+}
+
+TEST_F(S3FileWriterPoolTest, inflight_cap_bounds_concurrent_compaction_parts) {
+    install_compaction_pools(8, 4);
+    config::compaction_s3_upload_max_inflight_parts = 2;
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    client->upload_latency = std::chrono::milliseconds(50);
+    std::string part(config::s3_write_buffer_size, 'z');
+
+    constexpr int kWriters = 4;
+    constexpr int kParts = 4;
+    std::atomic<int64_t> peak_inflight {0};
+    std::atomic<bool> stop_sampling {false};
+    std::thread sampler([&] {
+        while (!stop_sampling) {
+            auto v = io::UploadBufferInflightLimiter::compaction()->inflight();
+            auto p = peak_inflight.load();
+            while (v > p && !peak_inflight.compare_exchange_weak(p, v)) {
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::vector<std::thread> writers;
+    std::atomic<int> ok {0};
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w] {
+            auto writer = make_writer(fmt::format("compaction_cap_{}.dat", w), true, client);
+            bool good = true;
+            for (int i = 0; i < kParts; ++i) {
+                good &= writer->append(part).ok();
+            }
+            good &= writer->close(true).ok();
+            good &= writer->close().ok();
+            ok += good;
+        });
+    }
+    for (auto& t : writers) {
+        t.join();
+    }
+    stop_sampling = true;
+    sampler.join();
+
+    EXPECT_EQ(ok.load(), kWriters);
+    EXPECT_EQ(client->upload_part_count, kWriters * kParts);
+    EXPECT_LE(client->peak_concurrent_uploads.load(), 2);
+    EXPECT_GE(client->peak_concurrent_uploads.load(), 1);
+    EXPECT_LE(peak_inflight.load(), 2);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::compaction()->inflight(), 0);
+}
+
+// Compaction writers whose uploads hang must not delay a load writer's close: with the
+// separate pools a load close finishes while every compaction close is still pending.
+// With the feature off the same burst fills the shared upload pool and the load close
+// stalls behind it.
+TEST_F(S3FileWriterPoolTest, saturated_compaction_pool_does_not_delay_load_close) {
+    constexpr int kCompactionWriters = 12; // > the shared test upload pool's 10 threads
+    std::string part(config::s3_write_buffer_size, 'c');
+
+    auto run = [&](bool separate) -> std::pair<bool, bool> {
+        config::enable_separate_compaction_s3_upload_pool = separate;
+        install_compaction_pools(2, 2);
+        auto client = std::make_shared<PoolRecordingMockClient>();
+        client->gate_marker = "compaction_";
+        Defer release {[&] { client->release(); }};
+
+        std::vector<std::unique_ptr<S3FileWriter>> compaction_writers;
+        for (int i = 0; i < kCompactionWriters; ++i) {
+            auto writer =
+                    make_writer(fmt::format("compaction_{}_{}.dat", separate, i), true, client);
+            EXPECT_TRUE(writer->append(Slice("small", 5)).ok());
+            EXPECT_TRUE(writer->close(true).ok());
+            compaction_writers.push_back(std::move(writer));
+        }
+        // Wait until the burst occupies its upload threads.
+        int expected_blocked = separate ? 2 : 10;
+        for (int i = 0; i < 500 && client->blocked_uploads.load() < expected_blocked; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_EQ(client->blocked_uploads.load(), expected_blocked);
+
+        auto load_writer = make_writer(fmt::format("load_{}.dat", separate), false, client);
+        EXPECT_TRUE(load_writer->append(part).ok());
+        EXPECT_TRUE(load_writer->append(part).ok());
+        EXPECT_TRUE(load_writer->close(true).ok());
+        auto load_close = std::async(std::launch::async, [&] { return load_writer->close(); });
+        bool load_finished_quickly =
+                load_close.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+        bool compaction_pending = std::none_of(compaction_writers.begin(), compaction_writers.end(),
+                                               [](auto& w) { return w->try_finish_close().ok(); });
+
+        client->release();
+        EXPECT_TRUE(load_close.get().ok());
+        for (auto& w : compaction_writers) {
+            auto st = w->close();
+            EXPECT_TRUE(st.ok() || w->state() == io::FileWriter::State::CLOSED) << st;
+        }
+        compaction_writers.clear();
+        return {load_finished_quickly, compaction_pending};
+    };
+
+    auto [separate_fast, separate_pending] = run(true);
+    EXPECT_TRUE(separate_fast);
+    EXPECT_TRUE(separate_pending);
+
+    auto [shared_fast, shared_pending] = run(false);
+    EXPECT_FALSE(shared_fast);
+    EXPECT_TRUE(shared_pending);
+}
+
+// Every file a compaction writes - segment, inverted index, and the small segment-0 files
+// that load would route through a shared packed file - must reach S3 on the compaction pools.
+TEST_F(S3FileWriterPoolTest, compaction_segment_index_and_packed_files_use_compaction_pool) {
+    install_compaction_pools(4, 2);
+    auto packed_fs = std::make_shared<io::PackedFileSystem>(s3_fs);
+    std::string part(config::s3_write_buffer_size, 'p');
+
+    auto options_for = [](DataWriteType type, FileType file_type) {
+        RowsetWriterContext ctx;
+        ctx.write_type = type;
+        return ctx.get_file_writer_options(file_type);
+    };
+    for (auto type : {DataWriteType::TYPE_COMPACTION, DataWriteType::TYPE_SCHEMA_CHANGE}) {
+        EXPECT_TRUE(options_for(type, FileType::SEGMENT_FILE).background_write);
+        EXPECT_TRUE(options_for(type, FileType::INVERTED_INDEX_FILE).background_write);
+    }
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_DIRECT, FileType::SEGMENT_FILE).background_write);
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_DIRECT, FileType::INVERTED_INDEX_FILE)
+                         .background_write);
+
+    struct Case {
+        std::string path;
+        FileType file_type;
+        size_t bytes;
+    };
+    std::vector<Case> cases {
+            {"compaction_rs_0.dat", FileType::SEGMENT_FILE, 2 * part.size() + 7}, // packed-eligible
+            {"compaction_rs_0.idx", FileType::INVERTED_INDEX_FILE, 1024}, // small, packed-eligible
+            {"compaction_rs_3.dat", FileType::SEGMENT_FILE, 2 * part.size()},
+            {"compaction_rs_3.idx", FileType::INVERTED_INDEX_FILE, 1024},
+    };
+    for (const auto& c : cases) {
+        auto opts = options_for(DataWriteType::TYPE_COMPACTION, c.file_type);
+        io::FileWriterPtr file_writer;
+        ASSERT_TRUE(packed_fs->create_file(c.path, &file_writer, &opts).ok());
+        auto* s3_writer = dynamic_cast<S3FileWriter*>(file_writer.get());
+        ASSERT_NE(s3_writer, nullptr) << c.path << " was wrapped in a shared packed file";
+        EXPECT_TRUE(s3_writer->uses_background_pools()) << c.path;
+
+        auto client = std::make_shared<PoolRecordingMockClient>();
+        auto holder = std::make_shared<ObjClientHolder>(S3ClientConf {});
+        holder->_client = client;
+        s3_writer->_obj_client = holder;
+        for (size_t left = c.bytes; left > 0;) {
+            size_t n = std::min(left, part.size());
+            ASSERT_TRUE(file_writer->append(Slice(part.data(), n)).ok());
+            left -= n;
+        }
+        ASSERT_TRUE(file_writer->close(true).ok());
+        ASSERT_TRUE(file_writer->close().ok());
+        EXPECT_TRUE(all_start_with(client->upload_thread_names(), "TestCompactionUpload"))
+                << c.path;
+        auto completes = client->complete_thread_names();
+        if (!completes.empty()) {
+            EXPECT_TRUE(all_start_with(completes, "TestCompactionClose")) << c.path;
+        }
+    }
+
+    // The same segment-0 files written by a load still join the packed file.
+    for (auto file_type : {FileType::SEGMENT_FILE, FileType::INVERTED_INDEX_FILE}) {
+        auto opts = options_for(DataWriteType::TYPE_DIRECT, file_type);
+        io::FileWriterPtr file_writer;
+        auto path = file_type == FileType::SEGMENT_FILE ? "load_rs_0.dat" : "load_rs_0.idx";
+        ASSERT_TRUE(packed_fs->create_file(path, &file_writer, &opts).ok());
+        EXPECT_NE(dynamic_cast<io::PackedFileWriter*>(file_writer.get()), nullptr) << path;
+    }
 }
 
 } // namespace doris

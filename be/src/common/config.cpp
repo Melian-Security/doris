@@ -1756,6 +1756,11 @@ DEFINE_mInt64(hdfs_jni_write_sleep_milliseconds, "300");
 // The max retry times when hdfs write failed
 DEFINE_mInt64(hdfs_jni_write_max_retry_time, "3");
 
+DEFINE_mBool(enable_separate_compaction_s3_upload_pool, "true");
+DEFINE_Int64(compaction_s3_upload_thread_num, "64");
+DEFINE_Int64(compaction_nonblock_close_thread_num, "64");
+DEFINE_mInt64(compaction_s3_upload_max_inflight_parts, "256");
+
 // The min thread num for NonBlockCloseThreadPool
 DEFINE_Int64(min_nonblock_close_thread_num, "12");
 // The max thread num for NonBlockCloseThreadPool

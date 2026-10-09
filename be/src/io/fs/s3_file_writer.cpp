@@ -55,6 +55,12 @@ bvar::Adder<uint64_t> s3_file_being_written("s3_file_writer_file_being_written")
 bvar::Adder<uint64_t> s3_file_writer_async_close_queuing("s3_file_writer_async_close_queuing");
 bvar::Adder<uint64_t> s3_file_writer_async_close_processing(
         "s3_file_writer_async_close_processing");
+bvar::Adder<uint64_t> s3_file_writer_load_parts("s3_file_writer_load_parts");
+bvar::Adder<uint64_t> s3_file_writer_background_parts("s3_file_writer_background_parts");
+bvar::Adder<uint64_t> s3_file_writer_compaction_async_close_queuing(
+        "s3_file_writer_compaction_async_close_queuing");
+bvar::Adder<uint64_t> s3_file_writer_compaction_async_close_processing(
+        "s3_file_writer_compaction_async_close_processing");
 bvar::IntRecorder s3_file_writer_first_append_to_close_ms_recorder;
 bvar::Window<bvar::IntRecorder> s3_file_writer_first_append_to_close_ms_window(
         "s3_file_writer_first_append_to_close_ms",
@@ -66,6 +72,8 @@ S3FileWriter::S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string 
                                   .bucket = std::move(bucket),
                                   .key = std::move(key)}),
           _used_by_s3_committer(opts ? opts->used_by_s3_committer : false),
+          _background_write(opts != nullptr && opts->background_write &&
+                            config::enable_separate_compaction_s3_upload_pool),
           _obj_client(std::move(client)) {
     s3_file_writer_total << 1;
     s3_file_being_written << 1;
@@ -91,6 +99,24 @@ S3FileWriter::~S3FileWriter() {
         s3_bytes_written_total << _bytes_appended;
     }
     s3_file_being_written << -1;
+}
+
+ThreadPool* S3FileWriter::_upload_thread_pool() const {
+    if (_background_write) {
+        if (auto* pool = ExecEnv::GetInstance()->compaction_s3_file_upload_thread_pool()) {
+            return pool;
+        }
+    }
+    return ExecEnv::GetInstance()->s3_file_upload_thread_pool();
+}
+
+ThreadPool* S3FileWriter::_close_thread_pool() const {
+    if (_background_write) {
+        if (auto* pool = ExecEnv::GetInstance()->compaction_non_block_close_thread_pool()) {
+            return pool;
+        }
+    }
+    return ExecEnv::GetInstance()->non_block_close_thread_pool();
 }
 
 Status S3FileWriter::_create_multi_upload_request() {
@@ -152,23 +178,26 @@ Status S3FileWriter::close(bool non_block) {
         _state = State::ASYNC_CLOSING;
         _async_close_pack = std::make_unique<AsyncCloseStatusPack>();
         _async_close_pack->future = _async_close_pack->promise.get_future();
-        s3_file_writer_async_close_queuing << 1;
+        auto* queuing = _background_write ? &s3_file_writer_compaction_async_close_queuing
+                                          : &s3_file_writer_async_close_queuing;
+        auto* processing = _background_write ? &s3_file_writer_compaction_async_close_processing
+                                             : &s3_file_writer_async_close_processing;
+        *queuing << 1;
         Status submit_status = Status::OK();
         DBUG_EXECUTE_IF("S3FileWriter.close.submit_async_close.inject_error", {
             submit_status = Status::IOError("S3FileWriter.close.submit_async_close.inject_error");
         });
         if (submit_status.ok()) {
-            submit_status =
-                    ExecEnv::GetInstance()->non_block_close_thread_pool()->submit_func([&]() {
-                        s3_file_writer_async_close_queuing << -1;
-                        s3_file_writer_async_close_processing << 1;
-                        _st = _close_impl();
-                        _async_close_pack->promise.set_value(_st);
-                        s3_file_writer_async_close_processing << -1;
-                    });
+            submit_status = _close_thread_pool()->submit_func([this, queuing, processing]() {
+                *queuing << -1;
+                *processing << 1;
+                _st = _close_impl();
+                _async_close_pack->promise.set_value(_st);
+                *processing << -1;
+            });
         }
         if (!submit_status.ok()) {
-            s3_file_writer_async_close_queuing << -1;
+            *queuing << -1;
             LOG(WARNING) << "failed to submit async close for "
                          << _obj_storage_path_opts.path.native()
                          << ", fallback to sync close, status=" << submit_status;
@@ -241,6 +270,7 @@ bool S3FileWriter::_complete_part_task_callback(Status s) {
 Status S3FileWriter::_build_upload_buffer() {
     auto builder = FileBufferBuilder();
     builder.set_type(BufferType::UPLOAD)
+            .set_upload_thread_pool(_upload_thread_pool())
             .set_upload_callback([part_num = _cur_part_num, this](UploadFileBuffer& buf) {
                 _upload_one_part(part_num, buf);
             })
@@ -268,6 +298,14 @@ Status S3FileWriter::_build_upload_buffer() {
 }
 
 Status S3FileWriter::_submit_upload_buffer(const std::shared_ptr<FileBuffer>& buf) {
+    if (_background_write) {
+        // Taken before add_count(): the permits this may wait on belong to already
+        // submitted buffers, which complete without this writer making progress.
+        buf->set_inflight_permit(UploadBufferInflightLimiter::compaction()->acquire());
+        s3_file_writer_background_parts << 1;
+    } else {
+        s3_file_writer_load_parts << 1;
+    }
     _countdown_event.add_count();
     DBUG_EXECUTE_IF("S3FileWriter.submit_upload_buffer.inject_error", {
         auto st = Status::IOError("S3FileWriter.submit_upload_buffer.inject_error");

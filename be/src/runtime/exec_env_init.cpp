@@ -303,6 +303,25 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths,
                               .set_min_threads(cast_set<int>(config::min_nonblock_close_thread_num))
                               .set_max_threads(cast_set<int>(config::max_nonblock_close_thread_num))
                               .build(&_non_block_close_thread_pool));
+    {
+        auto num_cores = static_cast<int64_t>(doris::CpuInfo::num_cores());
+        auto upload_threads = config::compaction_s3_upload_thread_num > 0
+                                      ? config::compaction_s3_upload_thread_num
+                                      : num_cores;
+        auto close_threads = config::compaction_nonblock_close_thread_num > 0
+                                     ? config::compaction_nonblock_close_thread_num
+                                     : num_cores;
+        static_cast<void>(
+                ThreadPoolBuilder("CompactionS3FileUploadThreadPool")
+                        .set_min_threads(cast_set<int>(std::min<int64_t>(16, upload_threads)))
+                        .set_max_threads(cast_set<int>(upload_threads))
+                        .build(&_compaction_s3_file_upload_thread_pool));
+        static_cast<void>(
+                ThreadPoolBuilder("CompactionNonBlockCloseThreadPool")
+                        .set_min_threads(cast_set<int>(std::min<int64_t>(8, close_threads)))
+                        .set_max_threads(cast_set<int>(close_threads))
+                        .build(&_compaction_non_block_close_thread_pool));
+    }
     static_cast<void>(ThreadPoolBuilder("S3FileSystemThreadPool")
                               .set_min_threads(config::min_s3_file_system_thread_num)
                               .set_max_threads(config::max_s3_file_system_thread_num)
@@ -894,6 +913,8 @@ void ExecEnv::destroy() {
     SAFE_SHUTDOWN(_s3_file_upload_thread_pool);
     SAFE_SHUTDOWN(_lazy_release_obj_pool);
     SAFE_SHUTDOWN(_non_block_close_thread_pool);
+    SAFE_SHUTDOWN(_compaction_non_block_close_thread_pool);
+    SAFE_SHUTDOWN(_compaction_s3_file_upload_thread_pool);
     SAFE_SHUTDOWN(_s3_file_system_thread_pool);
     SAFE_SHUTDOWN(_peer_race_s3_thread_pool);
     SAFE_SHUTDOWN(_send_batch_thread_pool);
@@ -950,6 +971,8 @@ void ExecEnv::destroy() {
     // TODO(zhiqiang): Maybe we should call shutdown before release thread pool?
     _lazy_release_obj_pool.reset(nullptr);
     _non_block_close_thread_pool.reset(nullptr);
+    _compaction_non_block_close_thread_pool.reset(nullptr);
+    _compaction_s3_file_upload_thread_pool.reset(nullptr);
     _s3_file_system_thread_pool.reset(nullptr);
     _peer_race_s3_thread_pool.reset(nullptr);
     _send_table_stats_thread_pool.reset(nullptr);
