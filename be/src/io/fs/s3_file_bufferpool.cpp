@@ -128,7 +128,7 @@ struct Memory : boost::noncopyable, Allocator {
 
 struct FileBuffer::PartData {
     Memory<> _memory;
-    PartData() : _memory(config::s3_write_buffer_size) {}
+    explicit PartData(size_t capacity) : _memory(capacity) {}
     ~PartData() = default;
     [[nodiscard]] Slice data() const { return Slice {_memory._data, _memory._size}; }
     [[nodiscard]] size_t size() const { return _memory._size; }
@@ -139,13 +139,14 @@ Slice FileBuffer::get_slice() const {
 }
 
 FileBuffer::FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> alloc_holder,
-                       size_t offset, OperationState state)
+                       size_t offset, OperationState state, size_t capacity)
         : _type(type),
           _alloc_holder(std::move(alloc_holder)),
           _offset(offset),
           _size(0),
           _state(std::move(state)),
-          _inner_data(std::make_unique<FileBuffer::PartData>()),
+          _inner_data(std::make_unique<FileBuffer::PartData>(
+                  capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size))),
           _capacity(_inner_data->size()) {}
 
 FileBuffer::~FileBuffer() {
@@ -160,6 +161,10 @@ FileBuffer::~FileBuffer() {
 Status UploadFileBuffer::append_data(const Slice& data) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("UploadFileBuffer::append_data", Status::OK(), this,
                                       data.get_size());
+    if (data.get_size() > _capacity - _size) [[unlikely]] {
+        return Status::InternalError("append {} bytes to upload buffer of {}/{} bytes",
+                                     data.get_size(), _size, _capacity);
+    }
     std::memcpy((void*)(_inner_data->data().get_data() + _size), data.get_data(), data.get_size());
     _size += data.get_size();
     _crc_value = crc32c::Extend(_crc_value, (const uint8_t*)data.get_data(), data.get_size());
@@ -313,7 +318,7 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
         std::shared_ptr<UploadFileBuffer> upload_buf;
         RETURN_IF_CATCH_EXCEPTION(upload_buf = std::make_shared<UploadFileBuffer>(
                                           std::move(_upload_cb), std::move(state), _offset,
-                                          std::move(_alloc_holder_cb)));
+                                          std::move(_alloc_holder_cb), _buffer_size));
         upload_buf->set_upload_thread_pool(_upload_thread_pool);
         *buf = std::move(upload_buf);
         return Status::OK();
@@ -323,7 +328,7 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
                                           std::move(_download),
                                           std::move(_write_to_local_file_cache),
                                           std::move(_write_to_use_buffer), std::move(state),
-                                          _offset, std::move(_alloc_holder_cb)));
+                                          _offset, std::move(_alloc_holder_cb), _buffer_size));
         return Status::OK();
     }
     // should never come here

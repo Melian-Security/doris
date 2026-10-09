@@ -134,8 +134,9 @@ struct OperationState {
 };
 
 struct FileBuffer {
+    // capacity 0 means config::s3_write_buffer_size at construction.
     FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> alloc_holder, size_t offset,
-               OperationState state);
+               OperationState state, size_t capacity = 0);
     virtual ~FileBuffer();
     /**
     * submit the correspoding task to async executor
@@ -198,8 +199,9 @@ struct DownloadFileBuffer final : public FileBuffer {
     DownloadFileBuffer(std::function<Status(Slice&)> download,
                        std::function<void(FileBlocksHolderPtr, Slice)> write_to_cache,
                        std::function<void(Slice, size_t)> write_to_use_buffer, OperationState state,
-                       size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder)
-            : FileBuffer(BufferType::DOWNLOAD, alloc_holder, offset, state),
+                       size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder,
+                       size_t capacity = 0)
+            : FileBuffer(BufferType::DOWNLOAD, alloc_holder, offset, state, capacity),
               _download(std::move(download)),
               _write_to_local_file_cache(std::move(write_to_cache)),
               _write_to_use_buffer(std::move(write_to_use_buffer)) {}
@@ -218,8 +220,9 @@ struct DownloadFileBuffer final : public FileBuffer {
 
 struct UploadFileBuffer final : public FileBuffer {
     UploadFileBuffer(std::function<void(UploadFileBuffer&)> upload_cb, OperationState state,
-                     size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder)
-            : FileBuffer(BufferType::UPLOAD, alloc_holder, offset, state),
+                     size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder,
+                     size_t capacity = 0)
+            : FileBuffer(BufferType::UPLOAD, alloc_holder, offset, state, capacity),
               _upload_to_remote(std::move(upload_cb)) {}
     ~UploadFileBuffer() override = default;
     Status append_data(const Slice& s) override;
@@ -341,6 +344,11 @@ struct FileBufferBuilder {
         _offset = offset;
         return *this;
     }
+    // Capacity of the buffer's memory; 0 means config::s3_write_buffer_size at build time.
+    FileBufferBuilder& set_buffer_size(size_t size) {
+        _buffer_size = size;
+        return *this;
+    }
     /**
     * set the callback which write the content into local file cache
     *
@@ -371,6 +379,7 @@ struct FileBufferBuilder {
     std::function<void(Slice, size_t)> _write_to_use_buffer;
     size_t _offset;
     ThreadPool* _upload_thread_pool = nullptr;
+    size_t _buffer_size = 0;
 };
 } // namespace io
 } // namespace doris

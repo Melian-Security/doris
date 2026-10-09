@@ -71,6 +71,7 @@ S3FileWriter::S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string 
         : _obj_storage_path_opts({.path = fmt::format("s3://{}/{}", bucket, key),
                                   .bucket = std::move(bucket),
                                   .key = std::move(key)}),
+          _buffer_size(config::s3_write_buffer_size),
           _used_by_s3_committer(opts ? opts->used_by_s3_committer : false),
           _background_write(opts != nullptr && opts->background_write &&
                             config::enable_separate_compaction_s3_upload_pool),
@@ -275,6 +276,7 @@ Status S3FileWriter::_build_upload_buffer() {
                 _upload_one_part(part_num, buf);
             })
             .set_file_offset(_bytes_appended)
+            .set_buffer_size(_buffer_size)
             .set_sync_after_complete_task([this](auto&& PH1) {
                 return _complete_part_task_callback(std::forward<decltype(PH1)>(PH1));
             })
@@ -285,11 +287,11 @@ Status S3FileWriter::_build_upload_buffer() {
         // try to do writing into file cache, so we make the lambda capture the variable
         // we need by value to extend their lifetime
         int64_t id = get_tablet_id(_obj_storage_path_opts.path.native()).value_or(0);
-        builder.set_allocate_file_blocks_holder([builder = *_cache_builder,
-                                                 offset = _bytes_appended,
-                                                 tablet_id = id]() -> FileBlocksHolderPtr {
-            return builder.allocate_cache_holder(offset, config::s3_write_buffer_size, tablet_id);
-        });
+        builder.set_allocate_file_blocks_holder(
+                [builder = *_cache_builder, offset = _bytes_appended, buffer_size = _buffer_size,
+                 tablet_id = id]() -> FileBlocksHolderPtr {
+                    return builder.allocate_cache_holder(offset, buffer_size, tablet_id);
+                });
     }
     RETURN_IF_ERROR(builder.build(&_pending_buf));
     auto* buf = dynamic_cast<UploadFileBuffer*>(_pending_buf.get());
@@ -369,7 +371,7 @@ Status S3FileWriter::appendv(const Slice* data, size_t data_cnt) {
         _first_append_timestamp = std::chrono::steady_clock::now();
     }
 
-    size_t buffer_size = config::s3_write_buffer_size;
+    const size_t buffer_size = _buffer_size;
     TEST_SYNC_POINT_RETURN_WITH_VALUE("s3_file_writer::appenv", Status());
     for (size_t i = 0; i < data_cnt; i++) {
         size_t data_size = data[i].get_size();
@@ -516,13 +518,13 @@ Status S3FileWriter::_complete() {
     }
 
     // check number of parts
-    int64_t expected_num_parts1 = (_bytes_appended / config::s3_write_buffer_size) +
-                                  !!(_bytes_appended % config::s3_write_buffer_size);
+    int64_t expected_num_parts1 =
+            (_bytes_appended / _buffer_size) + !!(_bytes_appended % _buffer_size);
     int64_t expected_num_parts2 =
-            (_bytes_appended % config::s3_write_buffer_size) ? _cur_part_num : _cur_part_num - 1;
+            (_bytes_appended % _buffer_size) ? _cur_part_num : _cur_part_num - 1;
     DCHECK_EQ(expected_num_parts1, expected_num_parts2)
             << " bytes_appended=" << _bytes_appended << " cur_part_num=" << _cur_part_num
-            << " s3_write_buffer_size=" << config::s3_write_buffer_size;
+            << " s3_write_buffer_size=" << _buffer_size;
     if (_failed || _completed_parts.size() != static_cast<size_t>(expected_num_parts1) ||
         expected_num_parts1 != expected_num_parts2) {
         _st = Status::InternalError(
@@ -540,7 +542,7 @@ Status S3FileWriter::_complete() {
     TEST_SYNC_POINT_CALLBACK("S3FileWriter::_complete:2", &_completed_parts);
     LOG(INFO) << "complete_multipart_upload " << _obj_storage_path_opts.path.native()
               << " size=" << _bytes_appended << " number_parts=" << _completed_parts.size()
-              << " s3_write_buffer_size=" << config::s3_write_buffer_size;
+              << " s3_write_buffer_size=" << _buffer_size;
     auto resp = client->complete_multipart_upload(_obj_storage_path_opts, _completed_parts);
     if (resp.status.code != ErrorCode::OK) {
         LOG_WARNING("failed to complete multipart upload, err={}, file_path={}", resp.status.msg,
