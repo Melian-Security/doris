@@ -15,6 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <typeinfo>
+
 #include <arrow/flight/client.h>
 #include <arrow/flight/sql/client.h>
 #include <arrow/scalar.h>
@@ -131,6 +143,36 @@ void init_signals() {
     if (ret < 0) {
         exit(-1);
     }
+}
+
+// Prints the frames that led to std::terminate as module+offset before anything slow runs: the
+// failure signal handler that std::abort triggers symbolizes against the full debug binary and
+// can take minutes, and the core dump that follows may never finish, which leaves no stack at all.
+// The offsets can be symbolized offline with addr2line against the same binary.
+[[noreturn]] void terminate_with_raw_backtrace() {
+    constexpr size_t kLineSize = 512;
+    char line[kLineSize];
+    auto emit = [&line](int len) {
+        if (len > 0) {
+            static_cast<void>(::write(STDERR_FILENO, line, std::min<size_t>(len, kLineSize - 1)));
+        }
+    };
+    const std::type_info* exception_type = abi::__cxa_current_exception_type();
+    emit(snprintf(line, sizeof(line), "*** std::terminate, exception type: %s ***\n",
+                        exception_type != nullptr ? exception_type->name() : "none"));
+    void* frames[128];
+    int depth = backtrace(frames, 128);
+    for (int i = 0; i < depth; ++i) {
+        Dl_info info;
+        if (dladdr(frames[i], &info) != 0 && info.dli_fname != nullptr) {
+            emit(snprintf(line, sizeof(line), "  #%d %s+0x%lx\n", i, info.dli_fname,
+                                static_cast<unsigned long>(reinterpret_cast<uintptr_t>(frames[i]) -
+                                                           reinterpret_cast<uintptr_t>(info.dli_fbase))));
+        } else {
+            emit(snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]));
+        }
+    }
+    std::abort();
 }
 
 static void thrift_output(const char* x) {
@@ -335,6 +377,7 @@ struct Checker {
 
 int main(int argc, char** argv) {
     doris::signal::InstallFailureSignalHandler();
+    std::set_terminate(doris::terminate_with_raw_backtrace);
     // create StackTraceCache Instance, at the beginning, other static destructors may use.
     StackTrace::createCache();
     // extern doris::ErrorCode::ErrorCodeInitializer error_code_init;
