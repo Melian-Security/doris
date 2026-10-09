@@ -234,9 +234,15 @@ Status CloudSnapshotMgr::_create_rowset_meta(
     }
     rowset_id_mapping[src_rs_id] = dst_rs_id;
 
+    // The restore loader writes each file to `remote_tablet_path(target) + '/' + dst file`, so dst
+    // names are relative to the tablet directory in the target vault's layout: `<rowset>_<seg>.dat`
+    // in path version 0, `<rowset>/<seg>.dat` in path version 1. Source names are the snapshot's.
+    const std::string dst_tablet_dir = storage_resource.remote_tablet_path(target_tablet_id) + '/';
     for (int i = 0; i < source_meta_pb.num_segments(); ++i) {
         std::string src_segment_file = fmt::format("{}_{}.dat", src_rs_id.to_string(), i);
-        std::string dst_segment_file = fmt::format("{}_{}.dat", dst_rs_id.to_string(), i);
+        std::string dst_segment_file =
+                storage_resource.remote_segment_path(target_tablet_id, dst_rs_id.to_string(), i)
+                        .substr(dst_tablet_dir.size());
         file_mapping[src_segment_file] = dst_segment_file;
         if (context.tablet_schema->get_inverted_index_storage_format() ==
             InvertedIndexStorageFormatPB::V1) {
