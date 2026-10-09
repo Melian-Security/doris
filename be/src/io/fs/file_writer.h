@@ -52,6 +52,10 @@ struct FileWriterOptions {
     // Compaction / schema change output. Remote writers route such writes to background
     // IO pools so they cannot delay load writes.
     bool background_write = false;
+    // Local files only: on close, wait for this file's writeback and drop its pages from the page
+    // cache, so data written once and read rarely does not hold dirty pages against the memory
+    // limit.
+    bool drop_page_cache_on_close = false;
 };
 
 struct AsyncCloseStatusPack {

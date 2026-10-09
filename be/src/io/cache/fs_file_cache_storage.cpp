@@ -232,7 +232,9 @@ Status FSFileCacheStorage::get_or_create_file_writer(const FileCacheKey& key, Fi
     std::string dir = get_path_in_local_cache_v3(key.hash);
     std::string tmp_file = get_path_in_local_cache_v3(dir, key.offset, true);
     FileWriterPtr file_writer;
-    FileWriterOptions opts {.sync_file_data = false};
+    FileWriterOptions opts {.sync_file_data = false,
+                            .drop_page_cache_on_close =
+                                    config::file_cache_drop_page_cache_after_write};
     // The removal of the last block of another offset under this hash may rmdir the directory
     // between create_directory and create_file; recreate it once in that case.
     for (int attempt = 0;; ++attempt) {

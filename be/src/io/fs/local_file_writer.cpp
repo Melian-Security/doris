@@ -18,6 +18,7 @@
 #include "io/fs/local_file_writer.h"
 
 #include <butil/iobuf.h>
+#include <bvar/bvar.h>
 
 // IWYU pragma: no_include <bthread/errno.h>
 #include <errno.h> // IWYU pragma: keep
@@ -44,9 +45,17 @@
 #include "io/fs/path.h"
 #include "storage/data_dir.h"
 #include "util/debug_points.h"
+#include "util/stopwatch.hpp"
 
 namespace doris::io {
 #include "common/compile_check_begin.h"
+
+bvar::Adder<uint64_t> g_local_file_writer_page_cache_dropped_bytes(
+        "local_file_writer_page_cache_dropped_bytes");
+bvar::Adder<uint64_t> g_local_file_writer_page_cache_drop_failed(
+        "local_file_writer_page_cache_drop_failed");
+bvar::LatencyRecorder g_local_file_writer_page_cache_drop_wait_us(
+        "local_file_writer_page_cache_drop_wait_us");
 namespace {
 
 Status sync_dir(const io::Path& dirname) {
@@ -71,8 +80,11 @@ Status sync_dir(const io::Path& dirname) {
 
 } // namespace
 
-LocalFileWriter::LocalFileWriter(Path path, int fd, bool sync_data)
-        : _path(std::move(path)), _fd(fd), _sync_data(sync_data) {
+LocalFileWriter::LocalFileWriter(Path path, int fd, bool sync_data, bool drop_page_cache)
+        : _path(std::move(path)),
+          _fd(fd),
+          _sync_data(sync_data),
+          _drop_page_cache_on_close(drop_page_cache) {
     DorisMetrics::instance()->local_file_open_writing->increment(1);
     DorisMetrics::instance()->local_file_writer_total->increment(1);
 }
@@ -250,6 +262,28 @@ Status LocalFileWriter::_finalize() {
     return Status::OK();
 }
 
+// Best effort: a failure leaves the pages to normal reclaim and is only counted.
+void LocalFileWriter::_drop_page_cache() {
+#if defined(__linux__)
+    if (_bytes_appended == 0) {
+        return;
+    }
+    // POSIX_FADV_DONTNEED drops only clean pages, so wait for this file's writeback first.
+    // sync_file_range writes the data without the journal commit fdatasync would wait for.
+    MonotonicStopWatch watch;
+    watch.start();
+    if (sync_file_range(_fd, 0, 0,
+                        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                                SYNC_FILE_RANGE_WAIT_AFTER) != 0 ||
+        posix_fadvise(_fd, 0, 0, POSIX_FADV_DONTNEED) != 0) {
+        g_local_file_writer_page_cache_drop_failed << 1;
+        return;
+    }
+    g_local_file_writer_page_cache_drop_wait_us << watch.elapsed_time() / 1000;
+    g_local_file_writer_page_cache_dropped_bytes << _bytes_appended;
+#endif
+}
+
 Status LocalFileWriter::_close(bool sync) {
     auto fd_reclaim_func = [&](Status st) {
         if (_fd > 0 && 0 != ::close(_fd)) {
@@ -275,6 +309,10 @@ Status LocalFileWriter::_close(bool sync) {
             _dirty = false;
         }
         RETURN_IF_ERROR(fd_reclaim_func(sync_dir(_path.parent_path())));
+    }
+
+    if (_drop_page_cache_on_close && _fd > 0) {
+        _drop_page_cache();
     }
 
     DBUG_EXECUTE_IF("LocalFileWriter.close.failed", {

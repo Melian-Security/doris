@@ -77,7 +77,8 @@ Status LocalFileSystem::create_file_impl(const Path& file, FileWriterPtr* writer
         return localfs_error(errno, fmt::format("failed to create file {}", file.native()));
     }
     bool sync_data = opts != nullptr ? opts->sync_file_data : true;
-    *writer = std::make_unique<LocalFileWriter>(file, fd, sync_data);
+    bool drop_page_cache = opts != nullptr && opts->drop_page_cache_on_close;
+    *writer = std::make_unique<LocalFileWriter>(file, fd, sync_data, drop_page_cache);
     return Status::OK();
 }
 

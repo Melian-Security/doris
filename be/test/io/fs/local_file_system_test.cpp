@@ -18,6 +18,7 @@
 #include "io/fs/local_file_system.h"
 
 #include <butil/iobuf.h>
+#include <bvar/bvar.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
 #include <gtest/gtest.h>
@@ -637,4 +638,53 @@ TEST_F(LocalFileSystemTest, TestEqualOrSubPath) {
     EXPECT_FALSE(io::LocalFileSystem::equal_or_sub_path("/data/store1", "/data/store11/snapshot"));
     EXPECT_FALSE(io::LocalFileSystem::equal_or_sub_path("/data/store/snapshot", "/data/store"));
 }
+
+#if defined(__linux__)
+namespace io {
+extern bvar::Adder<uint64_t> g_local_file_writer_page_cache_dropped_bytes;
+extern bvar::Adder<uint64_t> g_local_file_writer_page_cache_drop_failed;
+} // namespace io
+
+namespace {
+// Writes `content` to `path` with the given page-cache option and returns the bytes the writer
+// reported dropping from the page cache on close.
+uint64_t write_and_count_dropped(const std::string& path, const std::string& content,
+                                 bool drop_page_cache) {
+    io::FileWriterOptions opts {.sync_file_data = false,
+                                .drop_page_cache_on_close = drop_page_cache};
+    io::FileWriterPtr writer;
+    EXPECT_TRUE(io::global_local_filesystem()->create_file(path, &writer, &opts).ok());
+    EXPECT_TRUE(writer->append(content).ok());
+    auto before = io::g_local_file_writer_page_cache_dropped_bytes.get_value();
+    EXPECT_TRUE(writer->close().ok());
+    return io::g_local_file_writer_page_cache_dropped_bytes.get_value() - before;
+}
+
+std::string read_whole(const std::string& path, size_t size) {
+    io::FileReaderSPtr reader;
+    EXPECT_TRUE(io::global_local_filesystem()->open_file(path, &reader).ok());
+    std::string out(size, '\0');
+    size_t bytes_read = 0;
+    EXPECT_TRUE(reader->read_at(0, Slice(out.data(), out.size()), &bytes_read).ok());
+    EXPECT_EQ(bytes_read, size);
+    return out;
+}
+} // namespace
+
+TEST_F(LocalFileSystemTest, DropPageCacheOnCloseKeepsData) {
+    std::string path = std::string(test_dir) + "/drop_page_cache";
+    std::string content(1 << 20, 'x');
+    auto failed_before = io::g_local_file_writer_page_cache_drop_failed.get_value();
+    EXPECT_EQ(write_and_count_dropped(path, content, true), content.size());
+    EXPECT_EQ(io::g_local_file_writer_page_cache_drop_failed.get_value(), failed_before);
+    EXPECT_EQ(read_whole(path, content.size()), content);
+}
+
+TEST_F(LocalFileSystemTest, PageCacheKeptWithoutOption) {
+    std::string path = std::string(test_dir) + "/keep_page_cache";
+    std::string content(4096, 'y');
+    EXPECT_EQ(write_and_count_dropped(path, content, false), 0);
+    EXPECT_EQ(read_whole(path, content.size()), content);
+}
+#endif
 } // namespace doris
