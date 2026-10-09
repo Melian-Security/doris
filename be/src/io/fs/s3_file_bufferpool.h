@@ -234,6 +234,10 @@ struct UploadFileBuffer final : public FileBuffer {
     */
     void upload_to_local_file_cache(bool);
 
+    // True once if on_upload left the file cache copy for the caller to submit to
+    // S3FileCacheWriterThreadPool, which needs a reference that outlives the upload task.
+    bool take_pending_file_cache_write() { return std::exchange(_file_cache_write_pending, false); }
+
     void execute_async() override { on_upload(); }
     /**
     * do the upload work
@@ -267,6 +271,7 @@ private:
     std::shared_ptr<std::iostream> _stream_ptr; // point to _buffer.get_data()
 
     bool _is_cache_allocated {false};
+    bool _file_cache_write_pending {false};
     FileBlocksHolderPtr _holder;
     decltype(_holder->file_blocks.begin()) _cur_file_block;
     size_t _append_offset {0};
