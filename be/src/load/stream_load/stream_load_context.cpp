@@ -108,6 +108,10 @@ std::string StreamLoadContext::to_json() const {
     }
     writer.Key("StreamLoadPutTimeMs");
     writer.Int64(stream_load_put_cost_nanos / 1000000);
+    if (header_off_event_loop) {
+        writer.Key("HeaderWaitTimeMs");
+        writer.Int64(header_wait_cost_nanos / 1000000);
+    }
     writer.Key("ReadDataTimeMs");
     writer.Int64(read_data_cost_nanos / 1000000);
     writer.Key("WriteDataTimeMs");

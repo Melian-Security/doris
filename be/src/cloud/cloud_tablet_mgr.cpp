@@ -19,6 +19,7 @@
 
 #include <bthread/countdown_event.h>
 
+#include <algorithm>
 #include <chrono>
 
 #include "cloud/cloud_cluster_info.h"
@@ -480,6 +481,9 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
     auto disable = [](CloudTablet* t) { return t->tablet_meta()->tablet_schema()->disable_auto_compaction(); };
 
     auto [num_filtered, num_disabled, num_skipped] = std::make_tuple(0, 0, 0);
+    // Why the highest-scoring tablet was not picked, so a tablet stuck out of compaction shows up
+    // in the log instead of only in the max score gauge.
+    const char* max_score_tablet_outcome = nullptr;
 
     auto weak_tablets = get_weak_tablets();
     std::vector<std::pair<std::shared_ptr<CloudTablet>, int64_t>> buf;
@@ -495,15 +499,26 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
 
         int64_t s = score(t.get());
         if (s <= 0) { continue; }
-        if (s > *max_score) {
+        const bool is_max = s > *max_score;
+        if (is_max) {
             max_score_tablet_id = t->tablet_id();
             *max_score = s;
+            max_score_tablet_outcome = nullptr;
         }
 
-        if (filter_out(t.get())) { ++num_filtered; continue; }
-        if (disable(t.get())) { ++num_disabled; continue; }
+        if (filter_out(t.get())) {
+            ++num_filtered;
+            if (is_max) { max_score_tablet_outcome = "filtered (preparing, submitted or not running)"; }
+            continue;
+        }
+        if (disable(t.get())) {
+            ++num_disabled;
+            if (is_max) { max_score_tablet_outcome = "disabled (disable_auto_compaction)"; }
+            continue;
+        }
         if (skip(t.get())) {
             ++num_skipped;
+            if (is_max) { max_score_tablet_outcome = "skipped (recent failure, no suitable version or frozen)"; }
             if (skipped != nullptr && max_skipped > 0) {
                 skipped_buf.emplace_back(std::move(t), s);
                 std::sort(skipped_buf.begin(), skipped_buf.end(), [](auto& a, auto& b) { return a.second > b.second; });
@@ -523,6 +538,16 @@ Status CloudTabletMgr::get_topn_tablets_to_compact(
                << " max_score=" << *max_score << " max_score_tablet=" << max_score_tablet_id
                << " tablets=[" << [&buf] { std::stringstream ss; for (auto& i : buf) ss << i.first->tablet_id() << ":" << i.second << ","; return ss.str(); }() << "]"
                ;
+    if (n > 0 && max_score_tablet_id != 0 &&
+        std::none_of(buf.begin(), buf.end(),
+                     [&](const auto& i) { return i.first->tablet_id() == max_score_tablet_id; })) {
+        LOG_EVERY_T(INFO, 60) << "highest-scoring tablet not picked for compaction, type="
+                              << compaction_type << " tablet_id=" << max_score_tablet_id
+                              << " score=" << *max_score << " reason="
+                              << (max_score_tablet_outcome ? max_score_tablet_outcome
+                                                           : "below the top n")
+                              << " n=" << n;
+    }
     // clang-format on
 
     tablets->clear();

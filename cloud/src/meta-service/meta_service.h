@@ -23,6 +23,7 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 #include <type_traits>
@@ -529,6 +530,17 @@ private:
     std::shared_ptr<DeleteBitmapLockWhiteList> delete_bitmap_lock_white_list_;
     std::shared_ptr<SnapshotManager> snapshot_manager_;
 };
+
+// Sleep before the (retry_times + 1)-th retry of a KV_TXN_CONFLICT: uniform in [ceil/2, ceil]
+// with ceil = min(max_ms, base_ms << retry_times), picked by `random`.
+inline uint64_t txn_conflict_retry_backoff_ms(int32_t retry_times, int32_t base_ms, int32_t max_ms,
+                                              uint64_t random) {
+    uint64_t ceil = static_cast<uint64_t>(std::max(base_ms, 0))
+                    << std::clamp(retry_times, 0, 20);
+    ceil = std::min(ceil, static_cast<uint64_t>(std::max(max_ms, 0)));
+    uint64_t half = ceil / 2;
+    return half + random % (ceil - half + 1);
+}
 
 class MetaServiceProxy final : public MetaService {
 public:
@@ -1075,6 +1087,7 @@ private:
         std::string req_name = req->GetDescriptor()->name();
         int32_t retry_times = 0;
         uint64_t duration_ms = 0, retry_drift_ms = 0;
+        std::default_random_engine rng;
         while (true) {
             resp->Clear(); // reset the response message in case it is reused for retry
             TEST_SYNC_POINT_RETURN_WITH_VOID("MetaServiceProxy::call_impl::inject_ms_too_busy",
@@ -1094,12 +1107,16 @@ private:
             if (retry_times == 0) {
                 // the first retry, add random drift.
                 duration seed = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch());
-                std::default_random_engine rng(static_cast<uint64_t>(seed.count()));
+                rng.seed(static_cast<uint64_t>(seed.count()));
                 retry_drift_ms = std::uniform_int_distribution<uint64_t>(
                         0, config::txn_store_retry_base_intervals_ms)(rng);
             }
 
-            if (retry_times >= config::txn_store_retry_times ||
+            const bool conflict_backoff = code == MetaServiceCode::KV_TXN_CONFLICT &&
+                                          config::txn_conflict_retry_base_intervals_ms >= 0;
+            const int32_t max_retry_times = conflict_backoff ? config::txn_conflict_retry_times
+                                                             : config::txn_store_retry_times;
+            if (retry_times >= max_retry_times ||
                 // Retrying KV_TXN_TOO_OLD is very expensive, so we only retry once.
                 (retry_times > 1 && code == MetaServiceCode::KV_TXN_TOO_OLD)) {
                 // For KV_TXN_CONFLICT, we should return KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES,
@@ -1112,18 +1129,28 @@ private:
                         : code == MetaServiceCode::KV_TXN_CONFLICT
                                 ? KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES
                                 : MetaServiceCode::KV_TXN_TOO_OLD);
+                if (code == MetaServiceCode::KV_TXN_CONFLICT) {
+                    g_bvar_ms_txn_conflict_retry_exceeded << 1;
+                }
                 return;
             }
 
-            // 1 2 4 8 ...
-            duration_ms =
-                    (1 << retry_times) * config::txn_store_retry_base_intervals_ms + retry_drift_ms;
+            if (conflict_backoff) {
+                duration_ms = txn_conflict_retry_backoff_ms(
+                        retry_times, config::txn_conflict_retry_base_intervals_ms,
+                        config::txn_conflict_retry_max_intervals_ms, rng());
+                g_bvar_ms_txn_conflict_retry << 1;
+            } else {
+                // 1 2 4 8 ...
+                duration_ms = (1 << retry_times) * config::txn_store_retry_base_intervals_ms +
+                              retry_drift_ms;
+            }
             TEST_SYNC_POINT_CALLBACK("MetaServiceProxy::call_impl_duration_ms", &duration_ms);
 
             retry_times += 1;
             LOG(WARNING) << __PRETTY_FUNCTION__ << " sleep " << duration_ms
                          << " ms before next round, retry times left: "
-                         << (config::txn_store_retry_times - retry_times)
+                         << (max_retry_times - retry_times)
                          << ", code: " << MetaServiceCode_Name(code)
                          << ", msg: " << resp->status().msg();
             bthread_usleep(duration_ms * 1000);

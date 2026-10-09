@@ -237,10 +237,13 @@ struct RowsetWriterContext {
     io::FileSystem& fs_ref() const { return *fs(); }
 
     io::FileWriterOptions get_file_writer_options(FileType file_type = FileType::SEGMENT_FILE) {
-        io::FileWriterOptions opts {.write_file_cache = write_file_cache,
-                                    .is_cold_data = is_hot_data,
-                                    .file_cache_expiration_time = file_cache_ttl_sec,
-                                    .approximate_bytes_to_write = approximate_bytes_to_write};
+        io::FileWriterOptions opts {
+                .write_file_cache = write_file_cache,
+                .is_cold_data = is_hot_data,
+                .file_cache_expiration_time = file_cache_ttl_sec,
+                .approximate_bytes_to_write = approximate_bytes_to_write,
+                .background_write = write_type == DataWriteType::TYPE_COMPACTION ||
+                                    write_type == DataWriteType::TYPE_SCHEMA_CHANGE};
 
         if (config::enable_file_cache_write_index_file_only) {
             opts.allow_adaptive_file_cache_write = false;

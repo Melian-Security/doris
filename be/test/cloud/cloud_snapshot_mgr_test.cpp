@@ -20,6 +20,8 @@
 #include <gtest/gtest.h>
 
 #include "cloud/cloud_storage_engine.h"
+#include "storage/rowset/rowset_meta.h"
+#include "storage/storage_policy.h"
 #include "io/fs/remote_file_system.h"
 
 namespace doris {
@@ -158,6 +160,101 @@ TEST_F(CloudSnapshotMgrTest, TestConvertRowsets) {
     EXPECT_EQ(output_meta_pb.rs_metas(0).resource_id(), storage_resource.fs->id());
     EXPECT_FALSE(file_mapping.empty());
     EXPECT_TRUE(status.ok());
+}
+
+// Restored files are written to `remote_tablet_path(target) + '/' + mapped name`, so the mapped
+// names must follow the target vault's layout; path version 0 names are unchanged.
+TEST_F(CloudSnapshotMgrTest, TestConvertRowsetsFileMappingFollowsVaultLayout) {
+    auto make_input = [](TabletMetaPB* meta, InvertedIndexStorageFormatPB format) {
+        meta->set_tablet_id(1000);
+        meta->set_schema_hash(123456);
+        *meta->mutable_tablet_uid() = TabletUid::gen_uid().to_proto();
+        TabletSchemaPB* schema = meta->mutable_schema();
+        schema->set_keys_type(KeysType::DUP_KEYS);
+        schema->set_num_short_key_columns(1);
+        schema->set_num_rows_per_row_block(1024);
+        schema->set_compress_kind(COMPRESS_LZ4);
+        schema->set_inverted_index_storage_format(format);
+        ColumnPB* col1 = schema->add_column();
+        col1->set_unique_id(1);
+        col1->set_name("col1");
+        col1->set_type("INT");
+        col1->set_is_key(true);
+        col1->set_aggregation("NONE");
+        ColumnPB* col2 = schema->add_column();
+        col2->set_unique_id(2);
+        col2->set_name("col2");
+        col2->set_type("VARCHAR");
+        col2->set_is_key(false);
+        col2->set_aggregation("NONE");
+        doris::TabletIndexPB* index = schema->add_index();
+        index->set_index_id(1002);
+        index->set_index_name("test_index");
+        index->set_index_type(IndexType::INVERTED);
+        index->add_col_unique_id(2);
+        RowsetMetaPB* rowset_meta = meta->add_rs_metas();
+        RowsetId rowset_id;
+        rowset_id.init(10000);
+        rowset_meta->set_rowset_id(0);
+        rowset_meta->set_rowset_id_v2(rowset_id.to_string());
+        rowset_meta->set_tablet_id(1000);
+        rowset_meta->set_txn_id(2000);
+        rowset_meta->set_num_segments(2);
+        rowset_meta->set_num_rows(100);
+        rowset_meta->set_start_version(100);
+        rowset_meta->set_end_version(101);
+        rowset_meta->set_rowset_state(RowsetStatePB::VISIBLE);
+        rowset_meta->set_newest_write_timestamp(1678901234567890);
+        rowset_meta->mutable_tablet_schema()->CopyFrom(*schema);
+        return rowset_id.to_string();
+    };
+
+    cloud::StorageVaultPB_PathFormat path_v1;
+    path_v1.set_path_version(1);
+    path_v1.set_shard_num(1024);
+    for (auto format : {InvertedIndexStorageFormatPB::V1, InvertedIndexStorageFormatPB::V2}) {
+        for (bool sharded : {false, true}) {
+            TabletMetaPB input_meta_pb;
+            const std::string src_rs = make_input(&input_meta_pb, format);
+            auto tablet_meta = std::make_shared<TabletMeta>();
+            tablet_meta->init_from_pb(input_meta_pb);
+            CloudTabletSPtr target_tablet = std::make_shared<CloudTablet>(*_engine, tablet_meta);
+            StorageResource storage_resource =
+                    sharded ? StorageResource(_fs, path_v1) : StorageResource(_fs);
+            std::unordered_map<std::string, std::string> file_mapping;
+            TabletMetaPB output_meta_pb;
+            ASSERT_TRUE(_snapshot_mgr
+                                ->convert_rowsets(&output_meta_pb, input_meta_pb, 3000,
+                                                  target_tablet, storage_resource, file_mapping)
+                                .ok());
+            const std::string dst_rs = output_meta_pb.rs_metas(0).rowset_id_v2();
+            const std::string sep = sharded ? "/" : "_";
+            std::unordered_map<std::string, std::string> expected;
+            for (int seg = 0; seg < 2; ++seg) {
+                expected[fmt::format("{}_{}.dat", src_rs, seg)] =
+                        fmt::format("{}{}{}.dat", dst_rs, sep, seg);
+                if (format == InvertedIndexStorageFormatPB::V1) {
+                    expected[fmt::format("{}_{}_1002.idx", src_rs, seg)] =
+                            fmt::format("{}{}{}_1002.idx", dst_rs, sep, seg);
+                } else {
+                    expected[fmt::format("{}_{}.idx", src_rs, seg)] =
+                            fmt::format("{}{}{}.idx", dst_rs, sep, seg);
+                }
+            }
+            EXPECT_EQ(file_mapping, expected) << "sharded=" << sharded;
+            // The restored segment lands exactly where readers of the target vault look.
+            for (int seg = 0; seg < 2; ++seg) {
+                RowsetMeta rs_meta;
+                rs_meta.set_tablet_id(3000);
+                RowsetId rs_id;
+                rs_id.init(dst_rs);
+                rs_meta.set_rowset_id(rs_id);
+                EXPECT_EQ(storage_resource.remote_tablet_path(3000) + "/" +
+                                  file_mapping.at(fmt::format("{}_{}.dat", src_rs, seg)),
+                          storage_resource.remote_segment_path(rs_meta, seg));
+            }
+        }
+    }
 }
 
 TEST_F(CloudSnapshotMgrTest, TestRenameIndexIds) {

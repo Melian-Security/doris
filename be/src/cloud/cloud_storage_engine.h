@@ -108,6 +108,10 @@ public:
         bool synced = false;
         do {
             if (vault_id.empty() && latest_fs() != nullptr) {
+                // Keep the registered resource's path format; a bare fs means path version 0.
+                if (auto registered = doris::get_storage_resource(latest_fs()->id()); registered) {
+                    return registered->first;
+                }
                 return StorageResource {latest_fs()};
             }
             if (auto storage_resource = doris::get_storage_resource(vault_id); storage_resource) {

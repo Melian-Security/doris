@@ -260,6 +260,14 @@ public:
     }
     ThreadPool* send_table_stats_thread_pool() { return _send_table_stats_thread_pool.get(); }
     ThreadPool* s3_file_upload_thread_pool() { return _s3_file_upload_thread_pool.get(); }
+    // Dedicated pools for compaction / schema change S3 writes. Callers must fall back to
+    // the shared pools when these are null (tools and tests that do not create them).
+    ThreadPool* compaction_s3_file_upload_thread_pool() {
+        return _compaction_s3_file_upload_thread_pool.get();
+    }
+    ThreadPool* compaction_non_block_close_thread_pool() {
+        return _compaction_non_block_close_thread_pool.get();
+    }
     ThreadPool* lazy_release_obj_pool() { return _lazy_release_obj_pool.get(); }
     ThreadPool* non_block_close_thread_pool();
     ThreadPool* s3_file_system_thread_pool() { return _s3_file_system_thread_pool.get(); }
@@ -367,6 +375,12 @@ public:
     }
     void set_s3_file_upload_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
         _s3_file_upload_thread_pool = std::move(pool);
+    }
+    void set_compaction_s3_file_upload_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
+        _compaction_s3_file_upload_thread_pool = std::move(pool);
+    }
+    void set_compaction_non_block_close_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
+        _compaction_non_block_close_thread_pool = std::move(pool);
     }
     void set_file_cache_factory(io::FileCacheFactory* factory) { _file_cache_factory = factory; }
     void set_file_cache_open_fd_cache(std::unique_ptr<io::FDCache>&& fd_cache) {
@@ -494,6 +508,8 @@ private:
     // Pool to use a new thread to release object
     std::unique_ptr<ThreadPool> _lazy_release_obj_pool;
     std::unique_ptr<ThreadPool> _non_block_close_thread_pool;
+    std::unique_ptr<ThreadPool> _compaction_s3_file_upload_thread_pool;
+    std::unique_ptr<ThreadPool> _compaction_non_block_close_thread_pool;
     std::unique_ptr<ThreadPool> _s3_file_system_thread_pool;
     // for java-udf to close
     std::unique_ptr<ThreadPool> _udf_close_workers_thread_pool;
