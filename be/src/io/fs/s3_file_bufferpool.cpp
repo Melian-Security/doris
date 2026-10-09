@@ -41,6 +41,67 @@ namespace doris {
 namespace io {
 
 bvar::Adder<uint64_t> s3_file_buffer_allocated("s3_file_buffer_allocated");
+bvar::Adder<int64_t> s3_compaction_upload_inflight_parts("s3_compaction_upload_inflight_parts");
+bvar::Adder<int64_t> s3_compaction_upload_waiting_writers("s3_compaction_upload_waiting_writers");
+bvar::LatencyRecorder s3_compaction_upload_permit_wait_us("s3_compaction_upload_permit_wait_us");
+
+UploadBufferInflightLimiter* UploadBufferInflightLimiter::compaction() {
+    static UploadBufferInflightLimiter limiter(
+            [] { return config::compaction_s3_upload_max_inflight_parts; });
+    return &limiter;
+}
+
+UploadBufferInflightLimiter::Permit UploadBufferInflightLimiter::acquire() {
+    std::unique_lock lock(_mutex);
+    auto has_slot = [this] {
+        auto limit = _limit();
+        return limit <= 0 || _inflight < limit;
+    };
+    if (!has_slot()) {
+        auto start = std::chrono::steady_clock::now();
+        ++_waiters;
+        if (this == compaction()) {
+            s3_compaction_upload_waiting_writers << 1;
+        }
+        // Timed wait so that raising the limit at runtime wakes blocked writers.
+        while (!_cv.wait_for(lock, std::chrono::seconds(1), has_slot)) {
+        }
+        --_waiters;
+        if (this == compaction()) {
+            s3_compaction_upload_waiting_writers << -1;
+            s3_compaction_upload_permit_wait_us
+                    << std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+        }
+    }
+    ++_inflight;
+    if (this == compaction()) {
+        s3_compaction_upload_inflight_parts << 1;
+    }
+    return Permit(this);
+}
+
+void UploadBufferInflightLimiter::_release() {
+    {
+        std::lock_guard lock(_mutex);
+        --_inflight;
+    }
+    if (this == compaction()) {
+        s3_compaction_upload_inflight_parts << -1;
+    }
+    _cv.notify_one();
+}
+
+int64_t UploadBufferInflightLimiter::inflight() const {
+    std::lock_guard lock(_mutex);
+    return _inflight;
+}
+
+int64_t UploadBufferInflightLimiter::waiters() const {
+    std::lock_guard lock(_mutex);
+    return _waiters;
+}
 
 template <typename Allocator = Allocator<false>>
 struct Memory : boost::noncopyable, Allocator {
@@ -67,7 +128,7 @@ struct Memory : boost::noncopyable, Allocator {
 
 struct FileBuffer::PartData {
     Memory<> _memory;
-    PartData() : _memory(config::s3_write_buffer_size) {}
+    explicit PartData(size_t capacity) : _memory(capacity) {}
     ~PartData() = default;
     [[nodiscard]] Slice data() const { return Slice {_memory._data, _memory._size}; }
     [[nodiscard]] size_t size() const { return _memory._size; }
@@ -78,13 +139,14 @@ Slice FileBuffer::get_slice() const {
 }
 
 FileBuffer::FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> alloc_holder,
-                       size_t offset, OperationState state)
+                       size_t offset, OperationState state, size_t capacity)
         : _type(type),
           _alloc_holder(std::move(alloc_holder)),
           _offset(offset),
           _size(0),
           _state(std::move(state)),
-          _inner_data(std::make_unique<FileBuffer::PartData>()),
+          _inner_data(std::make_unique<FileBuffer::PartData>(
+                  capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size))),
           _capacity(_inner_data->size()) {}
 
 FileBuffer::~FileBuffer() {
@@ -99,6 +161,10 @@ FileBuffer::~FileBuffer() {
 Status UploadFileBuffer::append_data(const Slice& data) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("UploadFileBuffer::append_data", Status::OK(), this,
                                       data.get_size());
+    if (data.get_size() > _capacity - _size) [[unlikely]] {
+        return Status::InternalError("append {} bytes to upload buffer of {}/{} bytes",
+                                     data.get_size(), _size, _capacity);
+    }
     std::memcpy((void*)(_inner_data->data().get_data() + _size), data.get_data(), data.get_size());
     _size += data.get_size();
     _crc_value = crc32c::Extend(_crc_value, (const uint8_t*)data.get_data(), data.get_size());
@@ -111,8 +177,11 @@ Status UploadFileBuffer::append_data(const Slice& data) {
  */
 static Status submit_upload_buffer(std::shared_ptr<FileBuffer> buffer) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("UploadFileBuffer::submit", Status::OK(), buffer.get());
-    return ExecEnv::GetInstance()->s3_file_upload_thread_pool()->submit_func(
-            [buf = std::move(buffer)]() { buf->execute_async(); });
+    auto* pool = static_cast<UploadFileBuffer*>(buffer.get())->upload_thread_pool();
+    if (pool == nullptr) {
+        pool = ExecEnv::GetInstance()->s3_file_upload_thread_pool();
+    }
+    return pool->submit_func([buf = std::move(buffer)]() { buf->execute_async(); });
 }
 
 std::ostream& operator<<(std::ostream& os, const BufferType& value) {
@@ -246,9 +315,12 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
     OperationState state(_sync_after_complete_task, _is_cancelled);
 
     if (_type == BufferType::UPLOAD) {
-        RETURN_IF_CATCH_EXCEPTION(*buf = std::make_shared<UploadFileBuffer>(
+        std::shared_ptr<UploadFileBuffer> upload_buf;
+        RETURN_IF_CATCH_EXCEPTION(upload_buf = std::make_shared<UploadFileBuffer>(
                                           std::move(_upload_cb), std::move(state), _offset,
-                                          std::move(_alloc_holder_cb)));
+                                          std::move(_alloc_holder_cb), _buffer_size));
+        upload_buf->set_upload_thread_pool(_upload_thread_pool);
+        *buf = std::move(upload_buf);
         return Status::OK();
     }
     if (_type == BufferType::DOWNLOAD) {
@@ -256,7 +328,7 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
                                           std::move(_download),
                                           std::move(_write_to_local_file_cache),
                                           std::move(_write_to_use_buffer), std::move(state),
-                                          _offset, std::move(_alloc_holder_cb)));
+                                          _offset, std::move(_alloc_holder_cb), _buffer_size));
         return Status::OK();
     }
     // should never come here

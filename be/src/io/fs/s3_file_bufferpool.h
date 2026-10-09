@@ -26,6 +26,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #include "common/status.h"
 #include "io/cache/file_block.h"
@@ -35,6 +36,62 @@
 namespace doris {
 namespace io {
 enum class BufferType : uint32_t { DOWNLOAD, UPLOAD };
+
+// Bounds how many upload buffers of one class (e.g. compaction) are submitted but not yet
+// released. A permit is held by the buffer and released when the buffer is destroyed, i.e.
+// once its memory is freed. Acquire only when the caller holds no other unsubmitted permit
+// it depends on: permit holders are submitted buffers, which finish without the caller.
+class UploadBufferInflightLimiter {
+public:
+    class Permit {
+    public:
+        Permit() = default;
+        explicit Permit(UploadBufferInflightLimiter* limiter) : _limiter(limiter) {}
+        Permit(Permit&& other) noexcept : _limiter(std::exchange(other._limiter, nullptr)) {}
+        Permit& operator=(Permit&& other) noexcept {
+            if (this != &other) {
+                reset();
+                _limiter = std::exchange(other._limiter, nullptr);
+            }
+            return *this;
+        }
+        Permit(const Permit&) = delete;
+        Permit& operator=(const Permit&) = delete;
+        ~Permit() { reset(); }
+        void reset() {
+            if (_limiter != nullptr) {
+                std::exchange(_limiter, nullptr)->_release();
+            }
+        }
+        bool valid() const { return _limiter != nullptr; }
+
+    private:
+        UploadBufferInflightLimiter* _limiter = nullptr;
+    };
+
+    // `limit` is re-read on every acquire so a mutable config takes effect at runtime;
+    // a value <= 0 means unbounded.
+    explicit UploadBufferInflightLimiter(std::function<int64_t()> limit)
+            : _limit(std::move(limit)) {}
+
+    // The process-wide limiter for compaction / schema change uploads, bounded by
+    // config::compaction_s3_upload_max_inflight_parts.
+    static UploadBufferInflightLimiter* compaction();
+
+    // Blocks until a slot is free.
+    Permit acquire();
+    int64_t inflight() const;
+    int64_t waiters() const;
+
+private:
+    void _release();
+
+    std::function<int64_t()> _limit;
+    mutable std::mutex _mutex;
+    std::condition_variable _cv;
+    int64_t _inflight = 0;
+    int64_t _waiters = 0;
+};
 using FileBlocksHolderPtr = std::unique_ptr<FileBlocksHolder>;
 struct OperationState {
     OperationState(std::function<bool(Status)> sync_after_complete_task,
@@ -77,8 +134,9 @@ struct OperationState {
 };
 
 struct FileBuffer {
+    // capacity 0 means config::s3_write_buffer_size at construction.
     FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> alloc_holder, size_t offset,
-               OperationState state);
+               OperationState state, size_t capacity = 0);
     virtual ~FileBuffer();
     /**
     * submit the correspoding task to async executor
@@ -120,6 +178,13 @@ struct FileBuffer {
 
     std::string_view get_string_view_data() const;
 
+    // Released in ~FileBuffer after the part memory is freed.
+    void set_inflight_permit(UploadBufferInflightLimiter::Permit permit) {
+        _inflight_permit = std::move(permit);
+    }
+
+    // Declared first so it is destroyed last, after ~FileBuffer frees _inner_data.
+    UploadBufferInflightLimiter::Permit _inflight_permit;
     BufferType _type;
     std::function<FileBlocksHolderPtr()> _alloc_holder;
     size_t _offset;
@@ -134,8 +199,9 @@ struct DownloadFileBuffer final : public FileBuffer {
     DownloadFileBuffer(std::function<Status(Slice&)> download,
                        std::function<void(FileBlocksHolderPtr, Slice)> write_to_cache,
                        std::function<void(Slice, size_t)> write_to_use_buffer, OperationState state,
-                       size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder)
-            : FileBuffer(BufferType::DOWNLOAD, alloc_holder, offset, state),
+                       size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder,
+                       size_t capacity = 0)
+            : FileBuffer(BufferType::DOWNLOAD, alloc_holder, offset, state, capacity),
               _download(std::move(download)),
               _write_to_local_file_cache(std::move(write_to_cache)),
               _write_to_use_buffer(std::move(write_to_use_buffer)) {}
@@ -154,8 +220,9 @@ struct DownloadFileBuffer final : public FileBuffer {
 
 struct UploadFileBuffer final : public FileBuffer {
     UploadFileBuffer(std::function<void(UploadFileBuffer&)> upload_cb, OperationState state,
-                     size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder)
-            : FileBuffer(BufferType::UPLOAD, alloc_holder, offset, state),
+                     size_t offset, std::function<FileBlocksHolderPtr()> alloc_holder,
+                     size_t capacity = 0)
+            : FileBuffer(BufferType::UPLOAD, alloc_holder, offset, state, capacity),
               _upload_to_remote(std::move(upload_cb)) {}
     ~UploadFileBuffer() override = default;
     Status append_data(const Slice& s) override;
@@ -193,11 +260,15 @@ struct UploadFileBuffer final : public FileBuffer {
         _upload_to_remote = std::move(cb);
     }
 
+    // nullptr means ExecEnv's shared S3FileUploadThreadPool.
+    void set_upload_thread_pool(ThreadPool* pool) { _upload_thread_pool = pool; }
+    ThreadPool* upload_thread_pool() const { return _upload_thread_pool; }
     // CRC32C of the appended bytes; on_upload() verifies it against the buffer before
     // the upload callback runs, so the callback may send it as the body checksum.
     uint32_t crc32c() const { return _crc_value; }
 
 private:
+    ThreadPool* _upload_thread_pool = nullptr;
     std::function<void(UploadFileBuffer&)> _upload_to_remote = nullptr;
     std::shared_ptr<std::iostream> _stream_ptr; // point to _buffer.get_data()
 
@@ -238,6 +309,13 @@ struct FileBufferBuilder {
     */
     FileBufferBuilder& set_upload_callback(std::function<void(UploadFileBuffer& buf)> cb);
     /**
+    * set the pool the upload task runs on; nullptr means the shared S3 upload pool
+    */
+    FileBufferBuilder& set_upload_thread_pool(ThreadPool* pool) {
+        _upload_thread_pool = pool;
+        return *this;
+    }
+    /**
     * set the callback which would do task sync for the caller
     *
     * @param cb 
@@ -269,6 +347,11 @@ struct FileBufferBuilder {
         _offset = offset;
         return *this;
     }
+    // Capacity of the buffer's memory; 0 means config::s3_write_buffer_size at build time.
+    FileBufferBuilder& set_buffer_size(size_t size) {
+        _buffer_size = size;
+        return *this;
+    }
     /**
     * set the callback which write the content into local file cache
     *
@@ -298,6 +381,8 @@ struct FileBufferBuilder {
     std::function<Status(Slice&)> _download;
     std::function<void(Slice, size_t)> _write_to_use_buffer;
     size_t _offset;
+    ThreadPool* _upload_thread_pool = nullptr;
+    size_t _buffer_size = 0;
 };
 } // namespace io
 } // namespace doris

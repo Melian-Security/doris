@@ -86,6 +86,8 @@ bvar::Adder<uint64_t> g_read_cache_direct_partial_bytes(
 bvar::Adder<uint64_t> g_read_cache_indirect_bytes("cached_remote_reader_cache_indirect_bytes");
 bvar::Adder<uint64_t> g_read_cache_indirect_total_bytes(
         "cached_remote_reader_cache_indirect_total_bytes");
+bvar::Adder<uint64_t> g_read_cache_direct_stale_dropped(
+        "cached_remote_reader_direct_stale_block_dropped");
 bvar::Adder<uint64_t> g_read_cache_self_heal_on_not_found(
         "cached_remote_reader_self_heal_on_not_found");
 bvar::Window<bvar::Adder<uint64_t>> g_read_cache_indirect_bytes_1min_window(
@@ -177,7 +179,9 @@ void CachedRemoteFileReader::_insert_file_reader(FileBlockSPtr file_block) {
         std::lock_guard lock(_mtx);
         DCHECK(file_block->state() == FileBlock::State::DOWNLOADED);
         file_block->_owned_by_cached_reader = true;
-        _cache_file_readers.emplace(file_block->offset(), std::move(file_block));
+        // A block downloaded at an offset this reader already maps replaces the old block, which
+        // the cache has evicted: a DOWNLOADED cell is unique per offset.
+        _cache_file_readers.insert_or_assign(file_block->offset(), std::move(file_block));
     }
 }
 
@@ -751,6 +755,20 @@ bool CachedRemoteFileReader::_try_read_from_cached_files_directly(
 
     SCOPED_RAW_TIMER(&stats.read_cache_file_directly_timer);
     size_t need_read_size = bytes_req;
+    // Set when a mapped block can no longer be read (evicted or its file deleted); it is dropped
+    // from the map once the shared lock is released so later reads skip it.
+    FileBlockSPtr stale_block;
+    Defer drop_stale_block {[&] {
+        if (stale_block == nullptr) {
+            return;
+        }
+        std::lock_guard unique_lock(_mtx);
+        auto it = _cache_file_readers.find(stale_block->offset());
+        if (it != _cache_file_readers.end() && it->second == stale_block) {
+            _cache_file_readers.erase(it);
+            g_read_cache_direct_stale_dropped << 1;
+        }
+    }};
     std::shared_lock lock(_mtx);
     if (_cache_file_readers.empty()) {
         return false;
@@ -777,7 +795,10 @@ bool CachedRemoteFileReader::_try_read_from_cached_files_directly(
             if (!iter->second
                          ->read(Slice(result.data + (current_offset - offset), reserve_bytes),
                                 file_offset)
-                         .ok()) { // TODO: maybe read failed because block evict, should handle error
+                         .ok()) {
+                // Usually the cache evicted the block while this reader held it. The normal path
+                // re-reads the range and maps the replacement block.
+                stale_block = iter->second;
                 break;
             }
             source_read_breakdown.local_bytes += reserve_bytes;

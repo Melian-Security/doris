@@ -49,6 +49,9 @@ struct FileWriterOptions {
     bool sync_file_data = true;              // Whether flush data into storage system
     uint64_t file_cache_expiration_time = 0; // Relative time
     uint64_t approximate_bytes_to_write = 0; // Approximate bytes to write, used for file cache
+    // Compaction / schema change output. Remote writers route such writes to background
+    // IO pools so they cannot delay load writes.
+    bool background_write = false;
 };
 
 struct AsyncCloseStatusPack {

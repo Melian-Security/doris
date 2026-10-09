@@ -70,6 +70,8 @@ int main(int argc, char** argv) {
     cloud::config::enable_txn_store_retry = true;
     cloud::config::txn_store_retry_times = 100;
     cloud::config::txn_store_retry_base_intervals_ms = 1;
+    cloud::config::txn_conflict_retry_times = 100;
+    cloud::config::txn_conflict_retry_base_intervals_ms = 1;
     cloud::config::fdb_cluster_file_path = "fdb.cluster";
     cloud::config::write_schema_kv = true;
     cloud::config::enable_check_instance_id = false;

@@ -722,6 +722,8 @@ extern bvar::LatencyRecorder g_bvar_txn_kv_batch_get;
 
 extern bvar::Adder<int64_t> g_bvar_txn_kv_commit_error_counter;
 extern bvar::Adder<int64_t> g_bvar_txn_kv_commit_conflict_counter;
+extern bvar::Adder<int64_t> g_bvar_ms_txn_conflict_retry;
+extern bvar::Adder<int64_t> g_bvar_ms_txn_conflict_retry_exceeded;
 extern bvar::Adder<int64_t> g_bvar_txn_kv_get_count_normalized;
 
 extern bvar::Adder<int64_t> g_bvar_delete_bitmap_lock_txn_put_conflict_counter;

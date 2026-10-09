@@ -704,6 +704,10 @@ DECLARE_Int32(webserver_num_workers);
 // thread, which serves the bodies of other loads on the same keep-alive event loop.
 DECLARE_mBool(enable_stream_load_finish_off_event_loop);
 DECLARE_Int32(stream_load_finish_thread_num);
+// Begin a stream load's transaction, plan it and start its fragment on a pool thread instead of
+// the HTTP event loop thread, which serves the other connections on the same loop.
+DECLARE_mBool(enable_stream_load_header_off_event_loop);
+DECLARE_Int32(stream_load_header_thread_num);
 // Pause reading a stream load's HTTP body while its pipe is full instead of blocking the event
 // loop thread, which serves the other connections on the same loop.
 DECLARE_mBool(enable_stream_load_receive_flow_control);
@@ -1380,6 +1384,9 @@ DECLARE_mInt32(file_cache_leak_scan_pause_ms);
 DECLARE_mInt64(file_cache_leak_grace_seconds);
 DECLARE_mInt64(file_cache_remove_block_qps_limit);
 DECLARE_mInt64(file_cache_background_gc_interval_ms);
+// Run the storage removal of blocks evicted while holding the file cache lock after that lock
+// is released, instead of inline under it.
+DECLARE_mBool(enable_file_cache_async_evict_io);
 DECLARE_mInt64(file_cache_background_block_lru_update_interval_ms);
 DECLARE_mInt64(file_cache_background_block_lru_update_qps_limit);
 DECLARE_mInt64(file_cache_background_block_lru_update_queue_max_size);
@@ -1838,6 +1845,19 @@ DECLARE_mDouble(max_hdfs_wirter_jni_heap_usage_ratio);
 DECLARE_mInt64(hdfs_jni_write_sleep_milliseconds);
 // The max retry times when hdfs write failed
 DECLARE_mInt64(hdfs_jni_write_max_retry_time);
+
+// Route compaction and schema change S3 part uploads and async closes to dedicated
+// pools so a compaction burst cannot queue ahead of load segment closes. Read when a
+// writer is created; flipping it affects writers opened afterwards.
+DECLARE_mBool(enable_separate_compaction_s3_upload_pool);
+// Max threads of CompactionS3FileUploadThreadPool. 0 means the number of cores.
+DECLARE_Int64(compaction_s3_upload_thread_num);
+// Max threads of CompactionNonBlockCloseThreadPool. 0 means the number of cores.
+DECLARE_Int64(compaction_nonblock_close_thread_num);
+// Upper bound on compaction / schema change upload parts submitted but not yet uploaded,
+// per BE. Each part holds one s3_write_buffer_size buffer, so this bounds that memory.
+// A writer that hits the bound blocks before submitting. <= 0 disables the bound.
+DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
 
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);

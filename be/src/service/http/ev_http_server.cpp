@@ -54,12 +54,17 @@ namespace {
 struct DeferredReply {
     std::weak_ptr<void> request_alive;
     std::function<void()> reply;
+    std::function<void()> on_request_freed;
 };
 
 void run_deferred_reply(evutil_socket_t /*fd*/, short /*events*/, void* arg) {
     std::unique_ptr<DeferredReply> task(static_cast<DeferredReply*>(arg));
     if (task->request_alive.expired()) {
-        LOG(WARNING) << "http request was freed before its deferred reply";
+        if (task->on_request_freed) {
+            task->on_request_freed();
+        } else {
+            LOG(WARNING) << "http request was freed before its deferred reply";
+        }
         return;
     }
     task->reply();
@@ -68,7 +73,7 @@ void run_deferred_reply(evutil_socket_t /*fd*/, short /*events*/, void* arg) {
 } // namespace
 
 bool run_off_event_loop(HttpRequest* req, ThreadPool* pool, std::function<void()> work,
-                        std::function<void()> reply) {
+                        std::function<void()> reply, std::function<void()> on_request_freed) {
     if (pool == nullptr || req == nullptr || req->get_evhttp_request() == nullptr) {
         return false;
     }
@@ -80,9 +85,11 @@ bool run_off_event_loop(HttpRequest* req, ThreadPool* pool, std::function<void()
     // The event bases are created after evthread_use_pthreads(), so event_base_once() may be
     // called from a pool thread and wakes the loop.
     auto st = pool->submit_func([base, alive = req->lifetime_token(), work = std::move(work),
-                                 reply = std::move(reply)]() mutable {
+                                 reply = std::move(reply),
+                                 on_request_freed = std::move(on_request_freed)]() mutable {
         work();
-        auto* task = new DeferredReply {std::move(alive), std::move(reply)};
+        auto* task =
+                new DeferredReply {std::move(alive), std::move(reply), std::move(on_request_freed)};
         static const timeval kImmediately {0, 0};
         if (event_base_once(base, -1, EV_TIMEOUT, run_deferred_reply, task, &kImmediately) != 0) {
             LOG(ERROR) << "failed to schedule a deferred http reply on its event loop";

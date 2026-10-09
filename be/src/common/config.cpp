@@ -637,6 +637,11 @@ DEFINE_Int32(webserver_num_workers, "128");
 DEFINE_mBool(enable_stream_load_finish_off_event_loop, "true");
 // Upper bound of threads waiting for stream loads to finish; idle threads exit.
 DEFINE_Int32(stream_load_finish_thread_num, "1024");
+// Begin a stream load's transaction, plan it and start its fragment on a pool thread instead of
+// the HTTP event loop thread. Reading the load's body stays paused until the plan is running.
+DEFINE_mBool(enable_stream_load_header_off_event_loop, "true");
+// Upper bound of threads waiting on FE for stream load headers; idle threads exit.
+DEFINE_Int32(stream_load_header_thread_num, "256");
 // When true, a stream load whose pipe is full stops reading its HTTP body (EV_READ is disabled on
 // the connection, so TCP flow control holds back the sender) and resumes once the scanner drained
 // the pipe to half its capacity. When false, the event loop thread blocks until the pipe has room,
@@ -1341,6 +1346,7 @@ DEFINE_mInt64(file_cache_leak_grace_seconds, "3600");
 
 DEFINE_mInt64(file_cache_remove_block_qps_limit, "1000");
 DEFINE_mInt64(file_cache_background_gc_interval_ms, "100");
+DEFINE_mBool(enable_file_cache_async_evict_io, "true");
 DEFINE_mInt64(file_cache_background_block_lru_update_interval_ms, "5000");
 DEFINE_mInt64(file_cache_background_block_lru_update_qps_limit, "1000");
 DEFINE_mInt64(file_cache_background_block_lru_update_queue_max_size, "500000");
@@ -1753,6 +1759,11 @@ DEFINE_mDouble(max_hdfs_wirter_jni_heap_usage_ratio, "0.5");
 DEFINE_mInt64(hdfs_jni_write_sleep_milliseconds, "300");
 // The max retry times when hdfs write failed
 DEFINE_mInt64(hdfs_jni_write_max_retry_time, "3");
+
+DEFINE_mBool(enable_separate_compaction_s3_upload_pool, "true");
+DEFINE_Int64(compaction_s3_upload_thread_num, "64");
+DEFINE_Int64(compaction_nonblock_close_thread_num, "64");
+DEFINE_mInt64(compaction_s3_upload_max_inflight_parts, "256");
 
 // The min thread num for NonBlockCloseThreadPool
 DEFINE_Int64(min_nonblock_close_thread_num, "12");
