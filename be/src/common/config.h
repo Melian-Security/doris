@@ -1330,6 +1330,11 @@ DECLARE_Int32(blocking_pipeline_executor_size);
 // block file cache
 DECLARE_Bool(enable_file_cache);
 DECLARE_mBool(enable_file_cache_write_from_s3_file_writer);
+// After a file cache block file is written, wait for its writeback and drop its pages from the
+// page cache. Cached blocks are read through the cache's own reader, and keeping every written
+// block's pages makes dirty page cache pile up against the BE's memory limit, which turns reclaim
+// into waits on writeback for every allocating thread.
+DECLARE_mBool(file_cache_drop_page_cache_after_write);
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}]

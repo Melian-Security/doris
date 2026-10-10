@@ -1288,6 +1288,7 @@ DEFINE_Bool(enable_file_cache, "false");
 // Disable this for tests that need load and compaction output to bypass file cache while keeping
 // query-side file cache writes enabled.
 DEFINE_mBool(enable_file_cache_write_from_s3_file_writer, "true");
+DEFINE_mBool(file_cache_drop_page_cache_after_write, "true");
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: {"path": "/path/to/file_cache", "total_size":53687091200, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}

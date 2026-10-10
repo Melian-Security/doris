@@ -30,7 +30,7 @@ namespace doris::io {
 struct FileCacheAllocatorBuilder;
 class LocalFileWriter final : public FileWriter {
 public:
-    LocalFileWriter(Path path, int fd, bool sync_data = true);
+    LocalFileWriter(Path path, int fd, bool sync_data = true, bool drop_page_cache = false);
     ~LocalFileWriter() override;
 
     Status appendv(const Slice* data, size_t data_cnt) override;
@@ -44,11 +44,13 @@ private:
     Status _finalize();
     void _abort();
     Status _close(bool sync);
+    void _drop_page_cache();
 
     Path _path;
     int _fd; // owned
     bool _dirty = false;
     const bool _sync_data = true;
+    const bool _drop_page_cache_on_close = false;
     size_t _bytes_appended = 0;
     State _state {State::OPENED};
 };
