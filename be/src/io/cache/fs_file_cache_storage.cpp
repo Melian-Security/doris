@@ -116,33 +116,49 @@ FDCache* FDCache::instance() {
     return ExecEnv::GetInstance()->file_cache_open_fd_cache();
 }
 
+FDCache::Shard& FDCache::_shard_of(const AccessKeyAndOffset& key) {
+    return _shards[KeyAndOffsetHash()(key) % kShardCount];
+}
+
 std::shared_ptr<FileReader> FDCache::get_file_reader(const AccessKeyAndOffset& key) {
     if (config::file_cache_max_file_reader_cache_size == 0) [[unlikely]] {
         return nullptr;
     }
     DCHECK(ExecEnv::GetInstance());
-    std::shared_lock rlock(_mtx);
-    if (auto iter = _file_name_to_reader.find(key); iter != _file_name_to_reader.end()) {
-        return iter->second->second;
+    auto& shard = _shard_of(key);
+    std::shared_lock rlock(shard.mtx);
+    if (auto iter = shard.readers.find(key); iter != shard.readers.end()) {
+        return iter->second.reader;
     }
     return nullptr;
 }
 
 void FDCache::insert_file_reader(const AccessKeyAndOffset& key,
                                  std::shared_ptr<FileReader> file_reader) {
-    if (config::file_cache_max_file_reader_cache_size == 0) [[unlikely]] {
+    const int64_t capacity = config::file_cache_max_file_reader_cache_size;
+    if (capacity == 0) [[unlikely]] {
         return;
     }
-    std::lock_guard wlock(_mtx);
-
-    if (auto iter = _file_name_to_reader.find(key); iter == _file_name_to_reader.end()) {
-        if (config::file_cache_max_file_reader_cache_size == _file_reader_list.size()) {
-            _file_name_to_reader.erase(_file_reader_list.back().first);
-            _file_reader_list.pop_back();
+    std::lock_guard order_lock(_order_mtx);
+    auto& shard = _shard_of(key);
+    {
+        std::shared_lock rlock(shard.mtx);
+        if (shard.readers.contains(key)) {
+            return;
         }
-        _file_reader_list.emplace_front(key, std::move(file_reader));
-        _file_name_to_reader.insert(std::make_pair(key, _file_reader_list.begin()));
     }
+    while (!_order.empty() && static_cast<int64_t>(_order.size()) >= capacity) {
+        const auto& oldest = _order.back();
+        auto& oldest_shard = _shard_of(oldest);
+        {
+            std::lock_guard wlock(oldest_shard.mtx);
+            oldest_shard.readers.erase(oldest);
+        }
+        _order.pop_back();
+    }
+    _order.push_front(key);
+    std::lock_guard wlock(shard.mtx);
+    shard.readers.emplace(key, Entry {std::move(file_reader), _order.begin()});
 }
 
 void FDCache::remove_file_reader(const AccessKeyAndOffset& key) {
@@ -150,21 +166,24 @@ void FDCache::remove_file_reader(const AccessKeyAndOffset& key) {
         return;
     }
     DCHECK(ExecEnv::GetInstance());
-    std::lock_guard wlock(_mtx);
-    if (auto iter = _file_name_to_reader.find(key); iter != _file_name_to_reader.end()) {
-        _file_reader_list.erase(iter->second);
-        _file_name_to_reader.erase(key);
+    std::lock_guard order_lock(_order_mtx);
+    auto& shard = _shard_of(key);
+    std::lock_guard wlock(shard.mtx);
+    if (auto iter = shard.readers.find(key); iter != shard.readers.end()) {
+        _order.erase(iter->second.order_it);
+        shard.readers.erase(iter);
     }
 }
 
 bool FDCache::contains_file_reader(const AccessKeyAndOffset& key) {
-    std::shared_lock rlock(_mtx);
-    return _file_name_to_reader.contains(key);
+    auto& shard = _shard_of(key);
+    std::shared_lock rlock(shard.mtx);
+    return shard.readers.contains(key);
 }
 
 size_t FDCache::file_reader_cache_size() {
-    std::shared_lock rlock(_mtx);
-    return _file_reader_list.size();
+    std::lock_guard order_lock(_order_mtx);
+    return _order.size();
 }
 
 Status FSFileCacheStorage::init(BlockFileCache* mgr) {
