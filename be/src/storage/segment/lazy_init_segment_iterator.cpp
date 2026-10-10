@@ -19,6 +19,7 @@
 
 #include <typeinfo>
 
+#include "storage/rowset/beta_rowset.h"
 #include "storage/segment/segment_loader.h"
 
 namespace doris::segment_v2 {
