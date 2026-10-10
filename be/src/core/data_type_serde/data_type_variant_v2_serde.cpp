@@ -443,11 +443,21 @@ void read_binary_variant_rows(ColumnVariantV2& result, const arrow::StructArray&
                               const MetadataArray& metadata_array, const ValueArray& value_array,
                               int64_t start, int64_t end) {
     if (config::enable_arrow_input_validation) {
-        check_arrow_array_range(array, start, end);
+        // Unlike check_arrow_array_range, a non-zero offset is accepted: StructArray::field()
+        // slices the children whenever the struct itself is a slice. The bitmap and offsets
+        // checks below cover offset + length.
+        for (const arrow::Array* checked :
+             {static_cast<const arrow::Array*>(&array), static_cast<const arrow::Array*>(&metadata_array),
+              static_cast<const arrow::Array*>(&value_array)}) {
+            arrow_validation_detail::check_arrow_length_and_offset(*checked);
+            if (start < 0 || end < start || end > checked->length()) {
+                arrow_validation_detail::throw_invalid_arrow(
+                        *checked, "read range is invalid: start={}, end={}, length={}", start, end,
+                        checked->length());
+            }
+        }
         check_arrow_validity_bitmap(array);
-        check_arrow_array_range(metadata_array, start, end);
         check_arrow_binary_offsets_buffer(metadata_array);
-        check_arrow_array_range(value_array, start, end);
         check_arrow_binary_offsets_buffer(value_array);
     }
     const auto rows = static_cast<size_t>(end - start);

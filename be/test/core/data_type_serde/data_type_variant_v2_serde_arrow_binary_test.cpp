@@ -19,7 +19,49 @@
 // in struct<metadata: binary, value: binary>. These tests pin that both shapes load the same
 // Variant for the same document.
 //
-// JSON_TO_VARIANT_TYPING_RULES
+// JSON to Variant typing rules of JsonStringToVariantEncoder, which a binary producer must follow
+// to store what a JSON text load stores. JsonEncoderTypingRules pins the bytes.
+//
+// Numbers (exprs/function/parse/variant_string_parse.cpp JsonTreeCollector::collect). simdjson
+// classifies each number; the encoder never emits FLOAT or DECIMAL4/8, and never a decimal for a
+// number written with a fraction or an exponent.
+// - Integer literal that fits int64: the narrowest of INT8 (id 3), INT16 (4), INT32 (5), INT64 (6)
+//   holding it (core/value/variant/variant_scalar.cpp minimum_integer_width). -0 is INT8 0.
+// - Integer literal in (INT64_MAX, UINT64_MAX]: DECIMAL16 (id 10) with scale 0
+//   (VariantBatchBuilder::Row::add_largeint): header 0x28, scale byte 0x00, 16-byte little-endian
+//   two's-complement unscaled value.
+// - Any other number (fraction, exponent, or an integer outside [INT64_MIN, UINT64_MAX]): DOUBLE
+//   (id 7), the IEEE-754 bits of simdjson's correctly rounded parse, 8 bytes little-endian.
+//   -0.0 keeps its sign bit.
+// Other scalars: null 0x00, true 0x04, false 0x08. A string of at most 63 UTF-8 bytes is a short
+// string, header (length << 2) | 1, else primitive STRING (id 16), header 0x40, then a 4-byte
+// little-endian length (variant_scalar.cpp VariantScalarRef::write_physical). Escapes are decoded;
+// strings are not normalized.
+//
+// Containers (core/value/variant/variant_batch_builder.cpp plan_node / write_node). Integer fields
+// use the narrowest of 1, 2, 3 or 4 bytes (variant_parquet_encoding.h
+// variant_minimum_unsigned_width).
+// - Object: header 0x02 | (offset_width - 1) << 2 | (id_width - 1) << 4 | is_large << 6.
+//   is_large when it has more than 255 fields (then a 4-byte count). Fields are ordered by key
+//   bytes, which is also field-id order; values are written in that same order. id_width covers
+//   the largest field id used; offset_width covers the total child value bytes. A repeated key
+//   is an error ("Duplicate Variant object key"), unless
+//   variant_enable_duplicate_json_path_check is on and the first occurrence wins.
+//   {} is 02 00 00.
+// - Array: header 0x03 | (offset_width - 1) << 2 | is_large << 4, elements in JSON order.
+//   [] is 03 00 00.
+//
+// Metadata (VariantMetadataBuilder::seal): one dictionary per encoder batch, not per row. It holds
+// every key of every row of the batch, deduplicated and sorted by bytes, with the sorted_strings
+// bit always set: header 0x11 | (offset_width - 1) << 6, where offset_width covers
+// max(key count, total key bytes); then the count, count + 1 offsets and the key bytes. A batch
+// with no keys has 11 00 00. Because field ids and id_width come from the batch dictionary, a
+// value's bytes depend on the other rows of its batch; per-row dictionaries are equally valid and
+// load as the same Variant.
+//
+// Inputs (JsonStringToVariantEncoder add_json_row): an empty document is {}; an unparsable one is
+// the raw text as a string, or an error when variant_throw_exeception_on_invalid_json is set.
+// Nesting is limited to 128 levels and keys to variant_max_json_key_length (255) bytes.
 
 #include <arrow/array/array_nested.h>
 #include <arrow/array/builder_binary.h>
@@ -112,7 +154,6 @@ const std::vector<std::string>& tricky_documents() {
             R"("a string that is longer than sixty-three bytes, so it is a long primitive string")",
             R"("é中😀 \"q\" \\ \/ \b\f\n\r\t é中😀")",
             R"({"":0,"é":1,"A":2,"a":3,"aa":4,"b":{"a":[1.25,-3,"x"]}})",
-            R"({"dup":1,"dup":2})",
             R"({"n":{"n":{"n":{"n":{"n":[[[[1]]]]}}}}})",
             R"([1,-1,300,-70000,5000000000,1.5,1e2,"s",null,true,{"k":"v"}])",
     };
@@ -309,7 +350,10 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonTextAndBinaryStructMatchWithShar
     for (bool value_first : {true, false}) {
         auto array = write_binary_struct(*json_column, value_first);
         auto binary_column = ColumnVariantV2::create();
-        ASSERT_TRUE(read_arrow(*binary_column, *array, 0, array->length()).ok());
+        {
+            const Status status = read_arrow(*binary_column, *array, 0, array->length());
+            ASSERT_TRUE(status.ok()) << status;
+        }
         ASSERT_EQ(binary_column->size(), documents.size());
         EXPECT_EQ(binary_column->read_view().metadata_count(), 1);
         expect_same_rows(*json_column, 0, *binary_column, 0, documents.size());
@@ -330,7 +374,10 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonTextAndBinaryStructMatchWithPerR
     for (bool value_first : {true, false}) {
         auto array = write_binary_struct(*per_row, value_first);
         auto binary_column = ColumnVariantV2::create();
-        ASSERT_TRUE(read_arrow(*binary_column, *array, 0, array->length()).ok());
+        {
+            const Status status = read_arrow(*binary_column, *array, 0, array->length());
+            ASSERT_TRUE(status.ok()) << status;
+        }
         ASSERT_EQ(binary_column->size(), documents.size());
         EXPECT_EQ(binary_column->read_view().metadata_count(),
                   per_row->read_view().metadata_count());
@@ -339,6 +386,82 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonTextAndBinaryStructMatchWithPerR
             EXPECT_EQ(row_bytes(*binary_column, row), row_bytes(*per_row, row)) << row;
         }
     }
+}
+
+// The JSON text path rejects an object with a repeated key unless
+// variant_enable_duplicate_json_path_check is on (then the first occurrence wins), so a binary
+// producer must never emit one: Variant validation rejects repeated keys too.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DuplicateKeysAreRejectedOnBothPaths) {
+    auto text = make_utf8({R"({"dup":1,"dup":2})"});
+    auto column = ColumnVariantV2::create();
+    EXPECT_FALSE(read_arrow(*column, *text, 0, 1).ok());
+    EXPECT_EQ(column->size(), 0);
+
+    // {"dup":1,"dup":2} encoded by hand against a one-key dictionary.
+    const std::string metadata("\x11\x01\x00\x03dup", 7);
+    const std::string value("\x02\x02\x00\x00\x00\x02\x04\x0c\x01\x0c\x02", 11);
+    auto array = make_binary_struct({EncodedRow {metadata, value}});
+    EXPECT_FALSE(read_arrow(*column, *array, 0, 1).ok());
+    EXPECT_EQ(column->size(), 0);
+}
+
+// Pins the exact bytes JsonStringToVariantEncoder writes for one document per batch, so a binary
+// producer can reproduce them. See the typing rules at the top of this file.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonEncoderTypingRules) {
+    auto hex = [](std::string_view bytes) {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string out;
+        for (unsigned char byte : bytes) {
+            out.push_back(digits[byte >> 4]);
+            out.push_back(digits[byte & 0x0f]);
+        }
+        return out;
+    };
+    const std::string empty_metadata = "110000";
+    const std::vector<std::pair<std::string, std::string>> scalars = {
+            {"0", "0c00"},
+            {"-0", "0c00"},
+            {"127", "0c7f"},
+            {"-128", "0c80"},
+            {"128", "108000"},
+            {"-129", "107fff"},
+            {"32768", "1400800000"},
+            {"-2147483648", "1400000080"},
+            {"2147483648", "180000008000000000"},
+            {"-9223372036854775808", "180000000000000080"},
+            {"9223372036854775808", "280000000000000000800000000000000000"},
+            {"18446744073709551615", "2800ffffffffffffffff0000000000000000"},
+            {"18446744073709551616", "1c000000000000f043"},
+            {"-9223372036854775809", "1c000000000000e0c3"},
+            {"123456789012345678901234567890", "1c3e376cff90eef845"},
+            {"1.0", "1c000000000000f03f"},
+            {"-0.0", "1c0000000000000080"},
+            {"0.1", "1c9a9999999999b93f"},
+            {"1e3", "1c0000000000408f40"},
+            {"1.5E-2", "1cb81e85eb51b88e3f"},
+            {"true", "04"},
+            {"false", "08"},
+            {"null", "00"},
+            {R"("")", "01"},
+            {R"("ab")", "096162"},
+            {R"("\u00e9")", "09c3a9"},
+            {"\"" + std::string(63, 'x') + "\"", "fd" + hex(std::string(63, 'x'))},
+            {"\"" + std::string(64, 'x') + "\"", "4040000000" + hex(std::string(64, 'x'))},
+            {"{}", "020000"},
+            {"[]", "030000"},
+            {"[1,\"a\"]", "03020002040c01056" "1"},
+    };
+    for (const auto& [document, expected] : scalars) {
+        const EncodedRow row = encode_one(document);
+        EXPECT_EQ(hex(row.first), empty_metadata) << document;
+        EXPECT_EQ(hex(row.second), expected) << document;
+    }
+
+    // Keys are sorted by bytes in the dictionary (sorted_strings set) and object fields follow
+    // the sorted ids, whatever the JSON order.
+    const EncodedRow object = encode_one(R"({"b":1,"a":2})");
+    EXPECT_EQ(hex(object.first), "1102000102" + hex("ab"));
+    EXPECT_EQ(hex(object.second), "0202000100020" "40c020c01");
 }
 
 // Mixed batches append to one column, as the Arrow batches of one stream do.
@@ -417,7 +540,8 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, SlicedArrayAndRangeUseLogicalRows) {
         auto sliced = array->Slice(3, 6); // rows 3..8
         ASSERT_EQ(sliced->offset(), 3);
         auto column = ColumnVariantV2::create();
-        ASSERT_TRUE(read_arrow(*column, *sliced, 1, 5).ok()); // rows 4..7
+        const Status status = read_arrow(*column, *sliced, 1, 5); // rows 4..7
+        ASSERT_TRUE(status.ok()) << status;
         ASSERT_EQ(column->size(), 4);
         EXPECT_EQ(json_at(*column, 0), R"({"i":4,"s":"v4"})");
         EXPECT_EQ(json_at(*column, 1), "null");
