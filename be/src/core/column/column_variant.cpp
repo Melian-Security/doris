@@ -358,19 +358,31 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
     }
     size_t end = start + length;
     num_rows += length;
+    const DataTypePtr& src_type = src.get_least_common_type();
     if (data.empty()) {
-        add_new_column_part(src.get_least_common_type());
-    } else if (!least_common_type.get()->equals(*src.get_least_common_type())) {
-        DataTypePtr new_least_common_type =
-                resolve_ng_type_conflict(least_common_type.get(), src.get_least_common_type());
-        if (new_least_common_type == nullptr) {
-            // Normal (non-NG) type promotion.
-            get_least_supertype_jsonb(
-                    DataTypes {least_common_type.get(), src.get_least_common_type()},
-                    &new_least_common_type);
-        }
-        if (!new_least_common_type->equals(*least_common_type.get())) {
-            add_new_column_part(std::move(new_least_common_type));
+        add_new_column_part(src_type);
+        _remember_covered_src_type(src_type);
+    } else if (!_covers_src_type(src_type)) {
+        if (!least_common_type.get()->equals(*src_type)) {
+            DataTypePtr new_least_common_type =
+                    resolve_ng_type_conflict(least_common_type.get(), src_type);
+            // An NG conflict outcome depends on a mutable config, so only the pure supertype
+            // outcome is memoized.
+            const bool is_ng_conflict = new_least_common_type != nullptr;
+            if (!is_ng_conflict) {
+                // Normal (non-NG) type promotion.
+                get_least_supertype_jsonb(DataTypes {least_common_type.get(), src_type},
+                                          &new_least_common_type);
+            }
+            if (!new_least_common_type->equals(*least_common_type.get())) {
+                // The next slice from this source re-verifies against the new type
+                // before the memo records it.
+                add_new_column_part(std::move(new_least_common_type));
+            } else if (!is_ng_conflict) {
+                _remember_covered_src_type(src_type);
+            }
+        } else {
+            _remember_covered_src_type(src_type);
         }
     }
     if (end <= src.num_of_defaults_in_prefix) {
@@ -388,7 +400,8 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
                     "Invalid range for insert_range_from: from={}, n={}, column.size={}", from, n,
                     column->size());
         }
-        if (column_type->equals(*least_common_type.get())) {
+        if (column_type.get() == least_common_type.get().get() ||
+            column_type->equals(*least_common_type.get())) {
             data.back()->insert_range_from(*column, from, n);
             return;
         }
@@ -396,7 +409,7 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
         // be discarded under DISCARD_SCALAR. Mixed regular arrays such as
         // [null, "plain_text", 123, {"k":"v"}] must still get a chance to cast
         // into the NG-compatible array type during query-side merges.
-        if (is_nested_group_type(least_common_type.get())) {
+        if (_least_common_type_is_nested_group()) {
             const bool src_is_scalar = get_number_of_dimensions(*column_type) == 0;
             if (src_is_scalar) {
                 if (!config::variant_nested_group_discard_scalar_on_conflict) {
@@ -417,7 +430,7 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
             Status st = variant_util::cast_column({column, column_type, ""},
                                                   least_common_type.get(), &casted_column);
             if (!st.ok()) {
-                if (is_nested_group_type(least_common_type.get()) &&
+                if (_least_common_type_is_nested_group() &&
                     config::variant_nested_group_discard_scalar_on_conflict) {
                     data.back()->insert_many_defaults(n);
                     return;
@@ -431,7 +444,7 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
         Status st = variant_util::cast_column({casted_column, column_type, ""},
                                               least_common_type.get(), &casted_column);
         if (!st.ok()) {
-            if (is_nested_group_type(least_common_type.get()) &&
+            if (_least_common_type_is_nested_group() &&
                 config::variant_nested_group_discard_scalar_on_conflict) {
                 data.back()->insert_many_defaults(n);
                 return;
@@ -466,6 +479,43 @@ void ColumnVariant::Subcolumn::insert_range_from(const Subcolumn& src, size_t st
         size_t part_end = end - processed_rows;
         insert_from_part(src.data[pos], src.data_types[pos], 0, part_end);
     }
+}
+
+bool ColumnVariant::Subcolumn::_covers_src_type(const DataTypePtr& src_type) const {
+    const IDataType* lct = least_common_type.get().get();
+    if (src_type.get() == lct) {
+        return true;
+    }
+    if (_covered_lct == nullptr || lct != _covered_lct.get()) {
+        return false;
+    }
+    return std::any_of(_covered_src_types.begin(), _covered_src_types.end(),
+                       [&](const DataTypePtr& covered) { return covered.get() == src_type.get(); });
+}
+
+void ColumnVariant::Subcolumn::_remember_covered_src_type(const DataTypePtr& src_type) {
+    if (_covered_lct != least_common_type.get()) {
+        _covered_lct = least_common_type.get();
+        _covered_lct_is_nested_group = is_nested_group_type(_covered_lct);
+        for (auto& covered : _covered_src_types) {
+            covered.reset();
+        }
+        _next_covered_src_type = 0;
+    }
+    for (const auto& covered : _covered_src_types) {
+        if (covered == src_type) {
+            return;
+        }
+    }
+    _covered_src_types[_next_covered_src_type] = src_type;
+    _next_covered_src_type = (_next_covered_src_type + 1) % NUM_COVERED_SRC_TYPES;
+}
+
+bool ColumnVariant::Subcolumn::_least_common_type_is_nested_group() const {
+    if (_covered_lct != nullptr && least_common_type.get() == _covered_lct) {
+        return _covered_lct_is_nested_group;
+    }
+    return is_nested_group_type(least_common_type.get());
 }
 
 bool ColumnVariant::Subcolumn::is_finalized() const {

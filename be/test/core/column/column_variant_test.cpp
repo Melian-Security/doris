@@ -3690,4 +3690,240 @@ TEST_F(ColumnVariantTest, deserialize_mixed_array_elements) {
             << subcolumn.get_least_common_type()->get_name();
 }
 
+namespace {
+
+ColumnVariant::Subcolumn make_finalized_subcolumn(const std::vector<Field>& fields) {
+    ColumnVariant::Subcolumn subcolumn(0, true /* is_nullable */, false /* is_root */);
+    for (const auto& field : fields) {
+        subcolumn.insert(field);
+    }
+    subcolumn.finalize();
+    return subcolumn;
+}
+
+void clear_insert_range_memo(ColumnVariant::Subcolumn& subcolumn) {
+    for (auto& covered : subcolumn._covered_src_types) {
+        covered.reset();
+    }
+    subcolumn._next_covered_src_type = 0;
+    subcolumn._covered_lct.reset();
+}
+
+// Inserts one row at a time from each source in turn, as compaction does for interleaved
+// rowsets. With defeat_memo every slice resolves the source type from scratch.
+void insert_interleaved(ColumnVariant::Subcolumn& dst,
+                        const std::vector<const ColumnVariant::Subcolumn*>& sources, size_t rows,
+                        bool defeat_memo) {
+    for (size_t row = 0; row < rows; ++row) {
+        for (const auto* source : sources) {
+            if (defeat_memo) {
+                clear_insert_range_memo(dst);
+            }
+            dst.insert_range_from(*source, row, 1);
+        }
+    }
+}
+
+void expect_same_types_and_sizes(const ColumnVariant::Subcolumn& actual,
+                                 const ColumnVariant::Subcolumn& expected) {
+    EXPECT_EQ(actual.get_least_common_type()->get_name(),
+              expected.get_least_common_type()->get_name());
+    ASSERT_EQ(actual.data_types.size(), expected.data_types.size());
+    ASSERT_EQ(actual.data.size(), expected.data.size());
+    for (size_t i = 0; i < actual.data_types.size(); ++i) {
+        EXPECT_EQ(actual.data_types[i]->get_name(), expected.data_types[i]->get_name()) << i;
+        EXPECT_EQ(actual.data[i]->size(), expected.data[i]->size()) << i;
+    }
+    ASSERT_EQ(actual.size(), expected.size());
+}
+
+void expect_same_subcolumn(const ColumnVariant::Subcolumn& actual,
+                           const ColumnVariant::Subcolumn& expected) {
+    expect_same_types_and_sizes(actual, expected);
+    for (size_t row = 0; row < actual.size(); ++row) {
+        FieldWithDataType actual_field;
+        FieldWithDataType expected_field;
+        actual.get(row, actual_field);
+        expected.get(row, expected_field);
+        EXPECT_TRUE(actual_field.field == expected_field.field) << "row " << row;
+    }
+}
+
+std::vector<std::string> data_type_names(const ColumnVariant::Subcolumn& subcolumn) {
+    std::vector<std::string> names;
+    for (const auto& type : subcolumn.data_types) {
+        names.push_back(type->get_name());
+    }
+    return names;
+}
+
+} // namespace
+
+TEST_F(ColumnVariantTest, subcolumn_insert_range_from_memo_int8_int64) {
+    const auto int8_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_TINYINT>(1), Field::create_field<TYPE_TINYINT>(-2),
+             Field::create_field<TYPE_TINYINT>(3), Field::create_field<TYPE_TINYINT>(127)});
+    const auto int64_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_BIGINT>(922337203685477588),
+             Field::create_field<TYPE_BIGINT>(-5), Field::create_field<TYPE_BIGINT>(70000),
+             Field::create_field<TYPE_BIGINT>(0)});
+    const std::vector<const ColumnVariant::Subcolumn*> sources {&int8_source, &int64_source};
+
+    ColumnVariant::Subcolumn memoized(0, true, false);
+    insert_interleaved(memoized, sources, 4, false);
+    ColumnVariant::Subcolumn reference(0, true, false);
+    insert_interleaved(reference, sources, 4, true);
+
+    expect_same_subcolumn(memoized, reference);
+    EXPECT_EQ(memoized.get_least_common_type()->get_name(), "Nullable(BIGINT)");
+    EXPECT_EQ(data_type_names(memoized),
+              (std::vector<std::string> {"Nullable(TINYINT)", "Nullable(BIGINT)"}));
+    EXPECT_EQ(memoized.size(), 8);
+    // The promoted type is neither source's type object, so both sources are served by the memo.
+    EXPECT_TRUE(memoized._covers_src_type(int8_source.get_least_common_type()));
+    EXPECT_TRUE(memoized._covers_src_type(int64_source.get_least_common_type()));
+
+    memoized.finalize();
+    reference.finalize();
+    expect_same_subcolumn(memoized, reference);
+}
+
+TEST_F(ColumnVariantTest, subcolumn_insert_range_from_memo_int64_string) {
+    const auto int64_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_BIGINT>(1), Field::create_field<TYPE_BIGINT>(-2),
+             Field::create_field<TYPE_BIGINT>(922337203685477588)});
+    const auto string_source = make_finalized_subcolumn({Field::create_field<TYPE_STRING>("a"),
+                                                         Field::create_field<TYPE_STRING>("bc"),
+                                                         Field::create_field<TYPE_STRING>("")});
+    const std::vector<const ColumnVariant::Subcolumn*> sources {&int64_source, &string_source};
+
+    ColumnVariant::Subcolumn memoized(0, true, false);
+    insert_interleaved(memoized, sources, 3, false);
+    ColumnVariant::Subcolumn reference(0, true, false);
+    insert_interleaved(reference, sources, 3, true);
+
+    expect_same_subcolumn(memoized, reference);
+    EXPECT_EQ(memoized.get_least_common_type()->get_name(), "Nullable(JSONB)");
+    EXPECT_EQ(data_type_names(memoized),
+              (std::vector<std::string> {"Nullable(BIGINT)", "Nullable(JSONB)"}));
+    EXPECT_EQ(memoized.size(), 6);
+
+    memoized.finalize();
+    reference.finalize();
+    expect_same_subcolumn(memoized, reference);
+}
+
+TEST_F(ColumnVariantTest, subcolumn_insert_range_from_memo_promotes_after_hit) {
+    const auto int8_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_TINYINT>(1), Field::create_field<TYPE_TINYINT>(2),
+             Field::create_field<TYPE_TINYINT>(3), Field::create_field<TYPE_TINYINT>(4)});
+    const auto int8_other_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_TINYINT>(5), Field::create_field<TYPE_TINYINT>(6),
+             Field::create_field<TYPE_TINYINT>(7), Field::create_field<TYPE_TINYINT>(8)});
+    const auto int16_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_SMALLINT>(1000), Field::create_field<TYPE_SMALLINT>(-1000),
+             Field::create_field<TYPE_SMALLINT>(32000), Field::create_field<TYPE_SMALLINT>(0)});
+    const auto string_source = make_finalized_subcolumn(
+            {Field::create_field<TYPE_STRING>("x"), Field::create_field<TYPE_STRING>("y"),
+             Field::create_field<TYPE_STRING>("z"), Field::create_field<TYPE_STRING>("w")});
+
+    auto run = [&](ColumnVariant::Subcolumn& dst, bool defeat_memo) {
+        // Two Int8 sources settle the memo on Nullable(TINYINT).
+        insert_interleaved(dst, {&int8_source, &int8_other_source}, 2, defeat_memo);
+        EXPECT_EQ(dst.get_least_common_type()->get_name(), "Nullable(TINYINT)");
+        // A wider source must still promote after the memo has been hit.
+        if (defeat_memo) {
+            clear_insert_range_memo(dst);
+        }
+        dst.insert_range_from(int16_source, 0, 2);
+        EXPECT_EQ(dst.get_least_common_type()->get_name(), "Nullable(SMALLINT)");
+        insert_interleaved(dst, {&int8_source, &int16_source}, 2, defeat_memo);
+        EXPECT_EQ(dst.get_least_common_type()->get_name(), "Nullable(SMALLINT)");
+        // And a string source must still promote to JSONB.
+        if (defeat_memo) {
+            clear_insert_range_memo(dst);
+        }
+        dst.insert_range_from(string_source, 0, 2);
+        EXPECT_EQ(dst.get_least_common_type()->get_name(), "Nullable(JSONB)");
+        insert_interleaved(dst, {&int8_source, &int16_source, &string_source}, 4, defeat_memo);
+    };
+
+    ColumnVariant::Subcolumn memoized(0, true, false);
+    run(memoized, false);
+    ColumnVariant::Subcolumn reference(0, true, false);
+    run(reference, true);
+
+    expect_same_subcolumn(memoized, reference);
+    EXPECT_EQ(data_type_names(memoized),
+              (std::vector<std::string> {"Nullable(TINYINT)", "Nullable(SMALLINT)",
+                                         "Nullable(JSONB)"}));
+    EXPECT_EQ(memoized.size(), 4 + 2 + 4 + 2 + 12);
+
+    memoized.finalize();
+    reference.finalize();
+    expect_same_subcolumn(memoized, reference);
+}
+
+TEST_F(ColumnVariantTest, subcolumn_insert_range_from_memo_nested_group) {
+    const bool saved_discard = config::variant_nested_group_discard_scalar_on_conflict;
+    config::variant_nested_group_discard_scalar_on_conflict = true;
+
+    auto ng_column = ColumnVariant::NESTED_TYPE->create_column();
+    ng_column->insert_many_defaults(3);
+    const ColumnVariant::Subcolumn ng_source(std::move(ng_column), ColumnVariant::NESTED_TYPE,
+                                             true /* is_nullable */, false /* is_root */);
+    const auto scalar_source = make_finalized_subcolumn({Field::create_field<TYPE_BIGINT>(1),
+                                                         Field::create_field<TYPE_BIGINT>(2),
+                                                         Field::create_field<TYPE_BIGINT>(3)});
+
+    auto expect_same_nulls = [](const ColumnVariant::Subcolumn& actual,
+                                const ColumnVariant::Subcolumn& expected) {
+        expect_same_types_and_sizes(actual, expected);
+        for (size_t part = 0; part < actual.data.size(); ++part) {
+            for (size_t row = 0; row < actual.data[part]->size(); ++row) {
+                EXPECT_EQ(actual.data[part]->is_null_at(row), expected.data[part]->is_null_at(row))
+                        << "part " << part << " row " << row;
+            }
+        }
+    };
+
+    // NG first: scalar slices are discarded as defaults and the LCT stays Array<Variant>.
+    {
+        const std::vector<const ColumnVariant::Subcolumn*> sources {&ng_source, &scalar_source};
+        ColumnVariant::Subcolumn memoized(0, true, false);
+        insert_interleaved(memoized, sources, 3, false);
+        ColumnVariant::Subcolumn reference(0, true, false);
+        insert_interleaved(reference, sources, 3, true);
+
+        expect_same_nulls(memoized, reference);
+        EXPECT_EQ(memoized.data_types.size(), 1);
+        EXPECT_TRUE(memoized.get_least_common_type()->equals(*ColumnVariant::NESTED_TYPE));
+        EXPECT_TRUE(memoized._least_common_type_is_nested_group());
+        EXPECT_EQ(memoized.size(), 6);
+        // An NG conflict outcome depends on a mutable config, so it is never memoized.
+        EXPECT_FALSE(memoized._covers_src_type(scalar_source.get_least_common_type()));
+
+        config::variant_nested_group_discard_scalar_on_conflict = false;
+        EXPECT_THROW(memoized.insert_range_from(scalar_source, 0, 1), doris::Exception);
+        config::variant_nested_group_discard_scalar_on_conflict = true;
+    }
+
+    // Scalar first: the NG source takes over the LCT.
+    {
+        const std::vector<const ColumnVariant::Subcolumn*> sources {&scalar_source, &ng_source};
+        ColumnVariant::Subcolumn memoized(0, true, false);
+        insert_interleaved(memoized, sources, 3, false);
+        ColumnVariant::Subcolumn reference(0, true, false);
+        insert_interleaved(reference, sources, 3, true);
+
+        expect_same_nulls(memoized, reference);
+        EXPECT_EQ(memoized.data_types.size(), 2);
+        EXPECT_EQ(memoized.data_types[0]->get_name(), "Nullable(BIGINT)");
+        EXPECT_TRUE(memoized.get_least_common_type()->equals(*ColumnVariant::NESTED_TYPE));
+        EXPECT_EQ(memoized.size(), 6);
+    }
+
+    config::variant_nested_group_discard_scalar_on_conflict = saved_discard;
+}
+
 } // namespace doris
