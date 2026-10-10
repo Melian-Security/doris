@@ -26,6 +26,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -243,6 +244,16 @@ public:
 
         void wrapp_array_nullable();
 
+        // True when the type resolution in insert_range_from is known to leave
+        // least_common_type unchanged for a source whose least common type is src_type.
+        bool _covers_src_type(const DataTypePtr& src_type) const;
+
+        // Records that src_type was verified to leave the current least_common_type unchanged.
+        void _remember_covered_src_type(const DataTypePtr& src_type);
+
+        // is_nested_group_type(least_common_type.get()), served from the memo when it matches.
+        bool _least_common_type_is_nested_group() const;
+
         /// Current least common type of all values inserted to this subcolumn.
         LeastCommonType least_common_type;
         /// If true then common type type of subcolumn is Nullable
@@ -264,6 +275,20 @@ public:
         size_t num_rows = 0;
         // distinguish from num_of_defaults_in_prefix when data is not empty
         size_t current_num_of_defaults = 0;
+        // Source least common types known to be covered by _covered_lct, keyed on pointers:
+        // while _covered_lct is still the current least_common_type, a source whose type is one
+        // of _covered_src_types needs no type resolution, so repeated slices from the same
+        // sources skip it. A few entries let interleaved slices from several input rowsets hit
+        // without evicting each other. Data types are immutable, so pointer identity implies
+        // type identity and every reassignment of least_common_type either keeps the covered
+        // type or misses the memo. All are owning pointers so a freed type's address cannot be
+        // reused by a different type and produce a false hit.
+        static constexpr size_t NUM_COVERED_SRC_TYPES = 4;
+        std::array<DataTypePtr, NUM_COVERED_SRC_TYPES> _covered_src_types;
+        size_t _next_covered_src_type = 0;
+        DataTypePtr _covered_lct;
+        // is_nested_group_type(_covered_lct), computed when _covered_lct is set.
+        bool _covered_lct_is_nested_group = false;
     };
     using Subcolumns = SubcolumnsTree<Subcolumn, false>;
 
