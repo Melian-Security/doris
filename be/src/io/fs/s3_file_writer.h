@@ -74,7 +74,9 @@ public:
     Status try_finish_close() override;
 
     // True when this writer's parts and async close run on the compaction pools and its
-    // submitted parts count against UploadBufferInflightLimiter::compaction().
+    // submitted parts count against UploadBufferInflightLimiter::compaction(); otherwise
+    // they count against UploadBufferInflightLimiter::load() unless
+    // FileWriterOptions::bound_load_upload_inflight is false.
     bool uses_background_pools() const { return _background_write; }
 
 private:
@@ -127,6 +129,8 @@ private:
     // Fixed at construction from FileWriterOptions::background_write and
     // config::enable_separate_compaction_s3_upload_pool.
     bool _background_write;
+    // From FileWriterOptions::bound_load_upload_inflight; ignored for background writers.
+    bool _bound_load_upload_inflight;
     std::unique_ptr<AsyncCloseStatusPack> _async_close_pack;
     State _state {State::OPENED};
     std::shared_ptr<ObjClientHolder> _obj_client;

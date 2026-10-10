@@ -75,6 +75,7 @@ S3FileWriter::S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string 
           _used_by_s3_committer(opts ? opts->used_by_s3_committer : false),
           _background_write(opts != nullptr && opts->background_write &&
                             config::enable_separate_compaction_s3_upload_pool),
+          _bound_load_upload_inflight(opts == nullptr || opts->bound_load_upload_inflight),
           _obj_client(std::move(client)) {
     s3_file_writer_total << 1;
     s3_file_being_written << 1;
@@ -309,12 +310,15 @@ Status S3FileWriter::_build_upload_buffer() {
 }
 
 Status S3FileWriter::_submit_upload_buffer(const std::shared_ptr<FileBuffer>& buf) {
+    // Taken before add_count(): the permits this may wait on belong to already
+    // submitted buffers, which complete without this writer making progress.
     if (_background_write) {
-        // Taken before add_count(): the permits this may wait on belong to already
-        // submitted buffers, which complete without this writer making progress.
         buf->set_inflight_permit(UploadBufferInflightLimiter::compaction()->acquire());
         s3_file_writer_background_parts << 1;
     } else {
+        if (_bound_load_upload_inflight) {
+            buf->set_inflight_permit(UploadBufferInflightLimiter::load()->acquire());
+        }
         s3_file_writer_load_parts << 1;
     }
     _countdown_event.add_count();

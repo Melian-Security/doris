@@ -1870,6 +1870,11 @@ DECLARE_Int64(compaction_nonblock_close_thread_num);
 // per BE. Each part holds one s3_write_buffer_size buffer, so this bounds that memory.
 // A writer that hits the bound blocks before submitting. <= 0 disables the bound.
 DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
+// Upper bound on load (non background) upload parts submitted but not yet uploaded, across
+// all load S3 file writers per BE. Each part holds one s3_write_buffer_size buffer, so this
+// bounds that memory. A writer that hits the bound blocks before submitting. <= 0 disables
+// the bound.
+DECLARE_mInt64(load_s3_upload_max_inflight_parts);
 
 // Copy an uploaded part into the file cache on S3FileCacheWriterThreadPool instead of on the
 // upload thread, so a slow or contended file cache cannot hold upload threads. A part that
