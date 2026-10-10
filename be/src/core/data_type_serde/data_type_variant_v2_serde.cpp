@@ -501,10 +501,11 @@ void read_binary_variant_rows(ColumnVariantV2& result, const arrow::StructArray&
     if (!metadata_is_shared) {
         // Distinct dictionaries: the appender hashes each dictionary once and indexes the
         // destination's dictionaries instead of scanning them for every new one.
+        // A null row's Variant null references no key, so it borrows the first row's dictionary
+        // rather than adding the empty one.
         for (auto& ref : refs) {
             if (ref.metadata.data == nullptr) {
-                ref.metadata = {.data = VARIANT_EMPTY_METADATA.data(),
-                                .size = VARIANT_EMPTY_METADATA.size()};
+                ref.metadata = {.data = shared_metadata.data, .size = shared_metadata.size};
             }
         }
         auto appender = result.create_encoded_rows_appender();
