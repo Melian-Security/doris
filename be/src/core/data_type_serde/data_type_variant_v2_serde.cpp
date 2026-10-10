@@ -17,10 +17,14 @@
 
 #include "core/data_type_serde/data_type_variant_v2_serde.h"
 
+#include <arrow/array/array_binary.h>
+#include <arrow/array/array_nested.h>
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_nested.h>
+#include <arrow/extension_type.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <orc/Vector.hh>
@@ -29,6 +33,7 @@
 #include <utility>
 
 #include "common/cast_set.h"
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/arena.h"
 #include "core/assert_cast.h"
@@ -368,6 +373,229 @@ Status write_arrow_variant_storage(const IColumn& column, const NullMap* null_ma
 
 thread_local bool trusted_peer_variant_block = false;
 
+constexpr std::string_view ARROW_VARIANT_EXTENSION_NAME = "arrow.parquet.variant";
+
+// A primitive header with primitive id NULL: the Variant JSON null that the JSON text path also
+// stores under a SQL NULL row.
+constexpr std::array<char, 1> VARIANT_NULL_VALUE {0};
+
+bool is_binary_variant_struct_type(const arrow::DataType& type) {
+    if (type.id() != arrow::Type::STRUCT || type.num_fields() != 2) {
+        return false;
+    }
+    bool has_metadata = false;
+    bool has_value = false;
+    for (const auto& field : type.fields()) {
+        const auto child_type = field->type()->id();
+        if (child_type != arrow::Type::BINARY && child_type != arrow::Type::LARGE_BINARY) {
+            return false;
+        }
+        if (field->name() == "metadata" && !has_metadata) {
+            has_metadata = true;
+        } else if (field->name() == "value" && !has_value) {
+            has_value = true;
+        } else {
+            return false;
+        }
+    }
+    return has_metadata && has_value;
+}
+
+// Bytes of one non-null row of a BINARY or LARGE_BINARY child. The StringRef borrows the Arrow
+// data buffer.
+template <typename ArrowBinaryArray>
+StringRef binary_child_bytes(const ArrowBinaryArray& array, int64_t row, std::string_view child) {
+    if (array.IsNull(row)) {
+        throw Exception(ErrorCode::INVALID_ARGUMENT,
+                        "Binary Variant Arrow row {} is not null but its {} is null", row, child);
+    }
+    const auto offset = array.value_offset(row);
+    const auto length = array.value_length(row);
+    const auto& buffer = array.value_data();
+    if (buffer == nullptr && length != 0) {
+        throw Exception(ErrorCode::INVALID_ARGUMENT,
+                        "Binary Variant Arrow {} child has no data buffer", child);
+    }
+    if (config::enable_arrow_input_validation) {
+        check_arrow_value_range(array, offset, length,
+                                buffer ? static_cast<size_t>(buffer->size()) : 0);
+    }
+    if (length == 0) {
+        throw Exception(ErrorCode::INVALID_ARGUMENT,
+                        "Binary Variant Arrow row {} has an empty {}; an encoded Variant {} is "
+                        "never empty",
+                        row, child, child);
+    }
+    if (static_cast<uint64_t>(length) > std::numeric_limits<uint32_t>::max()) {
+        throw Exception(ErrorCode::INVALID_ARGUMENT,
+                        "Binary Variant Arrow row {} {} has {} bytes, over the 4 GiB column limit",
+                        row, child, length);
+    }
+    return {reinterpret_cast<const char*>(buffer->data()) + offset, static_cast<size_t>(length)};
+}
+
+// Appends rows [start, end) of a struct<metadata, value> array whose children have the given
+// concrete binary array types. Every row goes through the validated encoded-row inserters, never
+// the trusted VariantBatchBuilder path. A null struct row becomes Variant null, as a null JSON
+// text row does.
+template <typename MetadataArray, typename ValueArray>
+void read_binary_variant_rows(ColumnVariantV2& result, const arrow::StructArray& array,
+                              const MetadataArray& metadata_array, const ValueArray& value_array,
+                              int64_t start, int64_t end) {
+    if (config::enable_arrow_input_validation) {
+        // Unlike check_arrow_array_range, a non-zero offset is accepted: StructArray::field()
+        // slices the children whenever the struct itself is a slice. The bitmap and offsets
+        // checks below cover offset + length.
+        for (const arrow::Array* checked :
+             {static_cast<const arrow::Array*>(&array), static_cast<const arrow::Array*>(&metadata_array),
+              static_cast<const arrow::Array*>(&value_array)}) {
+            arrow_validation_detail::check_arrow_length_and_offset(*checked);
+            if (start < 0 || end < start || end > checked->length()) {
+                arrow_validation_detail::throw_invalid_arrow(
+                        *checked, "read range is invalid: start={}, end={}, length={}", start, end,
+                        checked->length());
+            }
+        }
+        check_arrow_validity_bitmap(array);
+        check_arrow_binary_offsets_buffer(metadata_array);
+        check_arrow_binary_offsets_buffer(value_array);
+    }
+    const auto rows = static_cast<size_t>(end - start);
+    DorisVector<VariantRef> refs(rows);
+    StringRef shared_metadata;
+    bool metadata_is_shared = true;
+    bool has_null = false;
+    for (size_t index = 0; index < rows; ++index) {
+        const int64_t row = start + static_cast<int64_t>(index);
+        if (array.IsNull(row)) {
+            has_null = true;
+            refs[index].value = {VARIANT_NULL_VALUE.data(), VARIANT_NULL_VALUE.size()};
+            continue;
+        }
+        const StringRef metadata = binary_child_bytes(metadata_array, row, "metadata");
+        refs[index].metadata = {.data = metadata.data, .size = metadata.size};
+        refs[index].value = binary_child_bytes(value_array, row, "value");
+        // Producers normally repeat one dictionary for a whole batch. Byte equality with the first
+        // dictionary keeps such a batch on the single-metadata form without hashing any row.
+        if (shared_metadata.data == nullptr) {
+            shared_metadata = metadata;
+        } else if (metadata_is_shared && !(metadata == shared_metadata)) {
+            metadata_is_shared = false;
+        }
+    }
+    if (shared_metadata.data == nullptr) {
+        shared_metadata = {VARIANT_EMPTY_METADATA.data(), VARIANT_EMPTY_METADATA.size()};
+    }
+
+    // Rows go in chunks whose value bytes fit the uint32 offsets of the encoded-row view.
+    auto next_chunk_end = [&](size_t chunk_start) {
+        uint64_t bytes = 0;
+        size_t row = chunk_start;
+        while (row < rows && bytes + refs[row].value.size <= std::numeric_limits<uint32_t>::max()) {
+            bytes += refs[row].value.size;
+            ++row;
+        }
+        return row;
+    };
+
+    if (!metadata_is_shared) {
+        // Distinct dictionaries: the appender hashes each dictionary once and indexes the
+        // destination's dictionaries instead of scanning them for every new one.
+        // A null row's Variant null references no key, so it borrows the first row's dictionary
+        // rather than adding the empty one.
+        for (auto& ref : refs) {
+            if (ref.metadata.data == nullptr) {
+                ref.metadata = {.data = shared_metadata.data, .size = shared_metadata.size};
+            }
+        }
+        auto appender = result.create_encoded_rows_appender();
+        for (size_t chunk_start = 0; chunk_start < rows;) {
+            const size_t chunk_end = next_chunk_end(chunk_start);
+            appender.append(std::span<const VariantRef>(refs.data() + chunk_start,
+                                                        chunk_end - chunk_start));
+            chunk_start = chunk_end;
+        }
+        return;
+    }
+
+    // One dictionary for every row: the compact form with no per-row metadata ids. Without null
+    // rows the values are already contiguous in the Arrow data buffer and are borrowed; null rows
+    // need their Variant null spliced in.
+    const std::array<uint32_t, 2> metadata_offsets {0, static_cast<uint32_t>(shared_metadata.size)};
+    DorisVector<uint32_t> value_offsets;
+    DorisVector<char> spliced_values;
+    for (size_t chunk_start = 0; chunk_start < rows;) {
+        const size_t chunk_end = next_chunk_end(chunk_start);
+        value_offsets.resize(chunk_end - chunk_start + 1);
+        value_offsets[0] = 0;
+        for (size_t row = chunk_start; row < chunk_end; ++row) {
+            value_offsets[row - chunk_start + 1] = value_offsets[row - chunk_start] +
+                                                   static_cast<uint32_t>(refs[row].value.size);
+        }
+        StringRef value_bytes {refs[chunk_start].value.data, value_offsets.back()};
+        if (has_null) {
+            spliced_values.resize(value_offsets.back());
+            for (size_t row = chunk_start; row < chunk_end; ++row) {
+                std::memcpy(spliced_values.data() + value_offsets[row - chunk_start],
+                            refs[row].value.data, refs[row].value.size);
+            }
+            value_bytes = {spliced_values.data(), spliced_values.size()};
+        }
+        result.insert_encoded_rows({.metadata_bytes = shared_metadata,
+                                    .metadata_offsets = metadata_offsets,
+                                    .meta_ids = {},
+                                    .value_bytes = value_bytes,
+                                    .value_offsets = value_offsets});
+        chunk_start = chunk_end;
+    }
+}
+
+// Reads a struct<metadata, value> array (either child order, BINARY or LARGE_BINARY children)
+// carrying Parquet Variant binary rows. A failure leaves the destination at its original size.
+Status read_binary_variant_arrow(ColumnVariantV2& result, const arrow::StructArray& array,
+                                 int64_t start, int64_t end) {
+    if (!is_binary_variant_struct_type(*array.type())) {
+        return Status::InvalidArgument(
+                "Binary Variant Arrow input must be struct<metadata: binary, value: binary> "
+                "(either order, binary or large_binary children), got {}",
+                array.type()->ToString());
+    }
+    if (start < 0 || start > end) {
+        return Status::InvalidArgument("Invalid Variant Arrow row range [{}, {})", start, end);
+    }
+    if (start == end) {
+        return Status::OK();
+    }
+    const auto& struct_type = *array.struct_type();
+    const int metadata_index = struct_type.field(0)->name() == "metadata" ? 0 : 1;
+    // StructArray::field() returns the child sliced to the struct's own offset and length, and
+    // the struct array caches it, so row indexes are shared and the raw pointers stay valid.
+    const arrow::Array& metadata = *array.field(metadata_index);
+    const arrow::Array& value = *array.field(1 - metadata_index);
+
+    const size_t old_size = result.size();
+    try {
+        auto with_binary = [](const arrow::Array& child, auto&& fn) {
+            if (child.type_id() == arrow::Type::LARGE_BINARY) {
+                fn(static_cast<const arrow::LargeBinaryArray&>(child));
+            } else {
+                fn(static_cast<const arrow::BinaryArray&>(child));
+            }
+        };
+        with_binary(metadata, [&](const auto& metadata_array) {
+            with_binary(value, [&](const auto& value_array) {
+                read_binary_variant_rows(result, array, metadata_array, value_array, start, end);
+            });
+        });
+    } catch (...) {
+        if (result.size() > old_size) {
+            result.pop_back(result.size() - old_size);
+        }
+        throw;
+    }
+    return Status::OK();
+}
+
 } // namespace
 
 TrustedPeerVariantBlockScope::TrustedPeerVariantBlockScope(bool trusted) noexcept
@@ -593,16 +821,36 @@ Status DataTypeVariantV2SerDe::deserialize_column_from_json_vector(IColumn& colu
     return Status::OK();
 }
 
-// Arrow carries Variant values the way write_column_to_arrow emits them: one JSON document per
-// row in a string or binary array. Every row goes through the JSON load path, so empty input,
-// invalid JSON and invalid UTF-8 follow the same policies, and a failing row publishes nothing.
-// SQL NULL is the nullable wrapper's null map; the nested Variant row under it is JSON null.
+// Arrow carries a Variant column in one of two shapes:
+// - JSON text: one JSON document per row in a string, binary, large_string or large_binary array.
+//   Every row goes through the JSON load path, so empty input, invalid JSON and invalid UTF-8
+//   follow the same policies.
+// - Parquet Variant binary: struct<metadata: binary, value: binary> with the children in either
+//   order, each binary or large_binary, optionally wrapped in the arrow.parquet.variant extension
+//   type. Rows are validated and appended without re-encoding.
+// A failing row publishes nothing. SQL NULL is the nullable wrapper's null map; the nested Variant
+// row under it is Variant null.
 Status DataTypeVariantV2SerDe::read_column_from_arrow(IColumn& column,
                                                       const arrow::Array* arrow_array,
                                                       int64_t start, int64_t end,
-                                                      const cctz::time_zone&) const {
+                                                      const cctz::time_zone& ctz) const {
     if (arrow_array == nullptr) {
         return Status::InvalidArgument("Variant Arrow input is null");
+    }
+    if (arrow_array->type_id() == arrow::Type::EXTENSION) {
+        const auto& extension = static_cast<const arrow::ExtensionArray&>(*arrow_array);
+        if (extension.extension_type()->extension_name() != ARROW_VARIANT_EXTENSION_NAME) {
+            return Status::InvalidArgument("Unsupported Arrow extension type {} for a Variant column",
+                                           arrow_array->type()->ToString());
+        }
+        return read_column_from_arrow(column, extension.storage().get(), start, end, ctz);
+    }
+    if (arrow_array->type_id() == arrow::Type::STRUCT) {
+        RETURN_IF_CATCH_EXCEPTION({
+            return read_binary_variant_arrow(destination(column),
+                                             static_cast<const arrow::StructArray&>(*arrow_array),
+                                             start, end);
+        });
     }
     RETURN_IF_CATCH_EXCEPTION({
         ColumnVariantV2& result = destination(column);
