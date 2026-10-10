@@ -37,7 +37,7 @@ namespace doris {
 namespace io {
 enum class BufferType : uint32_t { DOWNLOAD, UPLOAD };
 
-// Bounds how many upload buffers of one class (e.g. compaction) are submitted but not yet
+// Bounds how many upload buffers of one class (compaction or load) are submitted but not yet
 // released. A permit is held by the buffer and released when the buffer is destroyed, i.e.
 // once its memory is freed. Acquire only when the caller holds no other unsubmitted permit
 // it depends on: permit holders are submitted buffers, which finish without the caller.
@@ -69,14 +69,21 @@ public:
         UploadBufferInflightLimiter* _limiter = nullptr;
     };
 
+    // The bvars a limiter reports to, defined in s3_file_bufferpool.cpp.
+    struct Metrics;
+
     // `limit` is re-read on every acquire so a mutable config takes effect at runtime;
-    // a value <= 0 means unbounded.
-    explicit UploadBufferInflightLimiter(std::function<int64_t()> limit)
-            : _limit(std::move(limit)) {}
+    // a value <= 0 means unbounded. `metrics` may be null, and must outlive the limiter.
+    explicit UploadBufferInflightLimiter(std::function<int64_t()> limit,
+                                         const Metrics* metrics = nullptr)
+            : _limit(std::move(limit)), _metrics(metrics) {}
 
     // The process-wide limiter for compaction / schema change uploads, bounded by
     // config::compaction_s3_upload_max_inflight_parts.
     static UploadBufferInflightLimiter* compaction();
+    // The process-wide limiter for load (non background) uploads, bounded by
+    // config::load_s3_upload_max_inflight_parts.
+    static UploadBufferInflightLimiter* load();
 
     // Blocks until a slot is free.
     Permit acquire();
@@ -87,6 +94,7 @@ private:
     void _release();
 
     std::function<int64_t()> _limit;
+    const Metrics* _metrics;
     mutable std::mutex _mutex;
     std::condition_variable _cv;
     int64_t _inflight = 0;

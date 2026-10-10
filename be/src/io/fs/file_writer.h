@@ -52,6 +52,10 @@ struct FileWriterOptions {
     // Compaction / schema change output. Remote writers route such writes to background
     // IO pools so they cannot delay load writes.
     bool background_write = false;
+    // Remote load (non background) writers only: count submitted upload parts against
+    // config::load_s3_upload_max_inflight_parts. A writer whose appends run under a lock that
+    // other writers need sets this to false so it never blocks there on a permit.
+    bool bound_load_upload_inflight = true;
     // Local files only: on close, wait for this file's writeback and drop its pages from the page
     // cache, so data written once and read rarely does not hold dirty pages against the memory
     // limit.

@@ -1888,9 +1888,11 @@ private:
 };
 
 std::unique_ptr<S3FileWriter> make_writer(const std::string& path, bool background,
-                                          const std::shared_ptr<io::ObjStorageClient>& client) {
+                                          const std::shared_ptr<io::ObjStorageClient>& client,
+                                          bool bound_load_upload_inflight = true) {
     io::FileWriterOptions opts;
     opts.background_write = background;
+    opts.bound_load_upload_inflight = bound_load_upload_inflight;
     io::FileWriterPtr file_writer;
     auto st = s3_fs->create_file(path, &file_writer, &opts);
     EXPECT_TRUE(st.ok()) << st;
@@ -1924,9 +1926,11 @@ protected:
         _saved_enable_file_cache = config::enable_file_cache;
         _saved_enable_separate = config::enable_separate_compaction_s3_upload_pool;
         _saved_max_inflight = config::compaction_s3_upload_max_inflight_parts;
+        _saved_load_max_inflight = config::load_s3_upload_max_inflight_parts;
         config::enable_file_cache = false;
         config::enable_separate_compaction_s3_upload_pool = true;
         config::compaction_s3_upload_max_inflight_parts = 0;
+        config::load_s3_upload_max_inflight_parts = 0;
         auto sp = SyncPoint::get_instance();
         sp->enable_processing();
         sp->clear_all_call_backs();
@@ -1937,6 +1941,7 @@ protected:
         config::enable_file_cache = _saved_enable_file_cache;
         config::enable_separate_compaction_s3_upload_pool = _saved_enable_separate;
         config::compaction_s3_upload_max_inflight_parts = _saved_max_inflight;
+        config::load_s3_upload_max_inflight_parts = _saved_load_max_inflight;
     }
     void install_compaction_pools(int upload_threads, int close_threads) {
         ExecEnv::GetInstance()->set_compaction_s3_file_upload_thread_pool(
@@ -1948,6 +1953,7 @@ protected:
     bool _saved_enable_file_cache = false;
     bool _saved_enable_separate = true;
     int64_t _saved_max_inflight = 0;
+    int64_t _saved_load_max_inflight = 0;
 };
 
 TEST_F(S3FileWriterPoolTest, compaction_and_load_writers_use_separate_pools) {
@@ -2032,6 +2038,116 @@ TEST_F(S3FileWriterPoolTest, inflight_limiter_blocks_at_limit) {
     EXPECT_TRUE(acquired2.load());
     p2.reset();
     EXPECT_EQ(limiter.inflight(), 0);
+}
+
+TEST_F(S3FileWriterPoolTest, load_inflight_limiter_follows_config) {
+    auto* limiter = io::UploadBufferInflightLimiter::load();
+    ASSERT_NE(limiter, io::UploadBufferInflightLimiter::compaction());
+
+    // 0 is unbounded.
+    config::load_s3_upload_max_inflight_parts = 0;
+    std::vector<io::UploadBufferInflightLimiter::Permit> permits;
+    for (int i = 0; i < 8; ++i) {
+        permits.push_back(limiter->acquire());
+    }
+    EXPECT_EQ(limiter->inflight(), 8);
+    EXPECT_EQ(limiter->waiters(), 0);
+    permits.clear();
+    EXPECT_EQ(limiter->inflight(), 0);
+
+    config::load_s3_upload_max_inflight_parts = 2;
+    auto p1 = limiter->acquire();
+    auto p2 = limiter->acquire();
+    std::atomic<bool> acquired {false};
+    std::thread t([&] {
+        auto p3 = limiter->acquire();
+        acquired = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(acquired.load());
+    EXPECT_EQ(limiter->waiters(), 1);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::compaction()->inflight(), 0);
+
+    // Raising the limit at runtime wakes the blocked waiter without any release.
+    config::load_s3_upload_max_inflight_parts = 3;
+    t.join();
+    EXPECT_TRUE(acquired.load());
+    EXPECT_EQ(limiter->waiters(), 0);
+    EXPECT_EQ(limiter->inflight(), 2);
+    p1.reset();
+    p2.reset();
+    EXPECT_EQ(limiter->inflight(), 0);
+}
+
+TEST_F(S3FileWriterPoolTest, inflight_cap_bounds_concurrent_load_parts) {
+    config::load_s3_upload_max_inflight_parts = 2;
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    client->upload_latency = std::chrono::milliseconds(50);
+    std::string part(config::s3_write_buffer_size, 'l');
+
+    constexpr int kWriters = 4;
+    constexpr int kParts = 4;
+    std::atomic<int64_t> peak_inflight {0};
+    std::atomic<bool> stop_sampling {false};
+    std::thread sampler([&] {
+        while (!stop_sampling) {
+            auto v = io::UploadBufferInflightLimiter::load()->inflight();
+            auto p = peak_inflight.load();
+            while (v > p && !peak_inflight.compare_exchange_weak(p, v)) {
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::vector<std::thread> writers;
+    std::atomic<int> ok {0};
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w] {
+            auto writer = make_writer(fmt::format("load_cap_{}.dat", w), false, client);
+            bool good = true;
+            for (int i = 0; i < kParts; ++i) {
+                good &= writer->append(part).ok();
+            }
+            good &= writer->close(true).ok();
+            good &= writer->close().ok();
+            ok += good;
+        });
+    }
+    for (auto& t : writers) {
+        t.join();
+    }
+    stop_sampling = true;
+    sampler.join();
+
+    EXPECT_EQ(ok.load(), kWriters);
+    EXPECT_EQ(client->upload_part_count, kWriters * kParts);
+    EXPECT_LE(client->peak_concurrent_uploads.load(), 2);
+    EXPECT_GE(client->peak_concurrent_uploads.load(), 1);
+    EXPECT_LE(peak_inflight.load(), 2);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::load()->inflight(), 0);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::compaction()->inflight(), 0);
+}
+
+TEST_F(S3FileWriterPoolTest, unbounded_load_writer_ignores_full_load_limit) {
+    config::load_s3_upload_max_inflight_parts = 1;
+    auto held = io::UploadBufferInflightLimiter::load()->acquire();
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    std::string part(config::s3_write_buffer_size, 'u');
+
+    auto done = std::async(std::launch::async, [&] {
+        auto writer = make_writer("packed_like.bin", false, client, false);
+        bool good = true;
+        for (int i = 0; i < 2; ++i) {
+            good &= writer->append(part).ok();
+        }
+        good &= writer->close().ok();
+        return good;
+    });
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::load()->inflight(), 1);
+    held.reset();
+    EXPECT_TRUE(done.get());
+    EXPECT_EQ(client->upload_part_count, 2);
+    EXPECT_EQ(io::UploadBufferInflightLimiter::load()->inflight(), 0);
 }
 
 TEST_F(S3FileWriterPoolTest, inflight_cap_bounds_concurrent_compaction_parts) {

@@ -49,10 +49,30 @@ bvar::Adder<uint64_t> s3_file_cache_write_dropped("s3_file_cache_write_dropped")
 bvar::Adder<int64_t> s3_compaction_upload_inflight_parts("s3_compaction_upload_inflight_parts");
 bvar::Adder<int64_t> s3_compaction_upload_waiting_writers("s3_compaction_upload_waiting_writers");
 bvar::LatencyRecorder s3_compaction_upload_permit_wait_us("s3_compaction_upload_permit_wait_us");
+bvar::Adder<int64_t> s3_load_upload_inflight_parts("s3_load_upload_inflight_parts");
+bvar::Adder<int64_t> s3_load_upload_waiting_writers("s3_load_upload_waiting_writers");
+bvar::LatencyRecorder s3_load_upload_permit_wait_us("s3_load_upload_permit_wait_us");
+
+struct UploadBufferInflightLimiter::Metrics {
+    bvar::Adder<int64_t>* inflight_parts;
+    bvar::Adder<int64_t>* waiting_writers;
+    bvar::LatencyRecorder* permit_wait_us;
+};
 
 UploadBufferInflightLimiter* UploadBufferInflightLimiter::compaction() {
+    static const Metrics metrics {&s3_compaction_upload_inflight_parts,
+                                  &s3_compaction_upload_waiting_writers,
+                                  &s3_compaction_upload_permit_wait_us};
     static UploadBufferInflightLimiter limiter(
-            [] { return config::compaction_s3_upload_max_inflight_parts; });
+            [] { return config::compaction_s3_upload_max_inflight_parts; }, &metrics);
+    return &limiter;
+}
+
+UploadBufferInflightLimiter* UploadBufferInflightLimiter::load() {
+    static const Metrics metrics {&s3_load_upload_inflight_parts, &s3_load_upload_waiting_writers,
+                                  &s3_load_upload_permit_wait_us};
+    static UploadBufferInflightLimiter limiter(
+            [] { return config::load_s3_upload_max_inflight_parts; }, &metrics);
     return &limiter;
 }
 
@@ -65,24 +85,23 @@ UploadBufferInflightLimiter::Permit UploadBufferInflightLimiter::acquire() {
     if (!has_slot()) {
         auto start = std::chrono::steady_clock::now();
         ++_waiters;
-        if (this == compaction()) {
-            s3_compaction_upload_waiting_writers << 1;
+        if (_metrics != nullptr) {
+            *_metrics->waiting_writers << 1;
         }
         // Timed wait so that raising the limit at runtime wakes blocked writers.
         while (!_cv.wait_for(lock, std::chrono::seconds(1), has_slot)) {
         }
         --_waiters;
-        if (this == compaction()) {
-            s3_compaction_upload_waiting_writers << -1;
-            s3_compaction_upload_permit_wait_us
-                    << std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - start)
-                               .count();
+        if (_metrics != nullptr) {
+            *_metrics->waiting_writers << -1;
+            *_metrics->permit_wait_us << std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - start)
+                                                 .count();
         }
     }
     ++_inflight;
-    if (this == compaction()) {
-        s3_compaction_upload_inflight_parts << 1;
+    if (_metrics != nullptr) {
+        *_metrics->inflight_parts << 1;
     }
     return Permit(this);
 }
@@ -92,8 +111,8 @@ void UploadBufferInflightLimiter::_release() {
         std::lock_guard lock(_mutex);
         --_inflight;
     }
-    if (this == compaction()) {
-        s3_compaction_upload_inflight_parts << -1;
+    if (_metrics != nullptr) {
+        *_metrics->inflight_parts << -1;
     }
     _cv.notify_one();
 }
@@ -178,8 +197,8 @@ Status UploadFileBuffer::append_data(const Slice& data) {
 
 // The part is already in S3, so a copy that cannot be queued is skipped rather than waited for.
 static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
-    // From here the buffer only waits for the cache copy, which the compaction upload bound
-    // does not cover.
+    // From here the buffer only waits for the cache copy, which the upload bounds do not
+    // cover.
     buffer->set_inflight_permit({});
     auto* pool = ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool();
     if (pool == nullptr) {

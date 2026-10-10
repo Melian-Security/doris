@@ -268,6 +268,9 @@ Status PackedFileManager::create_new_packed_file_context(
     // using the small file path as cache key, ensuring cache entries can be
     // properly cleaned up when stale rowsets are removed.
     opts.write_file_cache = false;
+    // Appends run under the BE-wide _current_packed_file_mutex, so waiting for an upload permit
+    // there would stall every small-file append. One writer at a time already bounds its parts.
+    opts.bound_load_upload_inflight = false;
     RETURN_IF_ERROR(
             packed_file_ctx->file_system->create_file(Path(relative_path), &new_writer, &opts));
     packed_file_ctx->writer = std::move(new_writer);
