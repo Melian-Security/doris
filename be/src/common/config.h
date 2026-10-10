@@ -1356,6 +1356,13 @@ DECLARE_mInt32(file_cache_exit_need_evict_cache_in_advance_percent);
 DECLARE_mInt32(file_cache_evict_in_advance_interval_ms);
 DECLARE_mInt64(file_cache_evict_in_advance_batch_bytes);
 DECLARE_mInt64(file_cache_evict_in_advance_recycle_keys_num_threshold);
+// Max LRU entries one eviction scan examines while holding the cache lock. A scan that hits the
+// bound stops, and a reservation it was serving fails, so the block is not cached. <= 0 means
+// unbounded.
+DECLARE_mInt64(file_cache_evict_max_scan_entries);
+// Move LRU entries an eviction scan skips because they are in use to the end of their queue, so
+// later scans do not examine them again before they are evictable.
+DECLARE_mBool(enable_file_cache_evict_rotate_in_use);
 DECLARE_mBool(enable_read_cache_file_directly);
 DECLARE_Bool(file_cache_enable_evict_from_other_queue_by_size);
 // If true, evict the ttl cache using LRU when full.
