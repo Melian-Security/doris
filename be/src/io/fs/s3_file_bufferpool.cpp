@@ -36,11 +36,16 @@
 #include "runtime/thread_context.h"
 #include "util/defer_op.h"
 #include "util/slice.h"
+#include "util/threadpool.h"
 
 namespace doris {
 namespace io {
 
 bvar::Adder<uint64_t> s3_file_buffer_allocated("s3_file_buffer_allocated");
+bvar::Adder<int64_t> s3_file_cache_write_queued("s3_file_cache_write_queued");
+bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread(
+        "s3_file_cache_write_off_upload_thread");
+bvar::Adder<uint64_t> s3_file_cache_write_dropped("s3_file_cache_write_dropped");
 bvar::Adder<int64_t> s3_compaction_upload_inflight_parts("s3_compaction_upload_inflight_parts");
 bvar::Adder<int64_t> s3_compaction_upload_waiting_writers("s3_compaction_upload_waiting_writers");
 bvar::LatencyRecorder s3_compaction_upload_permit_wait_us("s3_compaction_upload_permit_wait_us");
@@ -171,6 +176,29 @@ Status UploadFileBuffer::append_data(const Slice& data) {
     return Status::OK();
 }
 
+// The part is already in S3, so a copy that cannot be queued is skipped rather than waited for.
+static void submit_file_cache_write(std::shared_ptr<FileBuffer> buffer) {
+    // From here the buffer only waits for the cache copy, which the compaction upload bound
+    // does not cover.
+    buffer->set_inflight_permit({});
+    auto* pool = ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool();
+    if (pool == nullptr) {
+        s3_file_cache_write_dropped << 1;
+        return;
+    }
+    s3_file_cache_write_queued << 1;
+    auto st = pool->submit_func([buf = std::move(buffer)]() {
+        s3_file_cache_write_queued << -1;
+        static_cast<UploadFileBuffer*>(buf.get())->upload_to_local_file_cache(false);
+    });
+    if (st.ok()) {
+        s3_file_cache_write_off_upload_thread << 1;
+    } else {
+        s3_file_cache_write_queued << -1;
+        s3_file_cache_write_dropped << 1;
+    }
+}
+
 /**
  * 0. constrcut the stream ptr if the buffer is not empty
  * 1. submit the on_upload() callback to executor
@@ -181,7 +209,12 @@ static Status submit_upload_buffer(std::shared_ptr<FileBuffer> buffer) {
     if (pool == nullptr) {
         pool = ExecEnv::GetInstance()->s3_file_upload_thread_pool();
     }
-    return pool->submit_func([buf = std::move(buffer)]() { buf->execute_async(); });
+    return pool->submit_func([buf = std::move(buffer)]() mutable {
+        buf->execute_async();
+        if (static_cast<UploadFileBuffer*>(buf.get())->take_pending_file_cache_write()) {
+            submit_file_cache_write(std::move(buf));
+        }
+    });
 }
 
 std::ostream& operator<<(std::ostream& os, const BufferType& value) {
@@ -227,6 +260,13 @@ void UploadFileBuffer::on_upload() {
         // s3 file writer is already destructed
         bool cancelled = is_cancelled();
         _state.set_status();
+        if (!cancelled && config::enable_file_cache_write_off_upload_thread &&
+            config::enable_file_cache_write_from_s3_file_writer && config::enable_file_cache &&
+            _alloc_holder != nullptr &&
+            ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool() != nullptr) {
+            _file_cache_write_pending = true;
+            return;
+        }
         // this control flow means the buf and the stream shares one memory
         // so we can directly use buf here
         upload_to_local_file_cache(cancelled);

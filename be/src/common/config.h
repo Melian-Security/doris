@@ -1859,6 +1859,16 @@ DECLARE_Int64(compaction_nonblock_close_thread_num);
 // A writer that hits the bound blocks before submitting. <= 0 disables the bound.
 DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
 
+// Copy an uploaded part into the file cache on S3FileCacheWriterThreadPool instead of on the
+// upload thread, so a slow or contended file cache cannot hold upload threads. A part that
+// finds the queue full is not cached. Only applies while enable_flush_file_cache_async is on.
+DECLARE_mBool(enable_file_cache_write_off_upload_thread);
+// Max threads of S3FileCacheWriterThreadPool.
+DECLARE_Int64(file_cache_writer_thread_num);
+// Max queued part copies of S3FileCacheWriterThreadPool. Each holds one s3_write_buffer_size
+// buffer until it is copied.
+DECLARE_Int64(file_cache_writer_queue_size);
+
 // The min thread num for NonBlockCloseThreadPool
 DECLARE_Int64(min_nonblock_close_thread_num);
 // The max thread num for NonBlockCloseThreadPool

@@ -262,6 +262,9 @@ public:
     ThreadPool* s3_file_upload_thread_pool() { return _s3_file_upload_thread_pool.get(); }
     // Dedicated pools for compaction / schema change S3 writes. Callers must fall back to
     // the shared pools when these are null (tools and tests that do not create them).
+    ThreadPool* s3_file_cache_writer_thread_pool() {
+        return _s3_file_cache_writer_thread_pool.get();
+    }
     ThreadPool* compaction_s3_file_upload_thread_pool() {
         return _compaction_s3_file_upload_thread_pool.get();
     }
@@ -375,6 +378,9 @@ public:
     }
     void set_s3_file_upload_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
         _s3_file_upload_thread_pool = std::move(pool);
+    }
+    void set_s3_file_cache_writer_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
+        _s3_file_cache_writer_thread_pool = std::move(pool);
     }
     void set_compaction_s3_file_upload_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
         _compaction_s3_file_upload_thread_pool = std::move(pool);
@@ -509,6 +515,7 @@ private:
     std::unique_ptr<ThreadPool> _lazy_release_obj_pool;
     std::unique_ptr<ThreadPool> _non_block_close_thread_pool;
     std::unique_ptr<ThreadPool> _compaction_s3_file_upload_thread_pool;
+    std::unique_ptr<ThreadPool> _s3_file_cache_writer_thread_pool;
     std::unique_ptr<ThreadPool> _compaction_non_block_close_thread_pool;
     std::unique_ptr<ThreadPool> _s3_file_system_thread_pool;
     // for java-udf to close

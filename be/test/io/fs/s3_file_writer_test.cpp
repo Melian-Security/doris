@@ -26,6 +26,7 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
+#include <bvar/bvar.h>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
@@ -68,10 +69,16 @@
 #include "storage/index/index_file_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
 #include "util/defer_op.h"
+#include "util/threadpool.h"
 #include "util/slice.h"
 #include "util/thread.h"
 #include "util/threadpool.h"
 #include "util/uuid_generator.h"
+
+namespace doris::io {
+extern bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread;
+extern bvar::Adder<uint64_t> s3_file_cache_write_dropped;
+} // namespace doris::io
 
 using namespace doris::io;
 
@@ -425,6 +432,134 @@ TEST_F(S3FileWriterTest, DisableFileCacheWriteFromS3FileWriter) {
     EXPECT_TRUE(upload_called);
     EXPECT_TRUE(completion_called);
     EXPECT_FALSE(cache_allocator_called);
+}
+
+namespace {
+// Runs one upload buffer through FileBuffer::submit with file cache write-through on, with a
+// one-thread S3FileCacheWriterThreadPool whose only thread is held until `release` is set.
+struct CacheWriterPoolFixture {
+    explicit CacheWriterPoolFixture(int max_queue_size) {
+        _saved_cache = config::enable_file_cache;
+        _saved_write = config::enable_file_cache_write_from_s3_file_writer;
+        _saved_async = config::enable_flush_file_cache_async;
+        _saved_off_thread = config::enable_file_cache_write_off_upload_thread;
+        config::enable_file_cache = true;
+        config::enable_file_cache_write_from_s3_file_writer = true;
+        config::enable_flush_file_cache_async = true;
+        config::enable_file_cache_write_off_upload_thread = true;
+        std::unique_ptr<ThreadPool> upload_pool;
+        EXPECT_TRUE(ThreadPoolBuilder("TestUploadPool")
+                            .set_min_threads(1)
+                            .set_max_threads(1)
+                            .build(&upload_pool)
+                            .ok());
+        _upload_pool = std::move(upload_pool);
+        std::unique_ptr<ThreadPool> cache_pool;
+        EXPECT_TRUE(ThreadPoolBuilder("TestCacheWriterPool")
+                            .set_min_threads(1)
+                            .set_max_threads(1)
+                            .set_max_queue_size(max_queue_size)
+                            .build(&cache_pool)
+                            .ok());
+        EXPECT_TRUE(cache_pool
+                            ->submit_func([this] {
+                                std::unique_lock lock(_mutex);
+                                _blocker_running = true;
+                                _cv.notify_all();
+                                _cv.wait(lock, [this] { return _released; });
+                            })
+                            .ok());
+        ExecEnv::GetInstance()->set_s3_file_cache_writer_thread_pool(std::move(cache_pool));
+        std::unique_lock lock(_mutex);
+        _cv.wait(lock, [this] { return _blocker_running; });
+    }
+
+    ~CacheWriterPoolFixture() {
+        release();
+        ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool()->wait();
+        ExecEnv::GetInstance()->set_s3_file_cache_writer_thread_pool(nullptr);
+        _upload_pool->shutdown();
+        config::enable_file_cache = _saved_cache;
+        config::enable_file_cache_write_from_s3_file_writer = _saved_write;
+        config::enable_flush_file_cache_async = _saved_async;
+        config::enable_file_cache_write_off_upload_thread = _saved_off_thread;
+    }
+
+    void release() {
+        std::lock_guard lock(_mutex);
+        _released = true;
+        _cv.notify_all();
+    }
+
+    // Submits one buffer and waits until its upload reports completion.
+    void upload_one() {
+        std::promise<void> completed;
+        auto completed_future = completed.get_future();
+        FileBufferBuilder builder;
+        builder.set_type(BufferType::UPLOAD)
+                .set_upload_callback([this](UploadFileBuffer&) { uploaded = true; })
+                .set_sync_after_complete_task([&completed](Status st) {
+                    EXPECT_TRUE(st.ok()) << st;
+                    completed.set_value();
+                    return false;
+                })
+                .set_is_cancelled([] { return false; })
+                .set_allocate_file_blocks_holder([this]() -> FileBlocksHolderPtr {
+                    cache_copied = true;
+                    return std::make_unique<FileBlocksHolder>(FileBlocks {});
+                })
+                .set_upload_thread_pool(_upload_pool.get());
+        std::shared_ptr<FileBuffer> buf;
+        ASSERT_TRUE(builder.build(&buf).ok());
+        std::string data = "part data";
+        ASSERT_TRUE(buf->append_data(Slice(data)).ok());
+        ASSERT_TRUE(FileBuffer::submit(std::move(buf)).ok());
+        ASSERT_EQ(completed_future.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+        _upload_pool->wait();
+    }
+
+    std::atomic<bool> uploaded {false};
+    std::atomic<bool> cache_copied {false};
+
+private:
+    bool _saved_cache;
+    bool _saved_write;
+    bool _saved_async;
+    bool _saved_off_thread;
+    std::unique_ptr<ThreadPool> _upload_pool;
+    std::mutex _mutex;
+    std::condition_variable _cv;
+    bool _blocker_running = false;
+    bool _released = false;
+};
+} // namespace
+
+TEST_F(S3FileWriterTest, FileCacheCopyRunsOffTheUploadThread) {
+    CacheWriterPoolFixture fixture(/*max_queue_size=*/8);
+    auto queued_before = s3_file_cache_write_off_upload_thread.get_value();
+
+    // The cache writer pool is blocked, so the upload must finish without the cache copy.
+    fixture.upload_one();
+    EXPECT_TRUE(fixture.uploaded);
+    EXPECT_FALSE(fixture.cache_copied);
+    EXPECT_EQ(s3_file_cache_write_off_upload_thread.get_value(), queued_before + 1);
+
+    fixture.release();
+    ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool()->wait();
+    EXPECT_TRUE(fixture.cache_copied);
+}
+
+TEST_F(S3FileWriterTest, FileCacheCopyIsDroppedWhenTheWriterQueueIsFull) {
+    CacheWriterPoolFixture fixture(/*max_queue_size=*/0);
+    auto dropped_before = s3_file_cache_write_dropped.get_value();
+
+    fixture.upload_one();
+    EXPECT_TRUE(fixture.uploaded);
+    EXPECT_EQ(s3_file_cache_write_dropped.get_value(), dropped_before + 1);
+
+    fixture.release();
+    ExecEnv::GetInstance()->s3_file_cache_writer_thread_pool()->wait();
+    EXPECT_FALSE(fixture.cache_copied);
 }
 
 TEST_F(S3FileWriterTest, multi_part_io_error) {
