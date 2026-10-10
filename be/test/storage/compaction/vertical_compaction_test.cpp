@@ -73,6 +73,7 @@
 #include "storage/tablet/tablet_schema.h"
 #include "storage/txn/txn_manager.h"
 #include "storage/utils.h"
+#include "util/debug_points.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -839,6 +840,39 @@ TEST_F(VerticalCompactionTest, TestVerticalMergeStopsOnDroppedTablet) {
     ASSERT_FALSE(s.ok());
     EXPECT_NE(s.to_string().find("not used any more"), std::string::npos) << s;
     EXPECT_EQ(stats.output_rows, 0);
+}
+
+// A std::exception thrown while a rowset reader initializes its iterator must fail the read, not
+// terminate the process: DorisCallOnce rethrows it and the scan path only catches
+// doris::Exception.
+TEST_F(VerticalCompactionTest, TestStdExceptionInRowsetReaderInitIsAStatus) {
+    std::vector<std::vector<std::vector<std::tuple<int64_t, int64_t>>>> input_data;
+    generate_input_data(1, 2, 1024, NONOVERLAPPING, input_data);
+    TabletSchemaSPtr tablet_schema = create_schema();
+    auto rowset = create_rowset(tablet_schema, NONOVERLAPPING, input_data[0], 0);
+
+    RowsetReaderContext reader_context;
+    reader_context.tablet_schema = tablet_schema;
+    reader_context.need_ordered_result = false;
+    std::vector<uint32_t> return_columns = {0, 1};
+    reader_context.return_columns = &return_columns;
+    RowsetReaderSharedPtr rs_reader;
+    create_and_init_rowset_reader(rowset.get(), reader_context, &rs_reader);
+
+    bool saved_enable_debug_points = config::enable_debug_points;
+    config::enable_debug_points = true;
+    DebugPoints::instance()->add("BetaRowsetReader._init_iterator.call_empty_function");
+    Block block = tablet_schema->create_block();
+    auto first = rs_reader->next_batch(&block);
+    // The second read hits DorisCallOnce's stored exception instead of running init again.
+    auto second = rs_reader->next_batch(&block);
+    DebugPoints::instance()->remove("BetaRowsetReader._init_iterator.call_empty_function");
+    config::enable_debug_points = saved_enable_debug_points;
+
+    ASSERT_FALSE(first.ok());
+    EXPECT_NE(first.to_string().find("bad_function_call"), std::string::npos) << first;
+    ASSERT_FALSE(second.ok());
+    EXPECT_NE(second.to_string().find("bad_function_call"), std::string::npos) << second;
 }
 
 TEST_F(VerticalCompactionTest, TestDupWithoutKeyVerticalMerge) {

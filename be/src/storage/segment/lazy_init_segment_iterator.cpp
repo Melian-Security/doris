@@ -17,6 +17,9 @@
 
 #include "storage/segment/lazy_init_segment_iterator.h"
 
+#include <typeinfo>
+
+#include "storage/rowset/beta_rowset.h"
 #include "storage/segment/segment_loader.h"
 
 namespace doris::segment_v2 {
@@ -37,17 +40,29 @@ Status LazyInitSegmentIterator::init(const StorageReadOptions& opts) {
         return Status::OK();
     }
 
-    std::shared_ptr<Segment> segment;
-    {
-        SegmentCacheHandle segment_cache_handle;
-        RETURN_IF_ERROR(SegmentLoader::instance()->load_segment(
-                _rowset, _segment_id, &segment_cache_handle, _should_use_cache, false, opts.stats,
-                &opts.io_ctx));
-        const auto& tmp_segments = segment_cache_handle.get_segments();
-        segment = tmp_segments[0];
+    // Names the step that throws, since the exception is converted to a Status further up
+    // and its stack is lost.
+    const char* step = "load_segment";
+    try {
+        std::shared_ptr<Segment> segment;
+        {
+            SegmentCacheHandle segment_cache_handle;
+            RETURN_IF_ERROR(SegmentLoader::instance()->load_segment(
+                    _rowset, _segment_id, &segment_cache_handle, _should_use_cache, false,
+                    opts.stats, &opts.io_ctx));
+            const auto& tmp_segments = segment_cache_handle.get_segments();
+            segment = tmp_segments[0];
+        }
+        step = "new_iterator";
+        RETURN_IF_ERROR(segment->new_iterator(_schema, _read_options, &_inner_iterator));
+        step = "inner_iterator_init";
+        return _inner_iterator->init(_read_options);
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "exception initializing segment iterator, rowset=" << _rowset->rowset_id()
+                     << " segment=" << _segment_id << " step=" << step << ": "
+                     << typeid(e).name() << " " << e.what();
+        throw;
     }
-    RETURN_IF_ERROR(segment->new_iterator(_schema, _read_options, &_inner_iterator));
-    return _inner_iterator->init(_read_options);
 }
 
 } // namespace doris::segment_v2
