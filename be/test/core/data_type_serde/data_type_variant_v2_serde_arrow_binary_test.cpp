@@ -30,9 +30,11 @@
 // - Integer literal in (INT64_MAX, UINT64_MAX]: DECIMAL16 (id 10) with scale 0
 //   (VariantBatchBuilder::Row::add_largeint): header 0x28, scale byte 0x00, 16-byte little-endian
 //   two's-complement unscaled value.
-// - Any other number (fraction, exponent, or an integer outside [INT64_MIN, UINT64_MAX]): DOUBLE
-//   (id 7), the IEEE-754 bits of simdjson's correctly rounded parse, 8 bytes little-endian.
-//   -0.0 keeps its sign bit.
+// - Any number with a fraction or an exponent: DOUBLE (id 7), the IEEE-754 bits of simdjson's
+//   correctly rounded parse, 8 bytes little-endian. -0.0 keeps its sign bit. 1.0 stays DOUBLE.
+// - An integer literal outside [INT64_MIN, UINT64_MAX], or a number that overflows a double
+//   (1e400): simdjson rejects the document, so the WHOLE document, wherever the number sits,
+//   is stored as one string holding the raw input text (the invalid-JSON fallback below).
 // Other scalars: null 0x00, true 0x04, false 0x08. A string of at most 63 UTF-8 bytes is a short
 // string, header (length << 2) | 1, else primitive STRING (id 16), header 0x40, then a 4-byte
 // little-endian length (variant_scalar.cpp VariantScalarRef::write_physical). Escapes are decoded;
@@ -418,6 +420,11 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonEncoderTypingRules) {
         return out;
     };
     const std::string empty_metadata = "110000";
+    // simdjson rejects an integer outside [INT64_MIN, UINT64_MAX] and a number that overflows a
+    // double, so the whole document is kept as its raw text in a string.
+    auto raw_text = [&](std::string_view text) {
+        return hex(std::string(1, static_cast<char>((text.size() << 2) | 1))) + hex(text);
+    };
     const std::vector<std::pair<std::string, std::string>> scalars = {
             {"0", "0c00"},
             {"-0", "0c00"},
@@ -431,9 +438,12 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, JsonEncoderTypingRules) {
             {"-9223372036854775808", "180000000000000080"},
             {"9223372036854775808", "280000000000000000800000000000000000"},
             {"18446744073709551615", "2800ffffffffffffffff0000000000000000"},
-            {"18446744073709551616", "1c000000000000f043"},
-            {"-9223372036854775809", "1c000000000000e0c3"},
-            {"123456789012345678901234567890", "1c3e376cff90eef845"},
+            {"18446744073709551616", raw_text("18446744073709551616")},
+            {"-9223372036854775809", raw_text("-9223372036854775809")},
+            {R"({"a":[1,18446744073709551616]})", raw_text(R"({"a":[1,18446744073709551616]})")},
+            {"123456789012345678901234567890", raw_text("123456789012345678901234567890")},
+            {"1e400", raw_text("1e400")},
+            {"123456789012345678901234567890.5", "1c3e376cff90eef845"},
             {"1.0", "1c000000000000f03f"},
             {"-0.0", "1c0000000000000080"},
             {"0.1", "1c9a9999999999b93f"},
@@ -523,8 +533,7 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, NullStructRowsIgnoreChildSlots) {
 TEST(DataTypeVariantV2SerdeArrowBinaryTest, SlicedArrayAndRangeUseLogicalRows) {
     std::vector<std::string> documents;
     for (int i = 0; i < 10; ++i) {
-        documents.push_back(R"({"i":)" + std::to_string(i) + R"(,"s":"v)" + std::to_string(i) +
-                            "\"}");
+        documents.push_back("{\"k" + std::to_string(i) + "\":" + std::to_string(i) + "}");
     }
     for (bool shared : {true, false}) {
         auto source = shared ? read_json_text(documents) : encode_per_row(documents);
@@ -543,10 +552,10 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, SlicedArrayAndRangeUseLogicalRows) {
         const Status status = read_arrow(*column, *sliced, 1, 5); // rows 4..7
         ASSERT_TRUE(status.ok()) << status;
         ASSERT_EQ(column->size(), 4);
-        EXPECT_EQ(json_at(*column, 0), R"({"i":4,"s":"v4"})");
+        EXPECT_EQ(json_at(*column, 0), R"({"k4":4})");
         EXPECT_EQ(json_at(*column, 1), "null");
-        EXPECT_EQ(json_at(*column, 2), R"({"i":6,"s":"v6"})");
-        EXPECT_EQ(json_at(*column, 3), R"({"i":7,"s":"v7"})");
+        EXPECT_EQ(json_at(*column, 2), R"({"k6":6})");
+        EXPECT_EQ(json_at(*column, 3), R"({"k7":7})");
         EXPECT_EQ(column->read_view().metadata_count(), shared ? 1 : 3);
 
         auto empty = ColumnVariantV2::create();
