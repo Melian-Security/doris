@@ -128,6 +128,7 @@ private:
 
     [[nodiscard]] Status _init_iterator_once();
     [[nodiscard]] Status _init_iterator();
+    [[nodiscard]] Status _init_iterator_steps(const char** step);
     bool _should_push_down_value_predicates() const;
 
     int64_t _get_segment_num() const {

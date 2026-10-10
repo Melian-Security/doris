@@ -73,6 +73,7 @@
 #include "storage/tablet/tablet_schema.h"
 #include "storage/txn/txn_manager.h"
 #include "storage/utils.h"
+#include "util/debug_points.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -839,6 +840,41 @@ TEST_F(VerticalCompactionTest, TestVerticalMergeStopsOnDroppedTablet) {
     ASSERT_FALSE(s.ok());
     EXPECT_NE(s.to_string().find("not used any more"), std::string::npos) << s;
     EXPECT_EQ(stats.output_rows, 0);
+}
+
+// A std::exception thrown while a rowset reader initializes its iterator must fail the read, not
+// terminate the process: DorisCallOnce rethrows it and the scan path only catches
+// doris::Exception.
+TEST_F(VerticalCompactionTest, TestStdExceptionInRowsetReaderInitIsAStatus) {
+    auto num_segments = 2;
+    std::vector<std::vector<std::vector<std::tuple<int64_t, int64_t>>>> input_data;
+    generate_input_data(1, num_segments, 1024, NONOVERLAPPING, input_data);
+    TabletSchemaSPtr tablet_schema = create_schema();
+    auto rowset = create_rowset(tablet_schema, NONOVERLAPPING, input_data[0], 0);
+    RowsetReaderSharedPtr rs_reader;
+    ASSERT_TRUE(rowset->create_reader(&rs_reader).ok());
+    std::vector<RowsetReaderSharedPtr> input_rs_readers {rs_reader};
+    auto writer_context = create_rowset_writer_context(tablet_schema, NONOVERLAPPING, 3457,
+                                                       {0, rowset->end_version()});
+    auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
+    ASSERT_TRUE(res.has_value()) << res.error();
+    auto output_rs_writer = std::move(res).value();
+    TabletSharedPtr tablet = create_tablet(*tablet_schema, false);
+
+    bool saved_enable_debug_points = config::enable_debug_points;
+    config::enable_debug_points = true;
+    DebugPoints::instance()->add("BetaRowsetReader._init_iterator.call_empty_function");
+    Merger::Statistics stats;
+    RowIdConversion rowid_conversion;
+    stats.rowid_conversion = &rowid_conversion;
+    auto s = Merger::vertical_merge_rowsets(tablet, ReaderType::READER_CUMULATIVE_COMPACTION,
+                                            *tablet_schema, input_rs_readers,
+                                            output_rs_writer.get(), 100, num_segments, &stats);
+    DebugPoints::instance()->remove("BetaRowsetReader._init_iterator.call_empty_function");
+    config::enable_debug_points = saved_enable_debug_points;
+
+    ASSERT_FALSE(s.ok());
+    EXPECT_NE(s.to_string().find("bad_function_call"), std::string::npos) << s;
 }
 
 TEST_F(VerticalCompactionTest, TestDupWithoutKeyVerticalMerge) {
