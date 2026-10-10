@@ -65,9 +65,11 @@
 // the raw text as a string, or an error when variant_throw_exeception_on_invalid_json is set.
 // Nesting is limited to 128 levels and keys to variant_max_json_key_length (255) bytes.
 
+#include <arrow/array/array_dict.h>
 #include <arrow/array/array_nested.h>
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_nested.h>
+#include <arrow/array/builder_primitive.h>
 #include <arrow/buffer.h>
 #include <arrow/builder.h>
 #include <arrow/extension_type.h>
@@ -76,6 +78,7 @@
 #include <cctz/time_zone.h>
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -314,6 +317,132 @@ void expect_same_rows(const ColumnVariantV2& expected, size_t expected_start,
         EXPECT_EQ(json_at(actual, actual_start + row), json_at(expected, expected_start + row))
                 << "row " << row;
     }
+}
+
+// One row of a struct whose metadata child is dictionary encoded. index nullopt is a null index
+// slot. A null struct row holds a junk index and junk value bytes, which the reader must ignore.
+struct DictionaryRow {
+    std::optional<int64_t> index;
+    std::string value;
+    bool null_row = false;
+};
+
+DictionaryRow null_dictionary_row() {
+    return {.index = 99, .value = "\x7f\x7f\x7f", .null_row = true};
+}
+
+struct DictionaryShape {
+    std::shared_ptr<arrow::DataType> index_type = arrow::int32();
+    bool large_dictionary = false;
+    bool metadata_first = true;
+};
+
+template <typename Builder>
+std::shared_ptr<arrow::Array> make_indices_with(const std::vector<DictionaryRow>& rows) {
+    Builder builder;
+    for (const auto& row : rows) {
+        if (row.index.has_value()) {
+            EXPECT_TRUE(builder.Append(static_cast<typename Builder::value_type>(*row.index)).ok());
+        } else {
+            EXPECT_TRUE(builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> array;
+    EXPECT_TRUE(builder.Finish(&array).ok());
+    return array;
+}
+
+std::shared_ptr<arrow::Array> make_indices(const arrow::DataType& type,
+                                           const std::vector<DictionaryRow>& rows) {
+    switch (type.id()) {
+    case arrow::Type::INT8:
+        return make_indices_with<arrow::Int8Builder>(rows);
+    case arrow::Type::INT16:
+        return make_indices_with<arrow::Int16Builder>(rows);
+    case arrow::Type::INT32:
+        return make_indices_with<arrow::Int32Builder>(rows);
+    case arrow::Type::INT64:
+        return make_indices_with<arrow::Int64Builder>(rows);
+    case arrow::Type::UINT8:
+        return make_indices_with<arrow::UInt8Builder>(rows);
+    case arrow::Type::UINT16:
+        return make_indices_with<arrow::UInt16Builder>(rows);
+    case arrow::Type::UINT32:
+        return make_indices_with<arrow::UInt32Builder>(rows);
+    default:
+        ADD_FAILURE() << "unsupported index type " << type.ToString();
+        return nullptr;
+    }
+}
+
+// Builds struct<metadata: dictionary<index, binary>, value: binary> by hand. The DictionaryArray
+// constructor does not check the indices against the dictionary, so out-of-range ones survive.
+std::shared_ptr<arrow::StructArray> make_dictionary_struct(const std::vector<std::string>& dictionary,
+                                                           const std::vector<DictionaryRow>& rows,
+                                                           DictionaryShape shape = {}) {
+    auto dictionary_values = make_child(shape.large_dictionary, dictionary);
+    auto metadata = std::make_shared<arrow::DictionaryArray>(
+            arrow::dictionary(shape.index_type, dictionary_values->type()),
+            make_indices(*shape.index_type, rows), dictionary_values);
+    std::vector<std::string> values;
+    int64_t null_count = 0;
+    std::shared_ptr<arrow::Buffer> bitmap =
+            arrow::AllocateEmptyBitmap(static_cast<int64_t>(rows.size())).ValueOrDie();
+    for (size_t row = 0; row < rows.size(); ++row) {
+        values.push_back(rows[row].value);
+        if (rows[row].null_row) {
+            ++null_count;
+        } else {
+            arrow::bit_util::SetBit(bitmap->mutable_data(), static_cast<int64_t>(row));
+        }
+    }
+    auto value = make_child(false, values);
+    arrow::ArrayVector children = shape.metadata_first ? arrow::ArrayVector {metadata, value}
+                                                       : arrow::ArrayVector {value, metadata};
+    std::vector<std::string> names = shape.metadata_first
+                                             ? std::vector<std::string> {"metadata", "value"}
+                                             : std::vector<std::string> {"value", "metadata"};
+    return arrow::StructArray::Make(children, names, null_count == 0 ? nullptr : bitmap,
+                                    null_count)
+            .ValueOrDie();
+}
+
+// Dictionary-encodes the metadata of every row of source: one entry per distinct metadata, in
+// first-use order.
+std::pair<std::vector<std::string>, std::vector<DictionaryRow>> dictionary_encode(
+        const ColumnVariantV2& source) {
+    std::vector<std::string> dictionary;
+    std::map<std::string, int64_t> ids;
+    std::vector<DictionaryRow> rows;
+    for (size_t row = 0; row < source.size(); ++row) {
+        auto [metadata, value] = row_bytes(source, row);
+        auto [it, inserted] = ids.emplace(metadata, static_cast<int64_t>(dictionary.size()));
+        if (inserted) {
+            dictionary.push_back(metadata);
+        }
+        rows.push_back({.index = it->second, .value = std::move(value)});
+    }
+    return {std::move(dictionary), std::move(rows)};
+}
+
+std::vector<DictionaryShape> dictionary_shapes() {
+    std::vector<DictionaryShape> shapes;
+    for (const auto& index_type : {arrow::int8(), arrow::int16(), arrow::int32(), arrow::uint8(),
+                                   arrow::uint16()}) {
+        for (bool large_dictionary : {false, true}) {
+            for (bool metadata_first : {true, false}) {
+                shapes.push_back({.index_type = index_type,
+                                  .large_dictionary = large_dictionary,
+                                  .metadata_first = metadata_first});
+            }
+        }
+    }
+    return shapes;
+}
+
+std::string describe(const DictionaryShape& shape) {
+    return shape.index_type->ToString() + (shape.large_dictionary ? " large_binary" : " binary") +
+           (shape.metadata_first ? " metadata-first" : " value-first");
 }
 
 // A minimal stand-in for the canonical extension type, which this Arrow build need not register.
@@ -684,6 +813,223 @@ TEST(DataTypeVariantV2SerdeArrowBinaryTest, WrongStructShapeIsInvalidArgument) {
                                      Names {"value", "value"})
                     .ValueOrDie(),
             arrow::StructArray::Make({binary(good.first), string_child}, Names {"metadata", "value"})
+                    .ValueOrDie(),
+    };
+    for (const auto& array : arrays) {
+        auto column = ColumnVariantV2::create();
+        const Status status = read_arrow(*column, *array, 0, 1);
+        EXPECT_EQ(status.code(), ErrorCode::INVALID_ARGUMENT) << array->type()->ToString();
+        EXPECT_EQ(column->size(), 0);
+    }
+}
+
+
+// The producer's common form: one dictionary entry per batch and every index 0. It loads into the
+// compact single-metadata form with the same bytes as the plain binary struct and the JSON text
+// read of the same rows, for every index type, dictionary value type and child order.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataWithOneEntryMatchesOtherForms) {
+    const auto& documents = tricky_documents();
+    auto json_column = read_json_text(documents);
+    ASSERT_EQ(json_column->read_view().metadata_count(), 1);
+    auto plain_array = write_binary_struct(*json_column, false);
+    auto plain_column = ColumnVariantV2::create();
+    ASSERT_TRUE(read_arrow(*plain_column, *plain_array, 0, plain_array->length()).ok());
+
+    const auto [dictionary, rows] = dictionary_encode(*json_column);
+    ASSERT_EQ(dictionary.size(), 1);
+    for (const auto& shape : dictionary_shapes()) {
+        SCOPED_TRACE(describe(shape));
+        auto array = make_dictionary_struct(dictionary, rows, shape);
+        auto column = ColumnVariantV2::create();
+        const Status status = read_arrow(*column, *array, 0, array->length());
+        ASSERT_TRUE(status.ok()) << status;
+        ASSERT_EQ(column->size(), documents.size());
+        EXPECT_EQ(column->read_view().metadata_count(), 1);
+        expect_same_rows(*json_column, 0, *column, 0, documents.size());
+        for (size_t row = 0; row < documents.size(); ++row) {
+            EXPECT_EQ(row_bytes(*column, row), row_bytes(*json_column, row)) << row;
+            EXPECT_EQ(row_bytes(*column, row), row_bytes(*plain_column, row)) << row;
+        }
+        column->sanity_check();
+    }
+}
+
+// Several entries with mixed indices map onto the encoded-row view: each row keeps its entry's
+// bytes, and only the entries the rows use reach the column.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataWithSeveralEntries) {
+    const auto& documents = tricky_documents();
+    auto json_column = read_json_text(documents);
+    auto per_row = encode_per_row(documents);
+    auto plain_array = write_binary_struct(*per_row, false);
+    auto plain_column = ColumnVariantV2::create();
+    ASSERT_TRUE(read_arrow(*plain_column, *plain_array, 0, plain_array->length()).ok());
+
+    auto [dictionary, rows] = dictionary_encode(*per_row);
+    ASSERT_GT(dictionary.size(), 1);
+    ASSERT_LT(dictionary.size(), 99);
+    // An entry no row uses is still a valid metadata, and it stays out of the column.
+    dictionary.push_back(encode_one(R"({"unused":1})").first);
+    for (const auto& shape : dictionary_shapes()) {
+        SCOPED_TRACE(describe(shape));
+        auto array = make_dictionary_struct(dictionary, rows, shape);
+        auto column = ColumnVariantV2::create();
+        const Status status = read_arrow(*column, *array, 0, array->length());
+        ASSERT_TRUE(status.ok()) << status;
+        ASSERT_EQ(column->size(), documents.size());
+        EXPECT_EQ(column->read_view().metadata_count(), dictionary.size() - 1);
+        EXPECT_EQ(column->read_view().metadata_count(),
+                  plain_column->read_view().metadata_count());
+        expect_same_rows(*json_column, 0, *column, 0, documents.size());
+        for (size_t row = 0; row < documents.size(); ++row) {
+            EXPECT_EQ(row_bytes(*column, row), row_bytes(*per_row, row)) << row;
+            EXPECT_EQ(row_bytes(*column, row), row_bytes(*plain_column, row)) << row;
+        }
+        column->sanity_check();
+    }
+}
+
+// A null struct row is SQL NULL and Variant null whatever its index and value slots hold: an
+// out-of-range index, a null index or junk value bytes.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataNullStructRowsIgnoreSlots) {
+    const EncodedRow object = encode_one(R"({"a":1})");
+    const EncodedRow other = encode_one(R"({"b":[true]})");
+    const std::vector<std::string> dictionary = {object.first, other.first};
+    DictionaryRow null_index_row = null_dictionary_row();
+    null_index_row.index.reset();
+    for (bool shared : {true, false}) {
+        const std::vector<DictionaryRow> rows = {
+                null_dictionary_row(),
+                {.index = 0, .value = object.second},
+                null_index_row,
+                shared ? DictionaryRow {.index = 0, .value = object.second}
+                       : DictionaryRow {.index = 1, .value = other.second},
+                null_dictionary_row(),
+        };
+        for (const auto& index_type : {arrow::int8(), arrow::int32()}) {
+            auto array = make_dictionary_struct(dictionary, rows, {.index_type = index_type});
+            DataTypeNullableSerDe nullable_serde(std::make_shared<DataTypeVariantV2SerDe>());
+            auto outer = make_nullable_variant_column();
+            const Status status = nullable_serde.read_column_from_arrow(
+                    *outer, array.get(), 0, array->length(), cctz::utc_time_zone());
+            ASSERT_TRUE(status.ok()) << status;
+            ASSERT_EQ(outer->size(), 5);
+            const auto& nested = assert_cast<const ColumnVariantV2&>(outer->get_nested_column());
+            for (size_t row : {size_t {0}, size_t {2}, size_t {4}}) {
+                EXPECT_TRUE(outer->is_null_at(row));
+                EXPECT_EQ(json_at(nested, row), "null");
+            }
+            EXPECT_FALSE(outer->is_null_at(1));
+            EXPECT_EQ(json_at(nested, 1), R"({"a":1})");
+            EXPECT_EQ(json_at(nested, 3), shared ? R"({"a":1})" : R"({"b":[true]})");
+            EXPECT_EQ(nested.read_view().metadata_count(), shared ? 1 : 2);
+            nested.sanity_check();
+        }
+    }
+
+    auto all_null = make_dictionary_struct(dictionary, {null_dictionary_row(), null_index_row});
+    auto column = ColumnVariantV2::create();
+    ASSERT_TRUE(read_arrow(*column, *all_null, 0, 2).ok());
+    ASSERT_EQ(column->size(), 2);
+    EXPECT_EQ(json_at(*column, 0), "null");
+    EXPECT_EQ(json_at(*column, 1), "null");
+}
+
+// An index outside the dictionary, or a null index on a non-null row, is InvalidArgument and
+// publishes nothing, on both the single-entry and the several-entry paths.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataBadIndexFailsAtomically) {
+    const EncodedRow good = encode_one(R"({"a":"b"})");
+    const EncodedRow other = encode_one(R"({"c":1})");
+    const std::vector<std::string> dictionary = {good.first, other.first};
+    const std::vector<std::optional<int64_t>> bad_indexes = {2, 99, -1, std::nullopt};
+    for (bool shared : {true, false}) {
+        for (const auto& bad_index : bad_indexes) {
+            for (const auto& index_type : {arrow::int8(), arrow::int16(), arrow::int32()}) {
+                SCOPED_TRACE(index_type->ToString() + " " +
+                             (bad_index ? std::to_string(*bad_index) : std::string("null")) +
+                             (shared ? " shared" : " mixed"));
+                auto column = ColumnVariantV2::create();
+                ASSERT_TRUE(read_arrow(*column, *make_binary_struct({good}), 0, 1).ok());
+                const std::vector<DictionaryRow> rows = {
+                        {.index = 0, .value = good.second},
+                        shared ? DictionaryRow {.index = 0, .value = good.second}
+                               : DictionaryRow {.index = 1, .value = other.second},
+                        {.index = bad_index, .value = good.second},
+                };
+                auto array = make_dictionary_struct(dictionary, rows, {.index_type = index_type});
+                const Status status = read_arrow(*column, *array, 0, array->length());
+                EXPECT_EQ(status.code(), ErrorCode::INVALID_ARGUMENT) << status;
+                EXPECT_EQ(column->size(), 1);
+                column->sanity_check();
+                EXPECT_EQ(json_at(*column, 0), R"({"a":"b"})");
+            }
+        }
+    }
+
+    // An empty or malformed dictionary entry is rejected too.
+    for (const auto& bad_entry : std::vector<std::string> {"", std::string("\x01", 1)}) {
+        auto column = ColumnVariantV2::create();
+        auto array = make_dictionary_struct(
+                {bad_entry, good.first},
+                {{.index = 1, .value = good.second}, {.index = 0, .value = good.second}});
+        EXPECT_FALSE(read_arrow(*column, *array, 0, array->length()).ok());
+        EXPECT_EQ(column->size(), 0);
+    }
+}
+
+// A sliced struct (offset != 0) slices the dictionary indices with it, and a [start, end)
+// sub-range addresses the logical rows.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataSlicedArrayUsesLogicalRows) {
+    std::vector<std::string> documents;
+    for (int i = 0; i < 10; ++i) {
+        documents.push_back("{\"k" + std::to_string(i) + "\":" + std::to_string(i) + "}");
+    }
+    for (bool shared : {true, false}) {
+        auto source = shared ? read_json_text(documents) : encode_per_row(documents);
+        auto [dictionary, rows] = dictionary_encode(*source);
+        rows[5] = null_dictionary_row();
+        auto array = make_dictionary_struct(dictionary, rows, {.index_type = arrow::int16()});
+        auto sliced = array->Slice(3, 6); // rows 3..8
+        ASSERT_EQ(sliced->offset(), 3);
+        auto column = ColumnVariantV2::create();
+        const Status status = read_arrow(*column, *sliced, 1, 5); // rows 4..7
+        ASSERT_TRUE(status.ok()) << status;
+        ASSERT_EQ(column->size(), 4);
+        EXPECT_EQ(json_at(*column, 0), R"({"k4":4})");
+        EXPECT_EQ(json_at(*column, 1), "null");
+        EXPECT_EQ(json_at(*column, 2), R"({"k6":6})");
+        EXPECT_EQ(json_at(*column, 3), R"({"k7":7})");
+        EXPECT_EQ(column->read_view().metadata_count(), shared ? 1 : 3);
+        column->sanity_check();
+
+        auto empty = ColumnVariantV2::create();
+        ASSERT_TRUE(read_arrow(*empty, *sliced, 2, 2).ok());
+        EXPECT_EQ(empty->size(), 0);
+    }
+}
+
+// Only the metadata child may be dictionary encoded, and only over binary values.
+TEST(DataTypeVariantV2SerdeArrowBinaryTest, DictionaryMetadataWrongShapeIsInvalidArgument) {
+    const EncodedRow good = encode_one("1");
+    auto int32_indices = make_indices_with<arrow::Int32Builder>({{.index = 0, .value = ""}});
+    auto binary_dictionary = [&](const std::string& entry) {
+        auto values = make_child(false, {entry});
+        return std::make_shared<arrow::DictionaryArray>(
+                arrow::dictionary(arrow::int32(), arrow::binary()), int32_indices, values);
+    };
+    arrow::StringBuilder string_builder;
+    ASSERT_TRUE(string_builder.Append(good.first).ok());
+    std::shared_ptr<arrow::Array> string_values;
+    ASSERT_TRUE(string_builder.Finish(&string_values).ok());
+    auto string_dictionary = std::make_shared<arrow::DictionaryArray>(
+            arrow::dictionary(arrow::int32(), arrow::utf8()), int32_indices, string_values);
+
+    std::vector<std::shared_ptr<arrow::StructArray>> arrays = {
+            arrow::StructArray::Make({string_dictionary, make_child(false, {good.second})},
+                                     Names {"metadata", "value"})
+                    .ValueOrDie(),
+            arrow::StructArray::Make(
+                    {make_child(false, {good.first}), binary_dictionary(good.second)},
+                    Names {"metadata", "value"})
                     .ValueOrDie(),
     };
     for (const auto& array : arrays) {
