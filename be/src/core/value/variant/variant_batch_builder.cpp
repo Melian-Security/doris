@@ -27,6 +27,7 @@
 #include <limits>
 #include <ranges>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "common/exception.h"
@@ -132,9 +133,23 @@ void append_unsigned(String& output, uint64_t value, uint8_t width) {
     }
 }
 
+// Swapping with an empty container releases capacity that clear() would keep. This runs in
+// noexcept paths, typically right after a batch filled the query's memory budget, and every
+// allocation goes through the tracked allocator, which throws once the mem tracker is over its
+// limit. A default-constructed libstdc++ std::deque allocates its map and first node, so for a
+// container whose default constructor may throw, a failed swap falls back to clear(): that frees
+// every element and every node but one without allocating, and the rest goes with the container.
 template <typename Container>
 void release_batch_container(Container& container) noexcept {
-    Container().swap(container);
+    if constexpr (std::is_nothrow_default_constructible_v<Container>) {
+        Container().swap(container);
+    } else {
+        try {
+            Container().swap(container);
+        } catch (...) {
+            container.clear();
+        }
+    }
 }
 
 } // namespace
