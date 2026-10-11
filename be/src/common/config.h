@@ -1479,6 +1479,10 @@ DECLARE_mInt32(tablet_path_check_batch_size);
 
 // it must be larger than or equal to 5MB
 DECLARE_mInt64(s3_write_buffer_size);
+// Initial allocation of an S3 upload part buffer. The buffer grows geometrically up to
+// s3_write_buffer_size as data is appended, so a small file never reserves a full part.
+// A value <= 0 or >= s3_write_buffer_size allocates the whole part up front.
+DECLARE_mInt64(s3_write_buffer_initial_size);
 // Log interval when doing s3 upload task
 DECLARE_mInt32(s3_file_writer_log_interval_second);
 // the max number of cached file handle for block segemnt

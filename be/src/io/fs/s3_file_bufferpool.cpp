@@ -20,6 +20,7 @@
 #include <bvar/bvar.h>
 #include <crc32c/crc32c.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 
@@ -42,6 +43,11 @@ namespace doris {
 namespace io {
 
 bvar::Adder<uint64_t> s3_file_buffer_allocated("s3_file_buffer_allocated");
+// Bytes currently allocated by S3 file buffers; an upload buffer holds only what it has grown to.
+bvar::Adder<int64_t> s3_file_buffer_allocated_bytes("s3_file_buffer_allocated_bytes");
+bvar::Adder<uint64_t> s3_file_buffer_grow_count("s3_file_buffer_grow_count");
+// Bytes copied because a grow could not extend the allocation in place.
+bvar::Adder<uint64_t> s3_file_buffer_grow_copied_bytes("s3_file_buffer_grow_copied_bytes");
 bvar::Adder<int64_t> s3_file_cache_write_queued("s3_file_cache_write_queued");
 bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread(
         "s3_file_cache_write_off_upload_thread");
@@ -133,12 +139,25 @@ struct Memory : boost::noncopyable, Allocator {
     explicit Memory(size_t size) : _size(size) {
         alloc(size);
         s3_file_buffer_allocated << 1;
+        s3_file_buffer_allocated_bytes << static_cast<int64_t>(size);
     }
     ~Memory() {
+        s3_file_buffer_allocated_bytes << -static_cast<int64_t>(_size);
         dealloc();
         s3_file_buffer_allocated << -1;
     }
     void alloc(size_t size) { _data = static_cast<char*>(Allocator::alloc(size, 0)); }
+    // Keeps the first `used` bytes. On failure it throws and leaves the memory unchanged.
+    void grow(size_t new_size, size_t used) {
+        char* old_data = _data;
+        _data = static_cast<char*>(Allocator::realloc(_data, _size, new_size, 0));
+        s3_file_buffer_allocated_bytes << static_cast<int64_t>(new_size - _size);
+        s3_file_buffer_grow_count << 1;
+        if (_data != old_data) {
+            s3_file_buffer_grow_copied_bytes << used;
+        }
+        _size = new_size;
+    }
     void dealloc() {
         if (_data == nullptr) {
             return;
@@ -152,11 +171,26 @@ struct Memory : boost::noncopyable, Allocator {
 
 struct FileBuffer::PartData {
     Memory<> _memory;
-    explicit PartData(size_t capacity) : _memory(capacity) {}
+    explicit PartData(size_t size) : _memory(size) {}
     ~PartData() = default;
     [[nodiscard]] Slice data() const { return Slice {_memory._data, _memory._size}; }
     [[nodiscard]] size_t size() const { return _memory._size; }
+    void grow(size_t new_size, size_t used) { _memory.grow(new_size, used); }
 };
+
+// An upload buffer starts at config::s3_write_buffer_initial_size and grows on append, so a
+// small file holds about its own size rather than a whole part. A download buffer is filled
+// in place by its download callback, so it allocates its whole capacity.
+static size_t initial_allocation(BufferType type, size_t capacity) {
+    if (type != BufferType::UPLOAD) {
+        return capacity;
+    }
+    int64_t initial = config::s3_write_buffer_initial_size;
+    if (initial <= 0 || static_cast<size_t>(initial) >= capacity) {
+        return capacity;
+    }
+    return static_cast<size_t>(initial);
+}
 
 Slice FileBuffer::get_slice() const {
     return _inner_data->data();
@@ -169,9 +203,27 @@ FileBuffer::FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> all
           _offset(offset),
           _size(0),
           _state(std::move(state)),
-          _inner_data(std::make_unique<FileBuffer::PartData>(
-                  capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size))),
-          _capacity(_inner_data->size()) {}
+          _capacity(capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size)) {
+    _inner_data = std::make_unique<FileBuffer::PartData>(initial_allocation(type, _capacity));
+}
+
+size_t FileBuffer::get_allocated_size() const {
+    return _inner_data->size();
+}
+
+// Only the appending thread reaches this, before the buffer is submitted, so no reader holds
+// a pointer into the memory that a grow may move.
+Status FileBuffer::_reserve(size_t required) {
+    size_t allocated = _inner_data->size();
+    if (required <= allocated) [[likely]] {
+        return Status::OK();
+    }
+    DCHECK_LE(required, _capacity);
+    size_t new_size = std::min(std::max(required, allocated * 2), _capacity);
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->s3_file_buffer_tracker());
+    RETURN_IF_CATCH_EXCEPTION(_inner_data->grow(new_size, _size));
+    return Status::OK();
+}
 
 FileBuffer::~FileBuffer() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->s3_file_buffer_tracker());
@@ -189,6 +241,7 @@ Status UploadFileBuffer::append_data(const Slice& data) {
         return Status::InternalError("append {} bytes to upload buffer of {}/{} bytes",
                                      data.get_size(), _size, _capacity);
     }
+    RETURN_IF_ERROR(_reserve(_size + data.get_size()));
     std::memcpy((void*)(_inner_data->data().get_data() + _size), data.get_data(), data.get_size());
     _size += data.get_size();
     _crc_value = crc32c::Extend(_crc_value, (const uint8_t*)data.get_data(), data.get_size());
