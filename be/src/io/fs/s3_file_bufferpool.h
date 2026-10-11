@@ -212,11 +212,14 @@ struct FileBuffer {
     size_t _size;
     OperationState _state;
     size_t _capacity;
+    // Largest allocation reached by doubling; growth past it allocates _capacity directly.
+    size_t _grow_jump_threshold;
     struct PartData;
     std::unique_ptr<PartData> _inner_data;
 
 protected:
-    // Grows the allocation to hold `required` bytes, at least doubling it, up to _capacity.
+    // Grows the allocation to hold `required` bytes: doubling up to _grow_jump_threshold, then
+    // straight to _capacity.
     Status _reserve(size_t required);
 };
 
