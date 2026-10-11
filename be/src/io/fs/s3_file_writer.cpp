@@ -76,6 +76,7 @@ S3FileWriter::S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string 
           _background_write(opts != nullptr && opts->background_write &&
                             config::enable_separate_compaction_s3_upload_pool),
           _bound_load_upload_inflight(opts == nullptr || opts->bound_load_upload_inflight),
+          _load_upload_buffer(opts != nullptr && opts->load_upload_buffer),
           _obj_client(std::move(client)) {
     s3_file_writer_total << 1;
     s3_file_being_written << 1;
@@ -290,7 +291,8 @@ Status S3FileWriter::_build_upload_buffer() {
             .set_sync_after_complete_task([this](auto&& PH1) {
                 return _complete_part_task_callback(std::forward<decltype(PH1)>(PH1));
             })
-            .set_is_cancelled([this]() { return _failed.load(); });
+            .set_is_cancelled([this]() { return _failed.load(); })
+            .set_count_as_load_upload(_load_upload_buffer);
     if (_cache_builder != nullptr) {
         // We would load the data into file cache asynchronously which indicates
         // that this instance of S3FileWriter might have been destructed when we

@@ -244,6 +244,7 @@ struct RowsetWriterContext {
                 .approximate_bytes_to_write = approximate_bytes_to_write,
                 .background_write = write_type == DataWriteType::TYPE_COMPACTION ||
                                     write_type == DataWriteType::TYPE_SCHEMA_CHANGE};
+        opts.load_upload_buffer = !opts.background_write;
 
         if (config::enable_file_cache_write_index_file_only) {
             opts.allow_adaptive_file_cache_write = false;

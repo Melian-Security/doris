@@ -60,6 +60,10 @@ struct FileWriterOptions {
     // cache, so data written once and read rarely does not hold dirty pages against the memory
     // limit.
     bool drop_page_cache_on_close = false;
+    // Remote writers only: count this writer's upload buffers in io::load_upload_buffer_bytes(),
+    // which gates new load writes. Set for load output, whose buffers drain without the gated
+    // write threads.
+    bool load_upload_buffer = false;
 };
 
 struct AsyncCloseStatusPack {

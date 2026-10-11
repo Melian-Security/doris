@@ -1879,6 +1879,14 @@ DECLARE_mInt64(compaction_s3_upload_max_inflight_parts);
 // bounds that memory. A writer that hits the bound blocks before submitting. <= 0 disables
 // the bound.
 DECLARE_mInt64(load_s3_upload_max_inflight_parts);
+// Bytes held by load S3 upload buffers (filling, waiting for an upload slot, uploading or waiting
+// for the file cache copy) at which new load writes wait in the memtable memory gate. <= 0
+// disables it.
+DECLARE_mInt64(load_s3_upload_buffer_backpressure_bytes);
+// Once engaged, the gate holds writes until the bytes fall to this percent of the threshold.
+DECLARE_mInt32(load_s3_upload_buffer_backpressure_resume_percent);
+// Upper bound of one wait in that gate. <= 0 means no bound.
+DECLARE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms);
 
 // Copy an uploaded part into the file cache on S3FileCacheWriterThreadPool instead of on the
 // upload thread, so a slow or contended file cache cannot hold upload threads. A part that

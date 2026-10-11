@@ -131,6 +131,8 @@ private:
     bool _background_write;
     // From FileWriterOptions::bound_load_upload_inflight; ignored for background writers.
     bool _bound_load_upload_inflight;
+    // From FileWriterOptions::load_upload_buffer.
+    bool _load_upload_buffer;
     std::unique_ptr<AsyncCloseStatusPack> _async_close_pack;
     State _state {State::OPENED};
     std::shared_ptr<ObjClientHolder> _obj_client;

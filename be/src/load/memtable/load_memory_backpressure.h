@@ -92,6 +92,28 @@ struct LoadMemoryBackpressure {
         return max_wait_ms <= 0 || waited_ms < max_wait_ms;
     }
 
+    // Whether the load S3 upload-buffer gate holds writes, given whether it held them at the
+    // previous check. It engages at `threshold` bytes and, once engaged, releases only when the
+    // bytes fall to `resume_percent` of the threshold, so writers do not flap around it. A
+    // threshold <= 0 disables the gate; a resume percent >= 100 releases as soon as the bytes
+    // drop below the threshold.
+    static bool s3_upload_buffer_engaged(bool engaged, int64_t bytes, int64_t threshold,
+                                         int64_t resume_percent) {
+        if (threshold <= 0) {
+            return false;
+        }
+        if (bytes >= threshold) {
+            return true;
+        }
+        if (!engaged) {
+            return false;
+        }
+        int64_t resume = resume_percent >= 100 ? threshold
+                         : resume_percent <= 0 ? 0
+                                               : percent_of(threshold, resume_percent);
+        return bytes > resume;
+    }
+
     // Memory the process GC should free by cancelling loads. With `extra_percent` < 0, or when
     // system available memory is below its low water mark, it is the full GC size. Otherwise it is
     // the overshoot above mem_limit plus `extra_percent` of mem_limit, capped at the full GC size,

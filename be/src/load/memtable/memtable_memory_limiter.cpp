@@ -19,6 +19,9 @@
 
 #include <bvar/bvar.h>
 
+#include <chrono>
+#include <thread>
+
 #include "common/config.h"
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
@@ -50,6 +53,12 @@ bvar::Adder<uint64_t> g_flush_cuz_load_mem_exceed_hard_limit("flush_cuz_hard_lim
 bvar::Adder<uint64_t> g_flush_cuz_sys_mem_exceed_soft_limit("flush_cuz_soft_limit");
 bvar::Adder<int> g_memtable_memory_limit_flush_memtable_count("mm_limiter_flush_memtable_count");
 bvar::LatencyRecorder g_memtable_memory_limit_flush_size_bytes("mm_limiter_flush_size_bytes");
+bvar::Adder<int64_t> g_s3_upload_buffer_waiting_threads(
+        "mm_limiter_s3_upload_buffer_waiting_threads");
+bvar::LatencyRecorder g_s3_upload_buffer_wait_time_ms("mm_limiter_s3_upload_buffer_wait_time_ms");
+bvar::Adder<uint64_t> g_s3_upload_buffer_engage_count("mm_limiter_s3_upload_buffer_engage_count");
+bvar::Adder<uint64_t> g_s3_upload_buffer_wait_timeout_count(
+        "mm_limiter_s3_upload_buffer_wait_timeout_count");
 
 // Calculate the total memory limit of all load tasks on this BE
 static int64_t calc_process_max_load_memory(int64_t process_mem_limit) {
@@ -246,8 +255,75 @@ void MemTableMemoryLimiter::handle_table_memtable_backpressure(std::function<boo
               << ", limit=" << pending_count_limit << ", memtable writers num: " << _writers.size();
 }
 
+bool S3UploadBufferBackpressure::_refresh() {
+    const int64_t threshold = config::load_s3_upload_buffer_backpressure_bytes;
+    bool was_engaged = _engaged.load(std::memory_order_relaxed);
+    if (threshold <= 0 && !was_engaged) {
+        return false;
+    }
+    bool engaged = LoadMemoryBackpressure::s3_upload_buffer_engaged(
+            was_engaged, _bytes(), threshold,
+            config::load_s3_upload_buffer_backpressure_resume_percent);
+    // Concurrent refreshes race only on which of two fresh reads wins; either is a valid state.
+    if (engaged != was_engaged) {
+        _engaged.store(engaged, std::memory_order_relaxed);
+        if (engaged) {
+            g_s3_upload_buffer_engage_count << 1;
+        }
+    }
+    return engaged;
+}
+
+void S3UploadBufferBackpressure::wait(const std::function<bool()>& cancel_check) {
+    if (!_refresh()) {
+        return;
+    }
+    MonotonicStopWatch timer;
+    timer.start();
+    _waiters.fetch_add(1, std::memory_order_relaxed);
+    g_s3_upload_buffer_waiting_threads << 1;
+    bool timed_out = false;
+    while (true) {
+        if (cancel_check && cancel_check()) {
+            break;
+        }
+        const int64_t max_wait_ms = config::load_s3_upload_buffer_backpressure_max_wait_ms;
+        if (max_wait_ms > 0 && timer.elapsed_time() / 1000 / 1000 >= max_wait_ms) {
+            timed_out = true;
+            g_s3_upload_buffer_wait_timeout_count << 1;
+            break;
+        }
+        LOG_EVERY_T(INFO, 1) << "load S3 upload buffer backpressure: upload buffer bytes="
+                             << PrettyPrinter::print_bytes(_bytes()) << ", threshold="
+                             << PrettyPrinter::print_bytes(
+                                        config::load_s3_upload_buffer_backpressure_bytes)
+                             << ", waiting writers=" << _waiters.load();
+        // Buffers are freed on upload and close threads with no hook into this gate, so it
+        // polls; the interval is small next to the time a part takes to upload.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!_refresh()) {
+            break;
+        }
+    }
+    _waiters.fetch_sub(1, std::memory_order_relaxed);
+    g_s3_upload_buffer_waiting_threads << -1;
+    timer.stop();
+    int64_t time_ms = timer.elapsed_time() / 1000 / 1000;
+    g_s3_upload_buffer_wait_time_ms << time_ms;
+    if (timed_out) {
+        LOG(WARNING) << "load S3 upload buffer backpressure wait timed out after " << time_ms
+                     << " ms, upload buffer bytes=" << PrettyPrinter::print_bytes(_bytes());
+    }
+}
+
 void MemTableMemoryLimiter::handle_memtable_flush(std::function<bool()> cancel_check,
                                                   WorkloadGroup*) {
+    _handle_memtable_mem_limit(cancel_check);
+    // After the memtable gate, so the upload buffers of the flushes it scheduled are counted.
+    _s3_upload_buffer_backpressure.wait(cancel_check);
+}
+
+void MemTableMemoryLimiter::_handle_memtable_mem_limit(const std::function<bool()>& cancel_check) {
     // Check the soft limit.
     DCHECK(_load_soft_mem_limit > 0);
     do {

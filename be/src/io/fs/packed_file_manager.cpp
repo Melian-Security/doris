@@ -271,6 +271,7 @@ Status PackedFileManager::create_new_packed_file_context(
     // Appends run under the BE-wide _current_packed_file_mutex, so waiting for an upload permit
     // there would stall every small-file append. One writer at a time already bounds its parts.
     opts.bound_load_upload_inflight = false;
+    opts.load_upload_buffer = true;
     RETURN_IF_ERROR(
             packed_file_ctx->file_system->create_file(Path(relative_path), &new_writer, &opts));
     packed_file_ctx->writer = std::move(new_writer);

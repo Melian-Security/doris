@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 
+#include <atomic>
 #include <functional>
 
 #include "common/status.h"
@@ -28,6 +29,42 @@
 #include "util/stopwatch.hpp"
 
 namespace doris {
+namespace io {
+int64_t load_upload_buffer_bytes();
+} // namespace io
+
+// Holds new load writes while load S3 upload buffers (io::load_upload_buffer_bytes()) are at or
+// above config::load_s3_upload_buffer_backpressure_bytes, until they fall to
+// config::load_s3_upload_buffer_backpressure_resume_percent of it.
+//
+// It never blocks a buffer allocation. Callers wait only at the entry of a load write, holding no
+// load upload buffer, and every counted buffer is filled, submitted and released by memtable
+// flush, segment close, load stream and upload threads, none of which pass through this gate.
+// Those threads may wait for an upload slot, which only already-submitted parts hold. So the
+// counted bytes keep draining while writers wait here.
+class S3UploadBufferBackpressure {
+public:
+    explicit S3UploadBufferBackpressure(
+            std::function<int64_t()> bytes = [] { return io::load_upload_buffer_bytes(); })
+            : _bytes(std::move(bytes)) {}
+
+    // Returns at once while the gate is released. Otherwise waits until it is released,
+    // `cancel_check` returns true, or config::load_s3_upload_buffer_backpressure_max_wait_ms runs
+    // out. Must not be called while holding a load upload buffer.
+    void wait(const std::function<bool()>& cancel_check);
+
+    bool engaged() const { return _engaged.load(std::memory_order_relaxed); }
+    int64_t waiters() const { return _waiters.load(std::memory_order_relaxed); }
+
+private:
+    // Re-evaluates the gate against the current bytes and configs.
+    bool _refresh();
+
+    std::function<int64_t()> _bytes;
+    std::atomic<bool> _engaged {false};
+    std::atomic<int64_t> _waiters {0};
+};
+
 class MemTableWriter;
 class PUniqueId;
 struct WriterMemItem {
@@ -45,6 +82,7 @@ public:
     // If yes, it will flush memtable to try to reduce memory consumption.
     // Every write operation will call this API to check if need flush memtable OR hang
     // when memory is not available.
+    // Then waits in the load S3 upload-buffer gate (see S3UploadBufferBackpressure).
     void handle_memtable_flush(std::function<bool()> cancel_check, WorkloadGroup* wg = nullptr);
     // `load_id`, when given, lets the memory gate wait only on the flushes of the writer's own load
     // (see config::load_memory_backpressure_wait_on_own_load).
@@ -61,7 +99,12 @@ public:
 
     bool soft_limit_reached() { return _soft_limit_reached(); }
 
+    S3UploadBufferBackpressure* s3_upload_buffer_backpressure() {
+        return &_s3_upload_buffer_backpressure;
+    }
+
 private:
+    void _handle_memtable_mem_limit(const std::function<bool()>& cancel_check);
     static inline int64_t _sys_avail_mem_less_than_warning_water_mark();
     static inline int64_t _process_used_mem_more_than_soft_mem_limit();
     // Bytes above the load back-pressure watermark; <= 0 when below it or when disabled.
@@ -96,5 +139,7 @@ private:
 
     std::vector<std::weak_ptr<MemTableWriter>> _writers;
     std::vector<std::weak_ptr<MemTableWriter>> _active_writers;
+
+    S3UploadBufferBackpressure _s3_upload_buffer_backpressure;
 };
 } // namespace doris
