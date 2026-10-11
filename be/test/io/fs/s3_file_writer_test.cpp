@@ -2672,7 +2672,10 @@ TEST_F(S3FileWriterTest, UploadBufferGrowJumpThresholdShapes) {
         UploadFileBuffer buffer([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr,
                                 capacity);
         std::string data = patterned_bytes(0, 2 * kMiB + 1);
-        ASSERT_TRUE(buffer.append_data(Slice(data)).ok());
+        ASSERT_TRUE(buffer.append_data(Slice(data.data(), 2 * kMiB)).ok());
+        EXPECT_EQ(buffer.get_allocated_size(), 2 * kMiB);
+        // Doubling 2 MiB would give 4 MiB; the step is capped at the 3 MiB threshold.
+        ASSERT_TRUE(buffer.append_data(Slice(data.data() + 2 * kMiB, 1)).ok());
         EXPECT_EQ(buffer.get_allocated_size(), 3 * kMiB);
         std::string more = patterned_bytes(data.size(), kMiB);
         ASSERT_TRUE(buffer.append_data(Slice(more)).ok());
