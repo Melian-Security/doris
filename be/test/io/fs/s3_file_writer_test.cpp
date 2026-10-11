@@ -84,6 +84,7 @@ extern bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread;
 extern bvar::Adder<uint64_t> s3_file_cache_write_dropped;
 extern bvar::Adder<int64_t> s3_file_buffer_allocated_bytes;
 extern bvar::Adder<uint64_t> s3_file_buffer_grow_count;
+extern bvar::Adder<uint64_t> s3_file_buffer_grow_copied_bytes;
 } // namespace doris::io
 
 using namespace doris::io;
@@ -2510,6 +2511,14 @@ struct BufferInitialSizeGuard {
     int64_t saved = config::s3_write_buffer_initial_size;
 };
 
+struct GrowJumpThresholdGuard {
+    explicit GrowJumpThresholdGuard(int64_t threshold) {
+        config::s3_write_buffer_grow_jump_threshold = threshold;
+    }
+    ~GrowJumpThresholdGuard() { config::s3_write_buffer_grow_jump_threshold = saved; }
+    int64_t saved = config::s3_write_buffer_grow_jump_threshold;
+};
+
 OperationState ok_operation_state() {
     return OperationState(
             [](Status st) {
@@ -2535,11 +2544,9 @@ constexpr size_t kMiB = 1024 * kKiB;
 size_t allocated_since(int64_t before) {
     return static_cast<size_t>(s3_file_buffer_allocated_bytes.get_value() - before);
 }
-} // namespace
 
-// An upload buffer starts at s3_write_buffer_initial_size and doubles on demand up to its
-// capacity; filling the allocation exactly does not grow it, one more byte does.
-TEST_F(S3FileWriterTest, UploadBufferGrowsGeometricallyToCapacity) {
+// Doubles from 256 KiB to an 8 MiB capacity, checking every step, the bytes and the CRC.
+void check_geometric_growth_to_capacity() {
     BufferInitialSizeGuard guard(256 * kKiB);
     const int64_t allocated_before = s3_file_buffer_allocated_bytes.get_value();
     std::string expected;
@@ -2581,6 +2588,139 @@ TEST_F(S3FileWriterTest, UploadBufferGrowsGeometricallyToCapacity) {
         EXPECT_TRUE(uploaded == expected);
     }
     EXPECT_EQ(s3_file_buffer_allocated_bytes.get_value(), allocated_before);
+}
+} // namespace
+
+// With the grow jump disabled (threshold <= 0 or >= the capacity) an upload buffer starts at
+// s3_write_buffer_initial_size and doubles on demand up to its capacity; filling the
+// allocation exactly does not grow it, one more byte does.
+TEST_F(S3FileWriterTest, UploadBufferGrowsGeometricallyToCapacity) {
+    for (int64_t threshold : {int64_t(0), int64_t(-1), int64_t(8 * kMiB), int64_t(64 * kMiB)}) {
+        SCOPED_TRACE(threshold);
+        GrowJumpThresholdGuard jump_guard(threshold);
+        check_geometric_growth_to_capacity();
+    }
+}
+
+// Past s3_write_buffer_grow_jump_threshold an upload buffer allocates its whole capacity in one
+// step, so filling a part copies at most the threshold at the jump and less than twice the
+// threshold in all, where doubling to the capacity would copy about the capacity.
+TEST_F(S3FileWriterTest, UploadBufferJumpsToCapacityPastThreshold) {
+    BufferInitialSizeGuard guard(256 * kKiB);
+    GrowJumpThresholdGuard jump_guard(4 * kMiB);
+    const size_t capacity = 32 * kMiB;
+    const int64_t allocated_before = s3_file_buffer_allocated_bytes.get_value();
+    const uint64_t grows_before = s3_file_buffer_grow_count.get_value();
+    const uint64_t copied_before = s3_file_buffer_grow_copied_bytes.get_value();
+    std::string expected;
+    std::string uploaded;
+    {
+        UploadFileBuffer buffer(
+                [&uploaded](UploadFileBuffer& buf) {
+                    uploaded = std::string(buf.get_string_view_data());
+                },
+                ok_operation_state(), 0, nullptr, capacity);
+        auto append_to = [&](size_t total) {
+            std::string chunk = patterned_bytes(expected.size(), total - expected.size());
+            ASSERT_TRUE(buffer.append_data(Slice(chunk)).ok()) << total;
+            expected += chunk;
+        };
+        // Doubling up to the threshold: 256 KiB -> 512 KiB -> 1 MiB -> 2 MiB -> 4 MiB.
+        for (size_t size = 256 * kKiB; size < 4 * kMiB; size *= 2) {
+            append_to(size);
+            EXPECT_EQ(buffer.get_allocated_size(), size);
+            append_to(size + 1);
+            EXPECT_EQ(buffer.get_allocated_size(), 2 * size);
+        }
+        append_to(4 * kMiB);
+        EXPECT_EQ(buffer.get_allocated_size(), 4 * kMiB);
+        EXPECT_EQ(s3_file_buffer_grow_count.get_value() - grows_before, 4U);
+        const uint64_t copied_before_jump = s3_file_buffer_grow_copied_bytes.get_value();
+        EXPECT_LT(copied_before_jump - copied_before, 4 * kMiB);
+
+        // One byte past the threshold: straight to the whole part, one copy of <= threshold.
+        append_to(4 * kMiB + 1);
+        EXPECT_EQ(buffer.get_allocated_size(), capacity);
+        EXPECT_EQ(allocated_since(allocated_before), capacity);
+        EXPECT_EQ(s3_file_buffer_grow_count.get_value() - grows_before, 5U);
+        EXPECT_LE(s3_file_buffer_grow_copied_bytes.get_value() - copied_before_jump, 4 * kMiB);
+
+        // Filling the rest of the part never grows or copies again.
+        append_to(capacity);
+        EXPECT_EQ(s3_file_buffer_grow_count.get_value() - grows_before, 5U);
+        EXPECT_LT(s3_file_buffer_grow_copied_bytes.get_value() - copied_before, 2 * 4 * kMiB);
+        EXPECT_FALSE(buffer.append_data(Slice("x", 1)).ok());
+
+        ASSERT_EQ(buffer.get_size(), expected.size());
+        EXPECT_TRUE(buffer.get_string_view_data() == expected);
+        EXPECT_EQ(buffer.crc32c(), crc32c::Crc32c(reinterpret_cast<const uint8_t*>(expected.data()),
+                                                  expected.size()));
+        buffer.on_upload();
+        EXPECT_TRUE(uploaded == expected);
+    }
+    EXPECT_EQ(s3_file_buffer_allocated_bytes.get_value(), allocated_before);
+}
+
+// A threshold that is not a power of two times the initial size caps the last doubling step at
+// the threshold; a threshold below the initial size jumps on the first grow; a single append
+// past the threshold jumps directly.
+TEST_F(S3FileWriterTest, UploadBufferGrowJumpThresholdShapes) {
+    BufferInitialSizeGuard guard(256 * kKiB);
+    const size_t capacity = 16 * kMiB;
+    {
+        GrowJumpThresholdGuard jump_guard(3 * kMiB);
+        UploadFileBuffer buffer([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr,
+                                capacity);
+        std::string data = patterned_bytes(0, 2 * kMiB + 1);
+        ASSERT_TRUE(buffer.append_data(Slice(data)).ok());
+        EXPECT_EQ(buffer.get_allocated_size(), 3 * kMiB);
+        std::string more = patterned_bytes(data.size(), kMiB);
+        ASSERT_TRUE(buffer.append_data(Slice(more)).ok());
+        EXPECT_EQ(buffer.get_allocated_size(), capacity);
+        EXPECT_TRUE(buffer.get_string_view_data() == data + more);
+    }
+    {
+        GrowJumpThresholdGuard jump_guard(100 * kKiB);
+        UploadFileBuffer buffer([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr,
+                                capacity);
+        EXPECT_EQ(buffer.get_allocated_size(), 256 * kKiB);
+        std::string data = patterned_bytes(0, 256 * kKiB + 1);
+        ASSERT_TRUE(buffer.append_data(Slice(data)).ok());
+        EXPECT_EQ(buffer.get_allocated_size(), capacity);
+        EXPECT_TRUE(buffer.get_string_view_data() == data);
+    }
+    {
+        GrowJumpThresholdGuard jump_guard(4 * kMiB);
+        UploadFileBuffer buffer([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr,
+                                capacity);
+        std::string data = patterned_bytes(0, 5 * kMiB);
+        ASSERT_TRUE(buffer.append_data(Slice(data)).ok());
+        EXPECT_EQ(buffer.get_allocated_size(), capacity);
+        EXPECT_TRUE(buffer.get_string_view_data() == data);
+    }
+}
+
+// A buffer reads the threshold once, when it is built: changing it while the buffer is filling
+// does not change that buffer's growth, and buffers built afterwards use the new value.
+TEST_F(S3FileWriterTest, UploadBufferGrowJumpThresholdChangeMidBuffer) {
+    BufferInitialSizeGuard guard(256 * kKiB);
+    GrowJumpThresholdGuard jump_guard(kMiB);
+    const size_t capacity = 16 * kMiB;
+    UploadFileBuffer first([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr, capacity);
+    std::string data = patterned_bytes(0, kMiB);
+    ASSERT_TRUE(first.append_data(Slice(data)).ok());
+    EXPECT_EQ(first.get_allocated_size(), kMiB);
+    config::s3_write_buffer_grow_jump_threshold = 0;
+    std::string more = patterned_bytes(data.size(), 1);
+    ASSERT_TRUE(first.append_data(Slice(more)).ok());
+    EXPECT_EQ(first.get_allocated_size(), capacity);
+    EXPECT_TRUE(first.get_string_view_data() == data + more);
+
+    UploadFileBuffer second([](UploadFileBuffer&) {}, ok_operation_state(), 0, nullptr, capacity);
+    ASSERT_TRUE(second.append_data(Slice(data)).ok());
+    ASSERT_TRUE(second.append_data(Slice(more)).ok());
+    EXPECT_EQ(second.get_allocated_size(), 2 * kMiB);
+    EXPECT_TRUE(second.get_string_view_data() == data + more);
 }
 
 // A capacity that is not a power of two times the initial size is reached exactly, and a
@@ -2627,6 +2767,7 @@ TEST_F(S3FileWriterTest, SmallFileDoesNotReserveAWholePart) {
         config::s3_write_buffer_size = origin_buffer_size;
     }};
     BufferInitialSizeGuard guard(256 * kKiB);
+    GrowJumpThresholdGuard jump_guard(4 * kMiB);
 
     auto [client, writer] = create_s3_client("small_file_lazy_buffer.dat");
     const int64_t allocated_before = s3_file_buffer_allocated_bytes.get_value();
@@ -2656,8 +2797,9 @@ TEST_F(S3FileWriterTest, GrowingBuffersKeepPartLayout) {
     }};
     const std::string data = patterned_bytes(0, 3 * 8 * kMiB + 4 * kMiB + 7);
 
-    auto write = [&](int64_t initial_size, const std::string& filename) {
+    auto write = [&](int64_t initial_size, int64_t jump_threshold, const std::string& filename) {
         BufferInitialSizeGuard guard(initial_size);
+        GrowJumpThresholdGuard jump_guard(jump_threshold);
         auto [client, writer] = create_s3_client(filename);
         // Odd-sized appends cross every growth step and part boundary mid-append.
         constexpr size_t chunk = 100003;
@@ -2669,24 +2811,28 @@ TEST_F(S3FileWriterTest, GrowingBuffersKeepPartLayout) {
         EXPECT_TRUE(client->objects[get_s3_path(filename)] == data) << filename;
         return client;
     };
-    auto grow_before = s3_file_buffer_grow_count.get_value();
-    auto growing = write(256 * kKiB, "grow_part_layout.dat");
-    EXPECT_GT(s3_file_buffer_grow_count.get_value(), grow_before);
-    auto full = write(0, "grow_part_layout.dat");
+    auto full = write(0, 0, "grow_part_layout.dat");
+    // Plain doubling, a jump at an odd size, and a jump at 4 MiB of an 8 MiB part.
+    for (int64_t jump_threshold : {int64_t(0), int64_t(kMiB + 12345), int64_t(4 * kMiB)}) {
+        SCOPED_TRACE(jump_threshold);
+        auto grow_before = s3_file_buffer_grow_count.get_value();
+        auto growing = write(256 * kKiB, jump_threshold, "grow_part_layout.dat");
+        EXPECT_GT(s3_file_buffer_grow_count.get_value(), grow_before);
 
-    EXPECT_EQ(growing->upload_part_count, 4);
-    EXPECT_EQ(growing->upload_part_count, full->upload_part_count);
-    EXPECT_EQ(growing->create_multipart_count, full->create_multipart_count);
-    EXPECT_EQ(growing->complete_multipart_count, full->complete_multipart_count);
-    EXPECT_EQ(growing->uploaded_bytes, full->uploaded_bytes);
-    ASSERT_EQ(growing->parts.size(), full->parts.size());
-    size_t index = 0;
-    for (const auto& [key, part] : growing->parts) {
-        ASSERT_TRUE(full->parts.contains(key)) << key;
-        EXPECT_EQ(part.size(), index + 1 < growing->parts.size() ? 8 * kMiB : 4 * kMiB + 7)
-                << key;
-        EXPECT_TRUE(part == full->parts.at(key)) << key;
-        ++index;
+        EXPECT_EQ(growing->upload_part_count, 4);
+        EXPECT_EQ(growing->upload_part_count, full->upload_part_count);
+        EXPECT_EQ(growing->create_multipart_count, full->create_multipart_count);
+        EXPECT_EQ(growing->complete_multipart_count, full->complete_multipart_count);
+        EXPECT_EQ(growing->uploaded_bytes, full->uploaded_bytes);
+        ASSERT_EQ(growing->parts.size(), full->parts.size());
+        size_t index = 0;
+        for (const auto& [key, part] : growing->parts) {
+            ASSERT_TRUE(full->parts.contains(key)) << key;
+            EXPECT_EQ(part.size(), index + 1 < growing->parts.size() ? 8 * kMiB : 4 * kMiB + 7)
+                    << key;
+            EXPECT_TRUE(part == full->parts.at(key)) << key;
+            ++index;
+        }
     }
 }
 
@@ -2714,6 +2860,42 @@ TEST_F(S3FileWriterTest, InitialSizeChangeMidWrite) {
     // 13 MiB in 5 MiB parts: the writer keeps the part size it was created with.
     EXPECT_EQ(client->upload_part_count, 3);
     EXPECT_TRUE(client->objects[get_s3_path("initial_size_change_mid_write.dat")] == head + tail);
+}
+
+// Changing s3_write_buffer_grow_jump_threshold while a writer is open leaves the object and its
+// parts unchanged.
+TEST_F(S3FileWriterTest, GrowJumpThresholdChangeMidWrite) {
+    bool enable_file_cache = config::enable_file_cache;
+    auto origin_buffer_size = config::s3_write_buffer_size;
+    config::enable_file_cache = false;
+    config::s3_write_buffer_size = 8 * kMiB;
+    Defer defer {[&]() {
+        config::enable_file_cache = enable_file_cache;
+        config::s3_write_buffer_size = origin_buffer_size;
+    }};
+    BufferInitialSizeGuard guard(256 * kKiB);
+    GrowJumpThresholdGuard jump_guard(2 * kMiB);
+    auto [client, writer] = create_s3_client("grow_jump_change_mid_write.dat");
+    // Stops 3 MiB into the second part, past its 2 MiB jump.
+    std::string head = patterned_bytes(0, 11 * kMiB);
+    ASSERT_EQ(writer->append(head), Status::OK());
+    config::s3_write_buffer_grow_jump_threshold = 0;
+    std::string middle = patterned_bytes(head.size(), 9 * kMiB);
+    ASSERT_EQ(writer->append(middle), Status::OK());
+    config::s3_write_buffer_grow_jump_threshold = 6 * kMiB;
+    std::string tail = patterned_bytes(head.size() + middle.size(), 7 * kMiB + 3);
+    ASSERT_EQ(writer->append(tail), Status::OK());
+    ASSERT_EQ(writer->close(), Status::OK());
+    // 27 MiB + 3 bytes in 8 MiB parts.
+    EXPECT_EQ(client->upload_part_count, 4);
+    ASSERT_EQ(client->parts.size(), 4);
+    size_t index = 0;
+    for (const auto& [key, part] : client->parts) {
+        EXPECT_EQ(part.size(), index + 1 < client->parts.size() ? 8 * kMiB : 3 * kMiB + 3) << key;
+        ++index;
+    }
+    EXPECT_TRUE(client->objects[get_s3_path("grow_jump_change_mid_write.dat")] ==
+                head + middle + tail);
 }
 
 // The write-through file cache copy reads the grown memory: every cached block holds the
@@ -2787,15 +2969,20 @@ TEST_F(S3FileWriterTest, FileCacheCopyMatchesAfterGrowth) {
 TEST_F(S3FileWriterChecksumTest, checksums_with_growing_buffers) {
     UploadChecksumConfigGuard checksum_guard;
     BufferInitialSizeGuard guard(100000);
-    for (std::string mode : {"md5", "crc32c"}) {
-        set_upload_checksum(mode);
-        mock_client = std::make_shared<MockS3Client>();
-        write_multipart_file("upload_checksum_growing_" + mode, [] {});
-        ASSERT_GE(mock_client->part_had_md5.size(), 2) << mode;
-        for (const auto& [part, had_md5] : mock_client->part_had_md5) {
-            EXPECT_EQ(had_md5, mode == "md5") << mode << " part " << part;
-            EXPECT_EQ(mock_client->part_checksums[part].empty(), mode == "md5")
-                    << mode << " part " << part;
+    for (int64_t jump_threshold : {int64_t(0), int64_t(1000003)}) {
+        GrowJumpThresholdGuard jump_guard(jump_threshold);
+        for (std::string mode : {"md5", "crc32c"}) {
+            SCOPED_TRACE(fmt::format("{} jump at {}", mode, jump_threshold));
+            set_upload_checksum(mode);
+            mock_client = std::make_shared<MockS3Client>();
+            write_multipart_file(fmt::format("upload_checksum_growing_{}_{}", mode, jump_threshold),
+                                 [] {});
+            ASSERT_GE(mock_client->part_had_md5.size(), 2);
+            for (const auto& [part, had_md5] : mock_client->part_had_md5) {
+                EXPECT_EQ(had_md5, mode == "md5") << "part " << part;
+                EXPECT_EQ(mock_client->part_checksums[part].empty(), mode == "md5")
+                        << "part " << part;
+            }
         }
     }
 }

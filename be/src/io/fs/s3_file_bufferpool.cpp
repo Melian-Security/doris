@@ -192,6 +192,20 @@ static size_t initial_allocation(BufferType type, size_t capacity) {
     return static_cast<size_t>(initial);
 }
 
+// Doubling a buffer to a whole part copies about one part per part: with a 64 MiB part, every
+// full part re-copies ~64 MiB on its way up. So an upload buffer doubles only up to
+// config::s3_write_buffer_grow_jump_threshold and the next grow allocates its whole capacity.
+// A full part then copies less than twice the threshold in total (the doubling steps below it
+// plus one copy of at most the threshold at the jump), while a file that fits under the
+// threshold still holds only about its own size.
+static size_t grow_jump_threshold(size_t capacity) {
+    int64_t threshold = config::s3_write_buffer_grow_jump_threshold;
+    if (threshold <= 0 || static_cast<size_t>(threshold) >= capacity) {
+        return capacity;
+    }
+    return static_cast<size_t>(threshold);
+}
+
 Slice FileBuffer::get_slice() const {
     return _inner_data->data();
 }
@@ -203,7 +217,8 @@ FileBuffer::FileBuffer(BufferType type, std::function<FileBlocksHolderPtr()> all
           _offset(offset),
           _size(0),
           _state(std::move(state)),
-          _capacity(capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size)) {
+          _capacity(capacity != 0 ? capacity : static_cast<size_t>(config::s3_write_buffer_size)),
+          _grow_jump_threshold(grow_jump_threshold(_capacity)) {
     _inner_data = std::make_unique<FileBuffer::PartData>(initial_allocation(type, _capacity));
 }
 
@@ -219,7 +234,9 @@ Status FileBuffer::_reserve(size_t required) {
         return Status::OK();
     }
     DCHECK_LE(required, _capacity);
-    size_t new_size = std::min(std::max(required, allocated * 2), _capacity);
+    size_t new_size = required > _grow_jump_threshold
+                              ? _capacity
+                              : std::min(std::max(required, allocated * 2), _grow_jump_threshold);
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->s3_file_buffer_tracker());
     RETURN_IF_CATCH_EXCEPTION(_inner_data->grow(new_size, _size));
     return Status::OK();

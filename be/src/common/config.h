@@ -1483,6 +1483,10 @@ DECLARE_mInt64(s3_write_buffer_size);
 // s3_write_buffer_size as data is appended, so a small file never reserves a full part.
 // A value <= 0 or >= s3_write_buffer_size allocates the whole part up front.
 DECLARE_mInt64(s3_write_buffer_initial_size);
+// An upload part buffer doubles only up to this size; growing past it allocates the whole
+// part at once, so filling a part copies at most about this many bytes instead of about the
+// part size. A value <= 0 or >= s3_write_buffer_size doubles all the way to the part size.
+DECLARE_mInt64(s3_write_buffer_grow_jump_threshold);
 // Log interval when doing s3 upload task
 DECLARE_mInt32(s3_file_writer_log_interval_second);
 // the max number of cached file handle for block segemnt
