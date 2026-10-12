@@ -31,12 +31,14 @@
 #include <utility>
 #include <vector>
 
+#include "common/config.h"
 #include "common/exception.h"
 #include "core/value/large_int_value.h"
 #include "core/value/variant/variant_batch_builder.h"
 #include "core/value/variant/variant_parquet_encoding.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
+#include "util/defer_op.h"
 #include "variant_test_utils.h"
 
 namespace doris {
@@ -2075,6 +2077,70 @@ TEST(VariantBatchBuilderTest, BatchLifetimeAllocationsAreMemTrackerVisible) {
 
     thread_context()->thread_mem_tracker_mgr->flush_untracked_mem();
     EXPECT_EQ(tracker->consumption(), baseline);
+}
+
+// finish_batch() releases the batch scratch from noexcept functions after its last output
+// allocation. Raising the mem tracker limit byte by byte past what finish_batch() needs makes
+// each of its allocations, in turn, the first one to exceed the limit. Every such failure must
+// reach the caller as an exception (or be absorbed by the release path), never std::terminate.
+TEST(VariantBatchBuilderTest, FinishBatchUnderMemoryLimitNeverTerminates) {
+    constexpr size_t ROWS = 16;
+    constexpr int64_t LIMIT_STEP = 8;
+    const std::string payload(64, 'p');
+    auto fill = [&payload](VariantBatchBuilder& builder) {
+        for (size_t index = 0; index < ROWS; ++index) {
+            auto row = builder.begin_row();
+            auto object = row.start_object();
+            object.add_key(string_ref("key_" + std::to_string(index)));
+            row.add_string(StringRef(payload));
+            object.add_key(string_ref("shared"));
+            row.add_int(static_cast<int64_t>(index));
+            object.finish();
+            row.finish();
+        }
+    };
+
+    VariantBatchBuilder unlimited;
+    fill(unlimited);
+    const VariantBatchBuilder expected = unlimited.finish_batch();
+
+    const int32_t old_consume_min_size = config::mem_tracker_consume_min_size_bytes;
+    config::mem_tracker_consume_min_size_bytes = 1;
+    ++enable_thread_catch_bad_alloc;
+    Defer restore {[&]() {
+        --enable_thread_catch_bad_alloc;
+        config::mem_tracker_consume_min_size_bytes = old_consume_min_size;
+    }};
+    const auto tracker = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::OTHER,
+                                                          "VariantBatchBuilderFinishUnderLimit");
+    auto scoped_tracker = SwitchThreadMemTrackerLimiter(tracker);
+
+    size_t failures = 0;
+    bool finished = false;
+    for (int64_t headroom = 1; !finished && headroom < 1024 * 1024; headroom += LIMIT_STEP) {
+        VariantBatchBuilder builder;
+        fill(builder);
+        thread_context()->thread_mem_tracker_mgr->flush_untracked_mem();
+        tracker->set_limit(tracker->consumption() + headroom);
+        try {
+            VariantBatchBuilder block = builder.finish_batch();
+            tracker->set_limit(-1);
+            finished = true;
+            ASSERT_EQ(block.num_rows(), expected.num_rows());
+            EXPECT_EQ(std::string_view(block.metadata_ref().data, block.metadata_ref().size),
+                      std::string_view(expected.metadata_ref().data,
+                                       expected.metadata_ref().size));
+            EXPECT_EQ(std::string_view(block.value_bytes().data, block.value_bytes().size),
+                      std::string_view(expected.value_bytes().data,
+                                       expected.value_bytes().size));
+        } catch (const Exception& exception) {
+            tracker->set_limit(-1);
+            EXPECT_EQ(exception.code(), ErrorCode::MEM_ALLOC_FAILED) << exception.what();
+            ++failures;
+        }
+    }
+    EXPECT_TRUE(finished);
+    EXPECT_GT(failures, 0);
 }
 #endif
 
