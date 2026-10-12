@@ -35,6 +35,7 @@
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
+#include "load/channel/eos_completion.h"
 #include "load/channel/load_channel.h"
 #include "runtime/exec_env.h"
 #include "util/thread.h"
@@ -152,7 +153,9 @@ Status LoadChannelMgr::_get_load_channel(std::shared_ptr<LoadChannel>& channel, 
 }
 
 Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
-                                 PTabletWriterAddBlockResult* response, const Block* local_block) {
+                                 PTabletWriterAddBlockResult* response,
+                                 std::shared_ptr<EosCompletion>* eos_completion,
+                                 const Block* local_block) {
     UniqueId load_id(request.id());
     // 1. get load channel
     std::shared_ptr<LoadChannel> channel;
@@ -178,7 +181,7 @@ Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
     // 3. add batch to load channel
     // batch may not exist in request(eg: eos request without batch),
     // this case will be handled in load channel's add batch method.
-    Status st = channel->add_batch(request, response, local_block);
+    Status st = channel->add_batch(request, response, eos_completion, local_block);
     if (UNLIKELY(!st.ok())) {
         RETURN_IF_ERROR(channel->cancel());
         return st;
@@ -198,7 +201,10 @@ void LoadChannelMgr::add_batch_local(const PTabletWriterAddBlockRequest& request
         SCOPED_RAW_TIMER(&execution_time_ns);
         Status st;
         try {
-            st = add_batch(request, response, &block);
+            // The in-process path never carries the eos request, so no barrier comes back.
+            std::shared_ptr<EosCompletion> eos_completion;
+            st = add_batch(request, response, &eos_completion, &block);
+            DCHECK(eos_completion == nullptr);
         } catch (const Exception& e) {
             st = e.to_status();
         } catch (const std::exception& e) {

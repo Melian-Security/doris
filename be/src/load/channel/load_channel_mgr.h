@@ -43,6 +43,7 @@ namespace doris {
 
 class Block;
 class PTabletWriterCancelRequest;
+class EosCompletion;
 class PTabletWriterOpenRequest;
 class Thread;
 
@@ -57,10 +58,14 @@ public:
     // open a new load channel if not exist
     Status open(const PTabletWriterOpenRequest& request);
 
+    // For hang_wait EOS, return a barrier handle to the service, which transfers
+    // the RPC completion after finishing synchronous response writes.
     // `local_block` carries the rows when a tablet sink on this BE hands them over in-process;
     // the request then has no serialized block.
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response, const Block* local_block = nullptr);
+                     PTabletWriterAddBlockResult* response,
+                     std::shared_ptr<EosCompletion>* eos_completion,
+                     const Block* local_block = nullptr);
 
     // In-process counterpart of PInternalService::tablet_writer_add_block for a sender on this
     // BE: runs add_batch on the calling thread and fills the result exactly as the RPC handler

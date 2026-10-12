@@ -35,6 +35,7 @@
 namespace doris {
 
 class Block;
+class EosCompletion;
 class PTabletWriterOpenRequest;
 class PTabletWriterAddBlockRequest;
 class PTabletWriterAddBlockResult;
@@ -52,10 +53,15 @@ public:
     // open a new load channel if not exist
     Status open(const PTabletWriterOpenRequest& request);
 
-    // this batch must belong to a index in one transaction.
+    // This batch must belong to one index in one transaction. For hang_wait EOS,
+    // return the sender-arrival barrier in eos_completion. Final flush/commit
+    // stays synchronous on the last sender. The caller must register its RPC
+    // completion only after all synchronous request/response access has ended.
     // `local_block` carries the rows when a tablet sink on this BE hands them over in-process.
     Status add_batch(const PTabletWriterAddBlockRequest& request,
-                     PTabletWriterAddBlockResult* response, const Block* local_block = nullptr);
+                     PTabletWriterAddBlockResult* response,
+                     std::shared_ptr<EosCompletion>* eos_completion,
+                     const Block* local_block = nullptr);
 
     // return true if this load channel has been opened and all tablets channels are closed then.
     bool is_finished();
