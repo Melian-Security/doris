@@ -21,6 +21,7 @@
 #include <crc32c/crc32c.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <memory>
 
@@ -48,6 +49,20 @@ bvar::Adder<int64_t> s3_file_buffer_allocated_bytes("s3_file_buffer_allocated_by
 bvar::Adder<uint64_t> s3_file_buffer_grow_count("s3_file_buffer_grow_count");
 // Bytes copied because a grow could not extend the allocation in place.
 bvar::Adder<uint64_t> s3_file_buffer_grow_copied_bytes("s3_file_buffer_grow_copied_bytes");
+// Read on every load write by the S3 upload-buffer gate, so kept in one atomic rather than a
+// bvar::Adder, whose read combines every thread's agent.
+static std::atomic<int64_t> g_load_upload_buffer_bytes {0};
+
+int64_t load_upload_buffer_bytes() {
+    return g_load_upload_buffer_bytes.load(std::memory_order_relaxed);
+}
+
+static int64_t get_load_upload_buffer_bytes(void*) {
+    return load_upload_buffer_bytes();
+}
+bvar::PassiveStatus<int64_t> s3_load_upload_buffer_bytes("s3_load_upload_buffer_bytes",
+                                                         get_load_upload_buffer_bytes, nullptr);
+
 bvar::Adder<int64_t> s3_file_cache_write_queued("s3_file_cache_write_queued");
 bvar::Adder<uint64_t> s3_file_cache_write_off_upload_thread(
         "s3_file_cache_write_off_upload_thread");
@@ -171,12 +186,35 @@ struct Memory : boost::noncopyable, Allocator {
 
 struct FileBuffer::PartData {
     Memory<> _memory;
+    // Set once, before the buffer is shared; then follows every change of _memory._size.
+    std::atomic<int64_t>* _counter = nullptr;
     explicit PartData(size_t size) : _memory(size) {}
-    ~PartData() = default;
+    ~PartData() { _count(-static_cast<int64_t>(_memory._size)); }
     [[nodiscard]] Slice data() const { return Slice {_memory._data, _memory._size}; }
     [[nodiscard]] size_t size() const { return _memory._size; }
-    void grow(size_t new_size, size_t used) { _memory.grow(new_size, used); }
+    void grow(size_t new_size, size_t used) {
+        size_t old_size = _memory._size;
+        _memory.grow(new_size, used);
+        _count(static_cast<int64_t>(new_size - old_size));
+    }
+    void count_in(std::atomic<int64_t>* counter) {
+        DCHECK(_counter == nullptr);
+        _counter = counter;
+        _count(static_cast<int64_t>(_memory._size));
+    }
+
+private:
+    void _count(int64_t delta) {
+        if (_counter != nullptr) {
+            _counter->fetch_add(delta, std::memory_order_relaxed);
+        }
+    }
 };
+
+void FileBuffer::count_as_load_upload() {
+    DCHECK(_type == BufferType::UPLOAD);
+    _inner_data->count_in(&g_load_upload_buffer_bytes);
+}
 
 // An upload buffer starts at config::s3_write_buffer_initial_size and grows on append, so a
 // small file holds about its own size rather than a whole part. A download buffer is filled
@@ -449,6 +487,9 @@ Status FileBufferBuilder::build(std::shared_ptr<FileBuffer>* buf) {
                                           std::move(_upload_cb), std::move(state), _offset,
                                           std::move(_alloc_holder_cb), _buffer_size));
         upload_buf->set_upload_thread_pool(_upload_thread_pool);
+        if (_count_as_load_upload) {
+            upload_buf->count_as_load_upload();
+        }
         *buf = std::move(upload_buf);
         return Status::OK();
     }

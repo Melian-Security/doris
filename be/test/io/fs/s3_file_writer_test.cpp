@@ -69,6 +69,8 @@
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_obj_storage_client.h"
 #include "io/io_common.h"
+#include "load/memtable/load_memory_backpressure.h"
+#include "load/memtable/memtable_memory_limiter.h"
 #include "runtime/exec_env.h"
 #include "storage/index/index_file_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
@@ -2988,6 +2990,401 @@ TEST_F(S3FileWriterChecksumTest, checksums_with_growing_buffers) {
             }
         }
     }
+}
+
+// Load S3 upload-buffer back-pressure: load writers count their upload buffers, and the gate in
+// front of load writes holds new writes above a threshold without ever blocking an allocation.
+class S3FileWriterLoadBackpressureTest : public S3FileWriterPoolTest {
+protected:
+    void SetUp() override {
+        S3FileWriterPoolTest::SetUp();
+        _saved_threshold = config::load_s3_upload_buffer_backpressure_bytes;
+        _saved_resume = config::load_s3_upload_buffer_backpressure_resume_percent;
+        _saved_max_wait = config::load_s3_upload_buffer_backpressure_max_wait_ms;
+        _saved_buffer_size = config::s3_write_buffer_size;
+        _bytes_before = io::load_upload_buffer_bytes();
+    }
+    void TearDown() override {
+        EXPECT_EQ(io::load_upload_buffer_bytes(), _bytes_before);
+        config::load_s3_upload_buffer_backpressure_bytes = _saved_threshold;
+        config::load_s3_upload_buffer_backpressure_resume_percent = _saved_resume;
+        config::load_s3_upload_buffer_backpressure_max_wait_ms = _saved_max_wait;
+        config::s3_write_buffer_size = _saved_buffer_size;
+        S3FileWriterPoolTest::TearDown();
+    }
+
+    static std::shared_ptr<FileBuffer> build_buffer(size_t capacity, bool load) {
+        std::shared_ptr<FileBuffer> buf;
+        auto st = FileBufferBuilder()
+                          .set_type(BufferType::UPLOAD)
+                          .set_upload_callback([](UploadFileBuffer&) {})
+                          .set_sync_after_complete_task([](Status) { return false; })
+                          .set_is_cancelled([] { return false; })
+                          .set_file_offset(0)
+                          .set_buffer_size(capacity)
+                          .set_count_as_load_upload(load)
+                          .build(&buf);
+        EXPECT_TRUE(st.ok()) << st;
+        return buf;
+    }
+
+    static std::unique_ptr<S3FileWriter> make_load_writer(
+            const std::string& path, const std::shared_ptr<io::ObjStorageClient>& client) {
+        io::FileWriterOptions opts;
+        opts.load_upload_buffer = true;
+        io::FileWriterPtr file_writer;
+        auto st = s3_fs->create_file(path, &file_writer, &opts);
+        EXPECT_TRUE(st.ok()) << st;
+        std::unique_ptr<S3FileWriter> writer(static_cast<S3FileWriter*>(file_writer.release()));
+        auto holder = std::make_shared<ObjClientHolder>(S3ClientConf {});
+        holder->_client = client;
+        writer->_obj_client = holder;
+        return writer;
+    }
+
+    // Runs `gate.wait` on its own thread; `done` turns true when it returns.
+    static std::thread start_waiter(S3UploadBufferBackpressure& gate, std::atomic<bool>& done,
+                                    std::function<bool()> cancel_check = nullptr) {
+        return std::thread([&gate, &done, cancel_check = std::move(cancel_check)] {
+            gate.wait(cancel_check);
+            done = true;
+        });
+    }
+
+    static bool eventually(const std::function<bool()>& pred, int timeout_ms = 5000) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pred()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return pred();
+    }
+
+    int64_t _saved_threshold = 0;
+    int32_t _saved_resume = 80;
+    int64_t _saved_max_wait = 60000;
+    int64_t _saved_buffer_size = 0;
+    int64_t _bytes_before = 0;
+};
+
+TEST_F(S3FileWriterLoadBackpressureTest, engaged_decision_has_hysteresis) {
+    using LMB = LoadMemoryBackpressure;
+    // Disabled.
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(false, 1000, 0, 80));
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(true, 1000, -1, 80));
+    // Engages at the threshold.
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(false, 99, 100, 80));
+    EXPECT_TRUE(LMB::s3_upload_buffer_engaged(false, 100, 100, 80));
+    // Once engaged, holds until the bytes fall to the resume level.
+    EXPECT_TRUE(LMB::s3_upload_buffer_engaged(true, 99, 100, 80));
+    EXPECT_TRUE(LMB::s3_upload_buffer_engaged(true, 81, 100, 80));
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(true, 80, 100, 80));
+    // Below the threshold, a released gate stays released.
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(false, 90, 100, 80));
+    // Resume >= 100 has no hysteresis; resume <= 0 waits for every byte to drain.
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(true, 99, 100, 100));
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(true, 99, 100, 150));
+    EXPECT_TRUE(LMB::s3_upload_buffer_engaged(true, 1, 100, 0));
+    EXPECT_FALSE(LMB::s3_upload_buffer_engaged(true, 0, 100, 0));
+}
+
+TEST_F(S3FileWriterLoadBackpressureTest, counts_only_load_upload_buffers) {
+    BufferInitialSizeGuard guard(16 * kKiB);
+    {
+        auto load_buf = build_buffer(256 * kKiB, true);
+        EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 16 * kKiB);
+        auto other_buf = build_buffer(256 * kKiB, false);
+        EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 16 * kKiB);
+
+        // Growth is counted as it happens.
+        std::string chunk(100 * kKiB, 'g');
+        ASSERT_TRUE(load_buf->append_data(Slice(chunk)).ok());
+        EXPECT_EQ(load_buf->get_allocated_size(), 100 * kKiB);
+        EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 100 * kKiB);
+        ASSERT_TRUE(load_buf->append_data(Slice(chunk)).ok());
+        EXPECT_EQ(load_buf->get_allocated_size(), 200 * kKiB);
+        EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 200 * kKiB);
+        ASSERT_TRUE(other_buf->append_data(Slice(chunk)).ok());
+        EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 200 * kKiB);
+    }
+    EXPECT_EQ(io::load_upload_buffer_bytes(), _bytes_before);
+
+    // Writers count their buffers only when opened as load output.
+    config::s3_write_buffer_size = 64 * kKiB;
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    std::string data(48 * kKiB, 'w');
+    auto load_writer = make_load_writer("bp_count_load.dat", client);
+    ASSERT_TRUE(load_writer->append(data).ok());
+    EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 48 * kKiB);
+    auto other_writer = make_writer("bp_count_other.dat", false, client);
+    ASSERT_TRUE(other_writer->append(data).ok());
+    EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 48 * kKiB);
+    ASSERT_TRUE(load_writer->close().ok());
+    ASSERT_TRUE(other_writer->close().ok());
+    EXPECT_TRUE(eventually([&] { return io::load_upload_buffer_bytes() == _bytes_before; }));
+
+    // Rowset writers mark load output, not compaction or schema change output.
+    auto options_for = [](DataWriteType type) {
+        RowsetWriterContext ctx;
+        ctx.write_type = type;
+        return ctx.get_file_writer_options();
+    };
+    EXPECT_TRUE(options_for(DataWriteType::TYPE_DIRECT).load_upload_buffer);
+    EXPECT_TRUE(options_for(DataWriteType::TYPE_DEFAULT).load_upload_buffer);
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_COMPACTION).load_upload_buffer);
+    EXPECT_FALSE(options_for(DataWriteType::TYPE_SCHEMA_CHANGE).load_upload_buffer);
+}
+
+TEST_F(S3FileWriterLoadBackpressureTest, gate_engages_above_threshold_and_releases_below_resume) {
+    BufferInitialSizeGuard guard(0); // whole parts up front, so the bytes are exact
+    config::load_s3_upload_buffer_backpressure_bytes = 4 * 64 * kKiB;
+    config::load_s3_upload_buffer_backpressure_resume_percent = 50;
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+    S3UploadBufferBackpressure gate;
+
+    std::vector<std::shared_ptr<FileBuffer>> held;
+    for (int i = 0; i < 3; ++i) {
+        held.push_back(build_buffer(64 * kKiB, true));
+    }
+    // Below the threshold: no wait.
+    std::atomic<bool> done {false};
+    auto t0 = start_waiter(gate, done);
+    t0.join();
+    EXPECT_FALSE(gate.engaged());
+
+    // At the threshold: the next write waits.
+    held.push_back(build_buffer(64 * kKiB, true));
+    done = false;
+    auto t1 = start_waiter(gate, done);
+    ASSERT_TRUE(eventually([&] { return gate.waiters() == 1; }));
+    EXPECT_TRUE(gate.engaged());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(done.load());
+
+    // Below the threshold but above the resume level (2 parts): still waiting.
+    held.pop_back();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(done.load());
+    EXPECT_TRUE(gate.engaged());
+
+    // At the resume level: released.
+    held.pop_back();
+    t1.join();
+    EXPECT_TRUE(done.load());
+    EXPECT_FALSE(gate.engaged());
+    EXPECT_EQ(gate.waiters(), 0);
+}
+
+// The full part a writer holds while it waits for an upload slot is still allocated, so it
+// counts against the threshold like any other load buffer.
+TEST_F(S3FileWriterLoadBackpressureTest, gate_counts_a_part_held_by_a_writer_waiting_for_a_slot) {
+    BufferInitialSizeGuard guard(0);
+    config::s3_write_buffer_size = 64 * kKiB;
+    config::load_s3_upload_max_inflight_parts = 1;
+    config::load_s3_upload_buffer_backpressure_bytes = 3 * 64 * kKiB;
+    config::load_s3_upload_buffer_backpressure_resume_percent = 50;
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+    S3UploadBufferBackpressure gate;
+
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    client->gate_marker = "bp_slot_blocker";
+    std::string part(64 * kKiB, 's');
+    // Holds the only upload slot until released.
+    auto blocker = make_load_writer("bp_slot_blocker.dat", client);
+    ASSERT_TRUE(blocker->append(part).ok());
+    ASSERT_TRUE(blocker->append(Slice("x", 1)).ok()); // submits the first part
+    ASSERT_TRUE(eventually([&] { return client->blocked_uploads.load() == 1; }));
+    // Uploading part + the blocker's next part: below the threshold.
+    EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 2 * 64 * kKiB);
+
+    // This writer fills a part and then waits for the slot, holding the full part.
+    auto waiting = std::async(std::launch::async, [&] {
+        auto writer = make_load_writer("bp_slot_waiter.dat", client);
+        bool good = writer->append(part).ok();
+        good &= writer->append(Slice("y", 1)).ok();
+        good &= writer->close().ok();
+        return good;
+    });
+    ASSERT_TRUE(
+            eventually([&] { return io::UploadBufferInflightLimiter::load()->waiters() == 1; }));
+    EXPECT_EQ(io::load_upload_buffer_bytes() - _bytes_before, 3 * 64 * kKiB);
+
+    std::atomic<bool> done {false};
+    auto t = start_waiter(gate, done);
+    ASSERT_TRUE(eventually([&] { return gate.waiters() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(done.load());
+
+    client->release();
+    EXPECT_TRUE(waiting.get());
+    ASSERT_TRUE(blocker->close().ok());
+    t.join();
+    EXPECT_TRUE(done.load());
+    EXPECT_TRUE(eventually([&] { return io::load_upload_buffer_bytes() == _bytes_before; }));
+}
+
+TEST_F(S3FileWriterLoadBackpressureTest, gate_is_noop_when_disabled) {
+    std::atomic<int64_t> bytes {int64_t(1) << 40};
+    S3UploadBufferBackpressure gate([&] { return bytes.load(); });
+    config::load_s3_upload_buffer_backpressure_bytes = 0;
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) {
+        gate.wait(nullptr);
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
+    EXPECT_FALSE(gate.engaged());
+    EXPECT_EQ(gate.waiters(), 0);
+
+    // Disabling it at runtime releases a waiting writer.
+    config::load_s3_upload_buffer_backpressure_bytes = 1;
+    std::atomic<bool> done {false};
+    auto t = start_waiter(gate, done);
+    ASSERT_TRUE(eventually([&] { return gate.waiters() == 1; }));
+    config::load_s3_upload_buffer_backpressure_bytes = 0;
+    t.join();
+    EXPECT_TRUE(done.load());
+    EXPECT_FALSE(gate.engaged());
+}
+
+TEST_F(S3FileWriterLoadBackpressureTest, gate_wait_is_bounded_and_cancellable) {
+    std::atomic<int64_t> bytes {100};
+    S3UploadBufferBackpressure gate([&] { return bytes.load(); });
+    config::load_s3_upload_buffer_backpressure_bytes = 10;
+
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 200;
+    auto start = std::chrono::steady_clock::now();
+    gate.wait(nullptr);
+    auto waited = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(waited, std::chrono::milliseconds(200));
+    EXPECT_LT(waited, std::chrono::seconds(5));
+
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+    std::atomic<bool> cancelled {false};
+    std::atomic<bool> done {false};
+    auto t = start_waiter(gate, done, [&] { return cancelled.load(); });
+    ASSERT_TRUE(eventually([&] { return gate.waiters() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(done.load());
+    cancelled = true;
+    t.join();
+    EXPECT_TRUE(done.load());
+    // A cancelled writer does not release the gate for the others.
+    EXPECT_TRUE(gate.engaged());
+}
+
+// Many flush tasks each hold two load buffers at once (a segment and its index file), fed by
+// writers that pass the gate. With a threshold below what the flushes alone hold, an upload
+// slot cap, and no bound on the gate's wait, every flush and every writer must still finish:
+// the flushes never wait in the gate, so the bytes it waits on always drain.
+TEST_F(S3FileWriterLoadBackpressureTest, many_flushes_holding_two_buffers_do_not_deadlock) {
+    BufferInitialSizeGuard guard(16 * kKiB);
+    config::s3_write_buffer_size = 64 * kKiB;
+    config::load_s3_upload_max_inflight_parts = 4;
+    config::load_s3_upload_buffer_backpressure_bytes = 64 * kKiB;
+    config::load_s3_upload_buffer_backpressure_resume_percent = 50;
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+    S3UploadBufferBackpressure gate;
+
+    auto client = std::make_shared<PoolRecordingMockClient>();
+    client->upload_latency = std::chrono::milliseconds(2);
+    auto flush_pool = build_pool("TestLoadFlush", 16);
+
+    constexpr int kWriters = 24;
+    constexpr int kWritesPerWriter = 4;
+    std::atomic<int> flushes_ok {0};
+    std::atomic<int> flushes_failed {0};
+    std::atomic<int64_t> peak_waiters {0};
+
+    auto flush = [&](int id) {
+        auto segment = make_load_writer(fmt::format("bp_stress_seg_{}.dat", id), client);
+        auto index = make_load_writer(fmt::format("bp_stress_idx_{}.idx", id), client);
+        std::string chunk(12 * kKiB, static_cast<char>('a' + id % 26));
+        bool good = true;
+        // Interleaved, so both files hold a partly filled buffer at the same time.
+        for (int i = 0; i < 14 && good; ++i) {
+            good &= segment->append(chunk).ok();
+            if (i % 2 == 0) {
+                good &= index->append(chunk).ok();
+            }
+        }
+        good &= segment->close(true).ok();
+        good &= index->close().ok();
+        good &= segment->close().ok();
+        (good ? flushes_ok : flushes_failed) += 1;
+    };
+    auto record_peak = [](std::atomic<int64_t>& peak, int64_t now) {
+        auto p = peak.load();
+        while (now > p && !peak.compare_exchange_weak(p, now)) {
+        }
+    };
+
+    auto run = std::async(std::launch::async, [&] {
+        std::vector<std::thread> writers;
+        for (int w = 0; w < kWriters; ++w) {
+            writers.emplace_back([&, w] {
+                for (int i = 0; i < kWritesPerWriter; ++i) {
+                    gate.wait(nullptr);
+                    record_peak(peak_waiters, gate.waiters());
+                    EXPECT_TRUE(flush_pool
+                                        ->submit_func([&, id = w * kWritesPerWriter + i] {
+                                            flush(id);
+                                        })
+                                        .ok());
+                }
+            });
+        }
+        for (auto& t : writers) {
+            t.join();
+        }
+        flush_pool->wait();
+    });
+    ASSERT_EQ(run.wait_for(std::chrono::seconds(120)), std::future_status::ready)
+            << "load writers or flushes deadlocked; upload buffer bytes="
+            << io::load_upload_buffer_bytes() << ", gate waiters=" << gate.waiters()
+            << ", slot waiters=" << io::UploadBufferInflightLimiter::load()->waiters();
+    run.get();
+
+    EXPECT_EQ(flushes_ok.load(), kWriters * kWritesPerWriter);
+    EXPECT_EQ(flushes_failed.load(), 0);
+    EXPECT_EQ(gate.waiters(), 0);
+    EXPECT_GT(peak_waiters.load(), 0);
+    EXPECT_TRUE(eventually([&] { return io::load_upload_buffer_bytes() == _bytes_before; }));
+    EXPECT_EQ(io::UploadBufferInflightLimiter::load()->inflight(), 0);
+    // Released once the bytes drained.
+    gate.wait(nullptr);
+    EXPECT_FALSE(gate.engaged());
+}
+
+TEST_F(S3FileWriterLoadBackpressureTest, memtable_limiter_write_gate_waits_on_upload_buffers) {
+    MemTableMemoryLimiter limiter;
+    ASSERT_TRUE(limiter.init(int64_t(1) << 40).ok());
+    BufferInitialSizeGuard guard(0);
+    config::load_s3_upload_buffer_backpressure_bytes = 2 * 64 * kKiB;
+    config::load_s3_upload_buffer_backpressure_resume_percent = 50;
+    config::load_s3_upload_buffer_backpressure_max_wait_ms = 0;
+
+    auto start = std::chrono::steady_clock::now();
+    limiter.handle_memtable_flush(nullptr);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+
+    std::vector<std::shared_ptr<FileBuffer>> held;
+    held.push_back(build_buffer(64 * kKiB, true));
+    held.push_back(build_buffer(64 * kKiB, true));
+    std::atomic<bool> done {false};
+    std::thread t([&] {
+        limiter.handle_memtable_flush(nullptr);
+        done = true;
+    });
+    ASSERT_TRUE(
+            eventually([&] { return limiter.s3_upload_buffer_backpressure()->waiters() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(done.load());
+    held.clear();
+    t.join();
+    EXPECT_TRUE(done.load());
 }
 
 } // namespace doris

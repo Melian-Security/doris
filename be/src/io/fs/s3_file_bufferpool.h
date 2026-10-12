@@ -37,6 +37,11 @@ namespace doris {
 namespace io {
 enum class BufferType : uint32_t { DOWNLOAD, UPLOAD };
 
+// Bytes currently allocated by upload buffers of load writers (FileWriterOptions::
+// load_upload_buffer): buffers being filled, buffers whose writer waits for an upload slot,
+// buffers being uploaded and buffers waiting for their file cache copy.
+int64_t load_upload_buffer_bytes();
+
 // Bounds how many upload buffers of one class (compaction or load) are submitted but not yet
 // released. A permit is held by the buffer and released when the buffer is destroyed, i.e.
 // once its memory is freed. Acquire only when the caller holds no other unsubmitted permit
@@ -194,6 +199,10 @@ struct FileBuffer {
     void set_inflight_permit(UploadBufferInflightLimiter::Permit permit) {
         _inflight_permit = std::move(permit);
     }
+
+    // Counts this buffer's allocation, now and as it grows, in load_upload_buffer_bytes()
+    // until it is destroyed. Call before the buffer is shared.
+    void count_as_load_upload();
 
     // Declared first so it is destroyed last, after ~FileBuffer frees _inner_data.
     UploadBufferInflightLimiter::Permit _inflight_permit;
@@ -376,6 +385,11 @@ struct FileBufferBuilder {
         _buffer_size = size;
         return *this;
     }
+    // Count the buffer in load_upload_buffer_bytes(); upload buffers only.
+    FileBufferBuilder& set_count_as_load_upload(bool count) {
+        _count_as_load_upload = count;
+        return *this;
+    }
     /**
     * set the callback which write the content into local file cache
     *
@@ -407,6 +421,7 @@ struct FileBufferBuilder {
     size_t _offset;
     ThreadPool* _upload_thread_pool = nullptr;
     size_t _buffer_size = 0;
+    bool _count_as_load_upload = false;
 };
 } // namespace io
 } // namespace doris

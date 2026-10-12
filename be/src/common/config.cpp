@@ -1770,6 +1770,12 @@ DEFINE_Int64(compaction_s3_upload_thread_num, "64");
 DEFINE_Int64(compaction_nonblock_close_thread_num, "64");
 DEFINE_mInt64(compaction_s3_upload_max_inflight_parts, "256");
 DEFINE_mInt64(load_s3_upload_max_inflight_parts, "0");
+// Load S3 upload-buffer back-pressure. New load writes (the memtable memory gate in front of
+// add_block and the sink-side memtable writes) wait while load upload buffers hold at least this
+// many bytes, instead of buffer allocations blocking inside a flush. 0 disables it.
+DEFINE_mInt64(load_s3_upload_buffer_backpressure_bytes, "0");
+DEFINE_mInt32(load_s3_upload_buffer_backpressure_resume_percent, "80");
+DEFINE_mInt64(load_s3_upload_buffer_backpressure_max_wait_ms, "60000");
 DEFINE_mBool(enable_file_cache_write_off_upload_thread, "true");
 DEFINE_Int64(file_cache_writer_thread_num, "32");
 DEFINE_Int64(file_cache_writer_queue_size, "256");
