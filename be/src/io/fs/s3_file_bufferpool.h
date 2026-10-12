@@ -175,7 +175,11 @@ struct FileBuffer {
     * @return the size of the buffered data
     */
     size_t get_size() const { return _size; }
+    // The most this buffer can hold: one part.
     size_t get_capacaticy() const { return _capacity; }
+    // Bytes allocated now; an upload buffer grows from config::s3_write_buffer_initial_size
+    // towards its capacity as data is appended.
+    size_t get_allocated_size() const;
     Slice get_slice() const;
     /**
     * detect whether the execution task is done
@@ -198,9 +202,16 @@ struct FileBuffer {
     size_t _offset;
     size_t _size;
     OperationState _state;
+    size_t _capacity;
+    // Largest allocation reached by doubling; growth past it allocates _capacity directly.
+    size_t _grow_jump_threshold;
     struct PartData;
     std::unique_ptr<PartData> _inner_data;
-    size_t _capacity;
+
+protected:
+    // Grows the allocation to hold `required` bytes: doubling up to _grow_jump_threshold, then
+    // straight to _capacity.
+    Status _reserve(size_t required);
 };
 
 struct DownloadFileBuffer final : public FileBuffer {

@@ -1438,6 +1438,8 @@ DEFINE_mInt32(tablet_path_check_batch_size, "1000");
 
 // it must be larger than or equal to 5MB
 DEFINE_mInt64(s3_write_buffer_size, "5242880");
+DEFINE_mInt64(s3_write_buffer_initial_size, "262144");
+DEFINE_mInt64(s3_write_buffer_grow_jump_threshold, "4194304");
 // Log interval when doing s3 upload task
 DEFINE_mInt32(s3_file_writer_log_interval_second, "60");
 DEFINE_mInt64(file_cache_max_file_reader_cache_size, "1000000");
