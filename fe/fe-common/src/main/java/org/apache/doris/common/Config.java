@@ -2896,6 +2896,15 @@ public class Config extends ConfigBase {
                     + "and are recorded as unknown (NULL) otherwise. Sampled extremes are never used as bounds."})
     public static boolean skip_table_wide_min_max_in_sample_analyze = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "表的自动收集作业失败后，在该时间（毫秒）内不再自动收集这张表。失败不会改变已有统计信息的新鲜度。"
+                    + "失败时间只保存在 Master FE 内存中，FE 重启或切主后会丢失。≤ 0 表示关闭。",
+            "After an automatic analyze job of a table fails, the table is not auto analyzed again until this "
+                    + "many milliseconds have passed since the failure. A failure does not change the freshness "
+                    + "of existing statistics. The failure time is kept in the master FE memory only, so a "
+                    + "restart or master failover forgets it. A value <= 0 disables the backoff."})
+    public static long auto_analyze_failure_backoff_in_millis = 3600000L;
+
     @Deprecated
     @ConfField
     public static final int period_analyze_simultaneously_running_task_num = 1;

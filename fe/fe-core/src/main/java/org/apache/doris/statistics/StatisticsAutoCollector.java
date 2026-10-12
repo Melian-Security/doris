@@ -104,6 +104,14 @@ public class StatisticsAutoCollector extends MasterDaemon {
                 if (!supportAutoAnalyze(table)) {
                     continue;
                 }
+                // Every queued job passes here whatever its priority or the reason its columns were queued
+                // (missing, stale or long-unanalyzed stats), so this one gate keeps a failing table from being
+                // rescanned every round.
+                if (Env.getServingEnv().getAnalysisManager().isInAutoAnalyzeFailureBackoff(table.getId())) {
+                    LOG.info("Skip auto analyzing table {}, its last auto analyze job failed less than {} ms ago.",
+                            table.getName(), Config.auto_analyze_failure_backoff_in_millis);
+                    continue;
+                }
                 processOneJob(table, job.first.getValue(), job.second);
             } catch (Exception e) {
                 LOG.warn("Failed to analyze table {} with columns [{}]", job.first.getKey().getTbl(),
