@@ -2886,6 +2886,16 @@ public class Config extends ConfigBase {
                     + "not guarded for correctness reasons; see the NOTE in BaseAnalysisTask."})
     public static long statistics_max_string_column_length = 1024;
 
+    @ConfField(mutable = true, description = {
+            "sample analyze 是否跳过全表 MIN/MAX 查询。sample analyze 默认对每一列额外执行一次不采样的 "
+                    + "MIN/MAX 查询以获得准确的上下界。开启后不再执行该查询：如果主 SQL 本身就扫描全表，"
+                    + "则 MIN/MAX 从主 SQL 中计算，否则 MIN/MAX 记为未知（NULL）。",
+            "Whether sample analyze skips the table-wide MIN/MAX query. By default, sample analyze runs an extra "
+                    + "unsampled MIN/MAX query per column to get exact bounds. When enabled, that query is not "
+                    + "issued: MIN/MAX are computed by the main statistics SQL when it scans the whole table anyway, "
+                    + "and are recorded as unknown (NULL) otherwise. Sampled extremes are never used as bounds."})
+    public static boolean skip_table_wide_min_max_in_sample_analyze = false;
+
     @Deprecated
     @ConfField
     public static final int period_analyze_simultaneously_running_task_num = 1;
