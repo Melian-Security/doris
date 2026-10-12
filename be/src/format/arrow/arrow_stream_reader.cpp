@@ -101,6 +101,13 @@ Status ArrowStreamReader::_convert_batch(const arrow::RecordBatch& batch, int64_
     auto columns_guard = block->mutate_columns_scoped();
     auto& columns = columns_guard.mutable_columns();
     const int num_columns = batch.num_columns();
+    const size_t block_columns = columns.size();
+    if (static_cast<size_t>(num_columns) > block_columns) {
+        return Status::InvalidArgument(
+                "Arrow batch has {} columns but the load expects {}; first unexpected column is {}",
+                num_columns, block_columns,
+                batch.schema()->field(static_cast<int>(block_columns))->name());
+    }
     for (int c = 0; c < num_columns; ++c) {
         const arrow::Array* column = batch.column(c).get();
         const std::string& column_name = batch.schema()->field(c)->name();
@@ -116,6 +123,18 @@ Status ArrowStreamReader::_convert_batch(const arrow::RecordBatch& batch, int64_
         } catch (Exception& e) {
             return Status::InternalError("Failed to convert from arrow to block: {}", e.what());
         }
+    }
+    // Trailing block columns absent from the Arrow schema load as NULL, as a column missing from
+    // a JSON or CSV row does. Leaving them unread would hand the scanner a column shorter than the
+    // rows it converts.
+    const auto rows = static_cast<size_t>(end - start);
+    for (size_t c = static_cast<size_t>(num_columns); c < block_columns; ++c) {
+        if (!columns[c]->is_nullable()) {
+            return Status::InvalidArgument(
+                    "Arrow batch has no column {} (position {}), and the column is not nullable",
+                    columns_guard.get_name_by_position(c), c);
+        }
+        columns[c]->insert_many_defaults(rows);
     }
     return Status::OK();
 }

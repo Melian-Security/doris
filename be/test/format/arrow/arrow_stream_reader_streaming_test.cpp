@@ -199,4 +199,92 @@ TEST_F(ArrowStreamReaderStreamingTest, InlineAndPooledDecompressionReadTheSameRo
     }
 }
 
+
+namespace {
+
+// Reads the whole pipe into blocks built by make, and returns the first error, or OK once every
+// row is read. rows_out receives the total rows read; null_extra counts NULL rows in the block's
+// third column, when there is one.
+Status read_into(const std::shared_ptr<io::StreamLoadPipe>& pipe, Block (*make)(),
+                 size_t* rows_out, size_t* null_extra) {
+    RuntimeState state;
+    TFileScanRangeParams params;
+    TFileRangeDesc range;
+    std::vector<SlotDescriptor*> slots;
+    ArrowStreamReader reader(&state, nullptr, nullptr, params, range, slots, nullptr);
+    RETURN_IF_ERROR(reader.init_reader(pipe));
+    *rows_out = 0;
+    *null_extra = 0;
+    while (true) {
+        Block block = make();
+        size_t read_rows = 0;
+        bool eof = false;
+        RETURN_IF_ERROR(reader.get_next_block(&block, &read_rows, &eof));
+        if (eof) {
+            return Status::OK();
+        }
+        for (size_t c = 0; c < block.columns(); ++c) {
+            EXPECT_EQ(block.get_by_position(c).column->size(), read_rows) << "column " << c;
+        }
+        if (block.columns() > 2) {
+            const auto& extra = assert_cast<const ColumnNullable&>(*block.get_by_position(2).column);
+            for (size_t r = 0; r < read_rows; ++r) {
+                *null_extra += extra.is_null_at(r) ? 1 : 0;
+            }
+        }
+        *rows_out += read_rows;
+    }
+}
+
+Block make_block_with_nullable_extra() {
+    Block block = make_block();
+    auto extra_type = make_nullable(std::make_shared<DataTypeInt64>());
+    block.insert({extra_type->create_column(), extra_type, "extra"});
+    return block;
+}
+
+Block make_block_with_not_null_extra() {
+    Block block = make_block();
+    block.insert({ColumnInt64::create(), std::make_shared<DataTypeInt64>(), "extra"});
+    return block;
+}
+
+Block make_block_id_only() {
+    Block block;
+    block.insert({ColumnInt32::create(), std::make_shared<DataTypeInt32>(), "id"});
+    return block;
+}
+
+} // namespace
+
+TEST_F(ArrowStreamReaderStreamingTest, MissingTrailingNullableColumnLoadsAsNull) {
+    for (bool streaming : {true, false}) {
+        config::enable_arrow_stream_load_streaming_read = streaming;
+        config::arrow_stream_load_block_rows = 1000;
+        size_t rows = 0;
+        size_t nulls = 0;
+        Status st = read_into(make_pipe({2500, 300}), make_block_with_nullable_extra, &rows, &nulls);
+        EXPECT_TRUE(st.ok()) << st.to_string();
+        EXPECT_EQ(rows, 2800);
+        EXPECT_EQ(nulls, 2800);
+    }
+}
+
+TEST_F(ArrowStreamReaderStreamingTest, MissingTrailingNotNullColumnFails) {
+    size_t rows = 0;
+    size_t nulls = 0;
+    Status st = read_into(make_pipe({10}), make_block_with_not_null_extra, &rows, &nulls);
+    EXPECT_FALSE(st.ok());
+    EXPECT_NE(st.to_string().find("has no column extra"), std::string::npos) << st.to_string();
+}
+
+TEST_F(ArrowStreamReaderStreamingTest, ExtraArrowColumnFails) {
+    size_t rows = 0;
+    size_t nulls = 0;
+    Status st = read_into(make_pipe({10}), make_block_id_only, &rows, &nulls);
+    EXPECT_FALSE(st.ok());
+    EXPECT_NE(st.to_string().find("first unexpected column is doc"), std::string::npos)
+            << st.to_string();
+}
+
 } // namespace doris
