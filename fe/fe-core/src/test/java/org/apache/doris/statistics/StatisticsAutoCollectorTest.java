@@ -36,6 +36,7 @@ import org.apache.doris.datasource.jdbc.JdbcExternalCatalog;
 import org.apache.doris.datasource.jdbc.JdbcExternalDatabase;
 import org.apache.doris.datasource.jdbc.JdbcExternalTable;
 import org.apache.doris.statistics.AnalysisInfo.AnalysisMethod;
+import org.apache.doris.statistics.util.StatisticsUtil;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -46,6 +47,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map.Entry;
@@ -200,5 +202,66 @@ public class StatisticsAutoCollectorTest {
         // ready to sample
         Assertions.assertTrue(collector.readyToSample(table, 100, null, null, true));
 
+    }
+
+    @Test
+    public void testCollectSkipsTableInFailureBackoff() {
+        AnalysisManager manager = Mockito.spy(new AnalysisManager());
+        TableName failing = new TableName("internal", "db", "failing");
+        TableName healthy = new TableName("internal", "db", "healthy");
+        // The failing table is queued on every path: query-driven high and mid priority, missing or stale
+        // stats (low) and long-unanalyzed stats (very low).
+        manager.highPriorityJobs.put(failing, Sets.newHashSet(Pair.of("failing", "c1")));
+        manager.midPriorityJobs.put(failing, Sets.newHashSet(Pair.of("failing", "c2")));
+        manager.lowPriorityJobs.put(failing, Sets.newHashSet(Pair.of("failing", "c3")));
+        manager.lowPriorityJobs.put(healthy, Sets.newHashSet(Pair.of("healthy", "c1")));
+        manager.veryLowPriorityJobs.put(failing, Sets.newHashSet(Pair.of("failing", "c4")));
+
+        OlapTable failingTable = Mockito.mock(OlapTable.class);
+        Mockito.when(failingTable.getId()).thenReturn(1L);
+        Mockito.when(failingTable.getName()).thenReturn("failing");
+        OlapTable healthyTable = Mockito.mock(OlapTable.class);
+        Mockito.when(healthyTable.getId()).thenReturn(2L);
+        Mockito.when(healthyTable.getName()).thenReturn("healthy");
+        Mockito.doReturn(true).when(manager).isInAutoAnalyzeFailureBackoff(1L);
+        Mockito.doReturn(false).when(manager).isInAutoAnalyzeFailureBackoff(2L);
+
+        new MockUp<Env>() {
+            @Mock
+            public AnalysisManager getAnalysisManager() {
+                return manager;
+            }
+        };
+        new MockUp<StatisticsUtil>() {
+            @Mock
+            public boolean canCollect() {
+                return true;
+            }
+
+            @Mock
+            public TableIf findTable(String catalogName, String dbName, String tblName) {
+                return "failing".equals(tblName) ? failingTable : healthyTable;
+            }
+        };
+        List<String> processed = new ArrayList<>();
+        StatisticsAutoCollector collector = new StatisticsAutoCollector() {
+            @Override
+            protected boolean supportAutoAnalyze(TableIf tableIf) {
+                return true;
+            }
+
+            @Override
+            protected void processOneJob(TableIf table, Set<Pair<String, String>> columns, JobPriority priority) {
+                processed.add(table.getName());
+            }
+        };
+
+        collector.collect();
+        Assertions.assertEquals(Collections.singletonList("healthy"), processed);
+        Mockito.verify(manager, Mockito.times(4)).isInAutoAnalyzeFailureBackoff(1L);
+        Assertions.assertTrue(manager.highPriorityJobs.isEmpty());
+        Assertions.assertTrue(manager.midPriorityJobs.isEmpty());
+        Assertions.assertTrue(manager.lowPriorityJobs.isEmpty());
+        Assertions.assertTrue(manager.veryLowPriorityJobs.isEmpty());
     }
 }

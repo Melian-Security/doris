@@ -37,6 +37,7 @@ import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugPointUtil;
@@ -63,6 +64,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class OlapAnalysisTaskTest {
 
@@ -969,5 +971,143 @@ public class OlapAnalysisTaskTest {
         Assertions.assertFalse(sql.contains("assert_true"), sql);
         Assertions.assertTrue(sql.contains("FROM (SELECT `id` FROM `internal`.`db1`.`tbl1`"), sql);
         Assertions.assertTrue(sql.endsWith(") __lc_t"), sql);
+    }
+
+    @Test
+    public void testPutMinMaxParamsUsesTableWideQueryByDefault(@Mocked OlapTable tableIf) {
+        boolean saved = Config.skip_table_wide_min_max_in_sample_analyze;
+        Config.skip_table_wide_min_max_in_sample_analyze = false;
+        try {
+            AtomicInteger minMaxQueries = new AtomicInteger();
+            new MockUp<OlapAnalysisTask>() {
+                @Mock
+                public ResultRow collectMinMax() {
+                    minMaxQueries.incrementAndGet();
+                    return new ResultRow(Lists.newArrayList("1", "it's"));
+                }
+            };
+            OlapAnalysisTask task = new OlapAnalysisTask();
+            task.col = new Column("test", PrimitiveType.INT);
+            task.tbl = tableIf;
+            for (AnalyzeSampleAlgorithm algorithm : AnalyzeSampleAlgorithm.values()) {
+                Map<String, String> params = new HashMap<>();
+                task.putMinMaxParams(params, algorithm);
+                Assertions.assertEquals("'1'", params.get("min"));
+                Assertions.assertEquals("'it''s'", params.get("max"));
+            }
+            Assertions.assertEquals(AnalyzeSampleAlgorithm.values().length, minMaxQueries.get());
+        } finally {
+            Config.skip_table_wide_min_max_in_sample_analyze = saved;
+        }
+    }
+
+    @Test
+    public void testPutMinMaxParamsSkipsTableWideQuery(@Mocked OlapTable tableIf) {
+        boolean saved = Config.skip_table_wide_min_max_in_sample_analyze;
+        Config.skip_table_wide_min_max_in_sample_analyze = true;
+        try {
+            boolean[] preAgg = {false};
+            new MockUp<OlapAnalysisTask>() {
+                @Mock
+                public ResultRow collectMinMax() {
+                    Assertions.fail("table-wide MIN/MAX query must not run");
+                    return null;
+                }
+
+                @Mock
+                boolean needPreAggHint() {
+                    return preAgg[0];
+                }
+            };
+            OlapAnalysisTask task = new OlapAnalysisTask();
+            task.col = new Column("test", PrimitiveType.INT);
+            task.tbl = tableIf;
+
+            // Sampled: the bounds are unknown, never the sample's extremes.
+            for (AnalyzeSampleAlgorithm algorithm
+                    : new AnalyzeSampleAlgorithm[] {AnalyzeSampleAlgorithm.LINEAR, AnalyzeSampleAlgorithm.DUJ1}) {
+                Map<String, String> params = new HashMap<>();
+                task.putMinMaxParams(params, algorithm);
+                Assertions.assertEquals("NULL", params.get("min"));
+                Assertions.assertEquals("NULL", params.get("max"));
+            }
+
+            // FULL scans the whole table, so the main SQL computes exact bounds.
+            Map<String, String> params = new HashMap<>();
+            task.putMinMaxParams(params, AnalyzeSampleAlgorithm.FULL);
+            Assertions.assertEquals("MIN(`${colName}`)", params.get("min"));
+            Assertions.assertEquals("MAX(`${colName}`)", params.get("max"));
+
+            // FULL under PREAGGOPEN reads unmerged rows, so the bounds stay unknown.
+            preAgg[0] = true;
+            params = new HashMap<>();
+            task.putMinMaxParams(params, AnalyzeSampleAlgorithm.FULL);
+            Assertions.assertEquals("NULL", params.get("min"));
+            Assertions.assertEquals("NULL", params.get("max"));
+        } finally {
+            Config.skip_table_wide_min_max_in_sample_analyze = saved;
+        }
+    }
+
+    @Test
+    public void testSampleSqlWithoutTableWideMinMax(@Mocked CatalogIf catalogIf, @Mocked DatabaseIf databaseIf,
+            @Mocked OlapTable tableIf) {
+        boolean saved = Config.skip_table_wide_min_max_in_sample_analyze;
+        Config.skip_table_wide_min_max_in_sample_analyze = true;
+        try {
+            AnalyzeSampleAlgorithm[] algorithm = {AnalyzeSampleAlgorithm.LINEAR};
+            List<String> sqls = new ArrayList<>();
+            new MockUp<OlapAnalysisTask>() {
+                @Mock
+                public ResultRow collectMinMax() {
+                    Assertions.fail("table-wide MIN/MAX query must not run");
+                    return null;
+                }
+
+                @Mock
+                boolean needPreAggHint() {
+                    return false;
+                }
+
+                @Mock
+                void getSampleParams(Map<String, String> params, long tableRowCount,
+                        OlapAnalysisTask.SampleCollectInfo info) {}
+
+                @Mock
+                OlapAnalysisTask.SampleCollectInfo getSampleCollectInfo(long tableRowCount) {
+                    return new OlapAnalysisTask.SampleCollectInfo(algorithm[0],
+                            algorithm[0] == AnalyzeSampleAlgorithm.FULL
+                                    ? null : Pair.of(Lists.newArrayList(1L, 2L), 100L));
+                }
+
+                @Mock
+                public void runQuery(String sql) {
+                    sqls.add(sql);
+                }
+            };
+            OlapAnalysisTask task = new OlapAnalysisTask();
+            task.col = new Column("test", PrimitiveType.INT);
+            task.tbl = tableIf;
+            task.info = new AnalysisInfoBuilder().setJobType(JobType.MANUAL).setColName("test").build();
+            task.catalog = catalogIf;
+            task.db = databaseIf;
+            task.tableSample = new TableSample(false, 100L);
+
+            task.doSample();
+            algorithm[0] = AnalyzeSampleAlgorithm.DUJ1;
+            task.doSample();
+            algorithm[0] = AnalyzeSampleAlgorithm.FULL;
+            task.doSample();
+
+            Assertions.assertEquals(3, sqls.size());
+            for (String sql : sqls.subList(0, 2)) {
+                Assertions.assertTrue(sql.contains("SUBSTRING(CAST(NULL AS STRING), 1, 1024) AS `min`, "
+                        + "SUBSTRING(CAST(NULL AS STRING), 1, 1024) AS `max`"), sql);
+            }
+            Assertions.assertTrue(sqls.get(2).contains("SUBSTRING(CAST(MIN(`test`) AS STRING), 1, 1024) AS `min`, "
+                    + "SUBSTRING(CAST(MAX(`test`) AS STRING), 1, 1024) AS `max`"), sqls.get(2));
+        } finally {
+            Config.skip_table_wide_min_max_in_sample_analyze = saved;
+        }
     }
 }

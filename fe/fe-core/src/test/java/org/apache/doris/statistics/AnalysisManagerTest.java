@@ -475,6 +475,133 @@ public class AnalysisManagerTest {
         Assertions.assertTrue(count.get() <= 20);
     }
 
+    private AnalysisManager spyManagerForJobStatus() {
+        AnalysisManager manager = Mockito.spy(new AnalysisManager());
+        Mockito.doNothing().when(manager).logCreateAnalysisTask(Mockito.any());
+        Mockito.doNothing().when(manager).logCreateAnalysisJob(Mockito.any());
+        Mockito.doNothing().when(manager).updateTableStats(Mockito.any());
+        return manager;
+    }
+
+    // Runs one analyze job of the table through updateTaskStatus: one task per given terminal state, all
+    // RUNNING first, then reported in the given order at the given time.
+    private AnalysisInfo runJob(AnalysisManager manager, long jobId, long tblId, JobType jobType, long time,
+            AnalysisState... taskStates) {
+        AnalysisInfo job = new AnalysisInfoBuilder().setJobId(jobId).setTblId(tblId)
+                .setState(AnalysisState.PENDING).setAnalysisType(AnalysisType.FUNDAMENTALS)
+                .setJobType(jobType).build();
+        manager.replayCreateAnalysisJob(job);
+        Map<Long, BaseAnalysisTask> tasks = new HashMap<>();
+        List<AnalysisInfo> taskInfos = new ArrayList<>();
+        for (int i = 0; i < taskStates.length; i++) {
+            AnalysisInfo taskInfo = new AnalysisInfoBuilder().setJobId(jobId).setTaskId(jobId + i + 1)
+                    .setTblId(tblId).setColName("c" + i).setJobType(jobType)
+                    .setAnalysisType(AnalysisType.FUNDAMENTALS).setState(AnalysisState.PENDING).build();
+            manager.replayCreateAnalysisTask(taskInfo);
+            BaseAnalysisTask task = Mockito.mock(BaseAnalysisTask.class);
+            task.info = taskInfo;
+            tasks.put(taskInfo.taskId, task);
+            taskInfos.add(taskInfo);
+        }
+        manager.addToJobIdTasksMap(jobId, tasks);
+        for (AnalysisInfo taskInfo : taskInfos) {
+            manager.updateTaskStatus(taskInfo, AnalysisState.RUNNING, "", time);
+        }
+        for (int i = 0; i < taskStates.length; i++) {
+            String msg = taskStates[i] == AnalysisState.FAILED ? "query timeout" : "";
+            manager.updateTaskStatus(taskInfos.get(i), taskStates[i], msg, time);
+        }
+        return job;
+    }
+
+    @Test
+    public void testFirstAutoAnalyzeFailureStartsBackoff() {
+        long savedBackoff = Config.auto_analyze_failure_backoff_in_millis;
+        Config.auto_analyze_failure_backoff_in_millis = 3600000L;
+        try {
+            AnalysisManager manager = spyManagerForJobStatus();
+            long now = System.currentTimeMillis();
+            // First ever auto analyze of the table: one column succeeds, then another fails.
+            AnalysisInfo job = runJob(manager, 100, 1001, JobType.SYSTEM, now,
+                    AnalysisState.FINISHED, AnalysisState.FAILED);
+            Assertions.assertEquals(AnalysisState.FAILED, job.state);
+            // The cooldown starts at the terminal failure.
+            Assertions.assertEquals(now, manager.getAutoAnalyzeFailureTime(1001));
+            Assertions.assertTrue(manager.isInAutoAnalyzeFailureBackoff(1001));
+            Assertions.assertFalse(manager.isInAutoAnalyzeFailureBackoff(1002));
+            // The failure must not mark anything as analyzed.
+            Mockito.verify(manager, Mockito.never()).updateTableStats(Mockito.any());
+            Assertions.assertNull(manager.findTableStatsStatus(1001));
+        } finally {
+            Config.auto_analyze_failure_backoff_in_millis = savedBackoff;
+        }
+    }
+
+    @Test
+    public void testAutoAnalyzeFailureKeepsExistingStatsFreshness() {
+        long savedBackoff = Config.auto_analyze_failure_backoff_in_millis;
+        Config.auto_analyze_failure_backoff_in_millis = 3600000L;
+        try {
+            AnalysisManager manager = spyManagerForJobStatus();
+            // Stale stats from an earlier successful analyze; TableStatsMeta() has tblId 0.
+            TableStatsMeta stale = new TableStatsMeta();
+            stale.lastAnalyzeTime = 12345L;
+            stale.updatedRows.set(1000L);
+            stale.partitionUpdateRows.put(7L, 70L);
+            manager.replayUpdateTableStatsStatus(stale);
+
+            runJob(manager, 200, 0, JobType.SYSTEM, System.currentTimeMillis(),
+                    AnalysisState.FAILED, AnalysisState.FINISHED);
+
+            Assertions.assertTrue(manager.isInAutoAnalyzeFailureBackoff(0));
+            Mockito.verify(manager, Mockito.never()).updateTableStats(Mockito.any());
+            Assertions.assertSame(stale, manager.findTableStatsStatus(0));
+            Assertions.assertEquals(12345L, stale.lastAnalyzeTime);
+            Assertions.assertEquals(1000L, stale.updatedRows.get());
+            Assertions.assertEquals(70L, stale.partitionUpdateRows.get(7L));
+        } finally {
+            Config.auto_analyze_failure_backoff_in_millis = savedBackoff;
+        }
+    }
+
+    @Test
+    public void testAutoAnalyzeFailureBackoffExpiryAndRecovery() {
+        long savedBackoff = Config.auto_analyze_failure_backoff_in_millis;
+        Config.auto_analyze_failure_backoff_in_millis = 3600000L;
+        try {
+            AnalysisManager manager = spyManagerForJobStatus();
+            long now = System.currentTimeMillis();
+
+            // A failure older than the backoff no longer suppresses auto analyze, and is forgotten.
+            runJob(manager, 300, 3001, JobType.SYSTEM, now - 3600000L - 1, AnalysisState.FAILED);
+            Assertions.assertFalse(manager.isInAutoAnalyzeFailureBackoff(3001));
+            Assertions.assertNull(manager.getAutoAnalyzeFailureTime(3001));
+
+            // A recent failure suppresses it, until the backoff is disabled.
+            runJob(manager, 400, 3001, JobType.SYSTEM, now, AnalysisState.FAILED);
+            Assertions.assertTrue(manager.isInAutoAnalyzeFailureBackoff(3001));
+            Config.auto_analyze_failure_backoff_in_millis = 0;
+            Assertions.assertFalse(manager.isInAutoAnalyzeFailureBackoff(3001));
+            Config.auto_analyze_failure_backoff_in_millis = 3600000L;
+
+            // A successful analyze clears the failure state and updates the table stats as usual.
+            runJob(manager, 500, 3001, JobType.SYSTEM, now, AnalysisState.FAILED);
+            Assertions.assertTrue(manager.isInAutoAnalyzeFailureBackoff(3001));
+            AnalysisInfo success = runJob(manager, 600, 3001, JobType.MANUAL, now,
+                    AnalysisState.FINISHED, AnalysisState.FINISHED);
+            Assertions.assertEquals(AnalysisState.FINISHED, success.state);
+            Mockito.verify(manager, Mockito.times(1)).updateTableStats(success);
+            Assertions.assertNull(manager.getAutoAnalyzeFailureTime(3001));
+            Assertions.assertFalse(manager.isInAutoAnalyzeFailureBackoff(3001));
+
+            // A failed manual analyze does not throttle auto analyze.
+            runJob(manager, 700, 3001, JobType.MANUAL, now, AnalysisState.FAILED);
+            Assertions.assertFalse(manager.isInAutoAnalyzeFailureBackoff(3001));
+        } finally {
+            Config.auto_analyze_failure_backoff_in_millis = savedBackoff;
+        }
+    }
+
     private AnalyzeTableCommand mockAnalyzeCommand(AnalysisMethod analysisMethod, ScheduleType scheduleType) {
         AnalyzeTableCommand command = Mockito.mock(AnalyzeTableCommand.class);
         TableIf table = Mockito.mock(TableIf.class);

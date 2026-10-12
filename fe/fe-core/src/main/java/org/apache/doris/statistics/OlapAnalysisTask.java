@@ -108,21 +108,13 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Will do sample collection for column {}", col.getName());
         }
-        // Get basic stats, including min and max.
-        ResultRow minMax = collectMinMax();
-        String min = StatisticsUtil.escapeSQL(minMax != null && minMax.getValues().size() > 0
-                ? minMax.get(0) : null);
-        String max = StatisticsUtil.escapeSQL(minMax != null && minMax.getValues().size() > 1
-                ? minMax.get(1) : null);
-
-        Map<String, String> params = buildSqlParams();
-        params.put("min", StatisticsUtil.quote(min));
-        params.put("max", StatisticsUtil.quote(max));
-        params.put("hotValueCollectCount", String.valueOf(SessionVariable.getHotValueCollectCount()));
         long tableRowCount = info.indexId == -1
                 ? tbl.getRowCount()
                 : ((OlapTable) tbl).getRowCountForIndex(info.indexId, false);
         SampleCollectInfo collectInfo = getSampleCollectInfo(tableRowCount);
+        Map<String, String> params = buildSqlParams();
+        putMinMaxParams(params, collectInfo.algorithm);
+        params.put("hotValueCollectCount", String.valueOf(SessionVariable.getHotValueCollectCount()));
         getSampleParams(params, tableRowCount, collectInfo);
         StringSubstitutor stringSubstitutor = new StringSubstitutor(params);
         String sql;
@@ -135,6 +127,37 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
                 collectInfo.algorithm, partitionColumnSampleTooManyRows, keyColumnSampleTooManyRows);
         LOG.debug(sql);
         runQuery(sql);
+    }
+
+    /**
+     * Fill the min and max params of the sample templates.
+     * Extremes of a sample are not valid table bounds (rare outliers are missed and distort range
+     * selectivity), so by default exact bounds come from a separate, unsampled MIN/MAX query.
+     * With {@link Config#skip_table_wide_min_max_in_sample_analyze}, that query is not issued:
+     * when the algorithm is FULL the main SQL scans the whole table and computes exact bounds
+     * itself, otherwise the bounds are left NULL, which is read back as unknown (-inf, +inf).
+     */
+    protected void putMinMaxParams(Map<String, String> params, AnalyzeSampleAlgorithm algorithm) {
+        if (Config.skip_table_wide_min_max_in_sample_analyze) {
+            // FULL renders LINEAR_ANALYZE_TEMPLATE without TABLET hint or limit, so cte1 is the whole table.
+            // Under PREAGGOPEN cte1 holds unmerged rows (including deleted ones), whose extremes are not the
+            // table's.
+            if (algorithm == AnalyzeSampleAlgorithm.FULL && !needPreAggHint()) {
+                params.put("min", "MIN(`${colName}`)");
+                params.put("max", "MAX(`${colName}`)");
+            } else {
+                params.put("min", "NULL");
+                params.put("max", "NULL");
+            }
+            return;
+        }
+        ResultRow minMax = collectMinMax();
+        String min = StatisticsUtil.escapeSQL(minMax != null && minMax.getValues().size() > 0
+                ? minMax.get(0) : null);
+        String max = StatisticsUtil.escapeSQL(minMax != null && minMax.getValues().size() > 1
+                ? minMax.get(1) : null);
+        params.put("min", StatisticsUtil.quote(min));
+        params.put("max", StatisticsUtil.quote(max));
     }
 
     protected ResultRow collectMinMax() {
@@ -308,10 +331,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         params.put("limit", "");
         params.put("subStringColName", getStringTypeColName(col));
 
-        // For agg table and mor unique table, set PREAGGOPEN preAggHint.
-        if (((OlapTable) tbl).getKeysType().equals(KeysType.AGG_KEYS)
-                || ((OlapTable) tbl).getKeysType().equals(KeysType.UNIQUE_KEYS)
-                && !((OlapTable) tbl).isUniqKeyMergeOnWrite()) {
+        if (needPreAggHint()) {
             params.put("preAggHint", "/*+PREAGGOPEN*/");
         }
 
@@ -347,6 +367,15 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
             }
         }
         setSampleParamsByAlgorithm(params, tableRowCount, info.algorithm);
+    }
+
+    /**
+     * For agg table and mor unique table, the sample SQL reads unmerged rows (PREAGGOPEN).
+     */
+    protected boolean needPreAggHint() {
+        OlapTable olapTable = (OlapTable) tbl;
+        return KeysType.AGG_KEYS.equals(olapTable.getKeysType())
+                || KeysType.UNIQUE_KEYS.equals(olapTable.getKeysType()) && !olapTable.isUniqKeyMergeOnWrite();
     }
 
     /**
