@@ -36,6 +36,7 @@
 #include "core/data_type/data_type_nullable.h"
 #include "core/data_type/data_type_number.h"
 #include "core/data_type/data_type_string.h"
+#include "core/data_type/data_type_date_or_datetime_v2.h"
 #include "format/arrow/arrow_stream_reader.h"
 #include "io/fs/stream_load_pipe.h"
 #include "runtime/runtime_state.h"
@@ -285,6 +286,62 @@ TEST_F(ArrowStreamReaderStreamingTest, ExtraArrowColumnFails) {
     EXPECT_FALSE(st.ok());
     EXPECT_NE(st.to_string().find("first unexpected column is doc"), std::string::npos)
             << st.to_string();
+}
+
+
+namespace {
+
+// One IPC stream with a single row: ts = 2026-10-13 16:37:00 UTC as a timestamp[us] with the
+// given Arrow time zone ("" for a naive timestamp).
+std::shared_ptr<io::StreamLoadPipe> make_timestamp_pipe(const std::string& arrow_timezone) {
+    auto schema = arrow::schema(
+            {arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MICRO, arrow_timezone))});
+    arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::MICRO, arrow_timezone),
+                                    arrow::default_memory_pool());
+    EXPECT_TRUE(builder.Append(1791909420000000).ok());
+    std::shared_ptr<arrow::Array> array;
+    EXPECT_TRUE(builder.Finish(&array).ok());
+    auto batch = arrow::RecordBatch::Make(schema, 1, {array});
+    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto writer = arrow::ipc::MakeStreamWriter(sink, schema).ValueOrDie();
+    EXPECT_TRUE(writer->WriteRecordBatch(*batch).ok());
+    EXPECT_TRUE(writer->Close().ok());
+    auto body = sink->Finish().ValueOrDie();
+    auto pipe = std::make_shared<io::StreamLoadPipe>(body->size() + 1024, 64 * 1024, body->size());
+    EXPECT_TRUE(pipe->append(reinterpret_cast<const char*>(body->data()), body->size()).ok());
+    EXPECT_TRUE(pipe->finish().ok());
+    return pipe;
+}
+
+std::string read_one_timestamp(const std::string& load_timezone, const std::string& arrow_timezone) {
+    RuntimeState state;
+    state.set_timezone(load_timezone);
+    TFileScanRangeParams params;
+    TFileRangeDesc range;
+    std::vector<SlotDescriptor*> slots;
+    ArrowStreamReader reader(&state, nullptr, nullptr, params, range, slots, nullptr);
+    EXPECT_TRUE(reader.init_reader(make_timestamp_pipe(arrow_timezone)).ok());
+    Block block;
+    auto ts_type = make_nullable(std::make_shared<DataTypeDateTimeV2>(6));
+    block.insert({ts_type->create_column(), ts_type, "ts"});
+    size_t read_rows = 0;
+    bool eof = false;
+    Status st = reader.get_next_block(&block, &read_rows, &eof);
+    EXPECT_TRUE(st.ok()) << st.to_string();
+    EXPECT_EQ(read_rows, 1);
+    const auto& nullable = assert_cast<const ColumnNullable&>(*block.get_by_position(0).column);
+    const auto& values =
+            assert_cast<const ColumnVector<TYPE_DATETIMEV2>&>(nullable.get_nested_column());
+    char buf[64];
+    values.get_element(0).to_string(buf, 6);
+    return std::string(buf);
+}
+
+} // namespace
+
+TEST_F(ArrowStreamReaderStreamingTest, UsesTheLoadTimezoneForTimestamps) {
+    EXPECT_EQ("2026-10-13 16:37:00.000000", read_one_timestamp("UTC", "UTC"));
+    EXPECT_EQ("2026-10-14 00:37:00.000000", read_one_timestamp("Asia/Shanghai", "UTC"));
 }
 
 } // namespace doris

@@ -56,7 +56,13 @@ ArrowStreamReader::ArrowStreamReader(RuntimeState* state, RuntimeProfile* profil
           _file_slot_descs(file_slot_descs),
           _io_ctx(io_ctx),
           _file_reader(nullptr) {
-    TimezoneUtils::find_cctz_time_zone(TimezoneUtils::default_time_zone, _ctzz);
+    // Arrow timestamps convert to DATETIME in the load's time zone (the Stream Load `timezone`
+    // header, else the session default), as the Parquet reader does.
+    if (state != nullptr) {
+        _ctzz = state->timezone_obj();
+    } else {
+        TimezoneUtils::find_cctz_time_zone(TimezoneUtils::default_time_zone, _ctzz);
+    }
 }
 
 ArrowStreamReader::~ArrowStreamReader() = default;
