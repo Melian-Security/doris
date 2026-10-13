@@ -35,6 +35,7 @@
 #include "cpp/sync_point.h"
 #include "storage/tablet/tablet_meta.h"
 #include "util/countdown_latch.h"
+#include "util/defer_op.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -188,6 +189,11 @@ TEST_F(CloudTabletMgrTest, TestConcurrentGetTabletTabletMapConsistency) {
 // sync_meta() called on it at all, so it kept serving the tablet properties -- the file cache
 // TTL among them -- that it happened to be built with.
 TEST_F(CloudTabletMgrTest, SyncTabletsRefreshesMetaOfContinuouslyIngestedTablet) {
+    // CloudTablet::sync_meta() is a no-op without the file cache, whose default is off here.
+    const bool saved_enable_file_cache = config::enable_file_cache;
+    config::enable_file_cache = true;
+    Defer restore_file_cache {[&] { config::enable_file_cache = saved_enable_file_cache; }};
+
     auto sp = SyncPoint::get_instance();
     sp->clear_all_call_backs();
     sp->enable_processing();
