@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <bvar/bvar.h>
+
+#include <cstring>
 #include "storage/index/inverted/inverted_index_writer.h"
 
 #include "storage/index/inverted/analyzer/analyzer.h"
@@ -236,6 +239,35 @@ Status InvertedIndexColumnWriter<field_type>::init_fulltext_index() {
     return Status::OK();
 }
 
+namespace {
+
+bvar::Adder<uint64_t> g_inverted_index_nul_terms_skipped("inverted_index_nul_terms_skipped");
+
+// CLucene rejects an untokenized term holding a NUL byte followed by any other byte
+// (SDocumentsWriter::FieldData::addPosition) and the error fails the whole load. Such a value
+// is left out of this index instead; the stored value is unchanged.
+bool skip_untokenized_term_with_nul(const Slice& v, const std::wstring& field_name) {
+    const char* begin = v.get_data();
+    const char* end = begin + v.get_size();
+    const auto* nul = static_cast<const char*>(memchr(begin, '\0', v.get_size()));
+    if (nul == nullptr) {
+        return false;
+    }
+    for (const char* p = nul; p < end; ++p) {
+        if (*p != '\0') {
+            g_inverted_index_nul_terms_skipped << 1;
+            LOG_EVERY_N(WARNING, 1000)
+                    << "inverted index skips an untokenized term with an embedded NUL byte, field="
+                    << std::string(field_name.begin(), field_name.end())
+                    << ", size=" << v.get_size() << ", nul_at=" << (nul - begin);
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 template <FieldType field_type>
 Status InvertedIndexColumnWriter<field_type>::add_document() {
     DBUG_EXECUTE_IF("inverted_index_writer.add_document", { return Status::OK(); });
@@ -372,7 +404,8 @@ Status InvertedIndexColumnWriter<field_type>::add_values(const std::string fn, c
         const auto* v = (Slice*)values;
         for (size_t i = 0; i < count; ++i) {
             // only ignore_above UNTOKENIZED strings and empty strings not tokenized
-            if ((!_should_analyzer && v->get_size() > _ignore_above) ||
+            if ((!_should_analyzer && (v->get_size() > _ignore_above ||
+                                       skip_untokenized_term_with_nul(*v, _field_name))) ||
                 (_should_analyzer && v->empty())) {
                 RETURN_IF_ERROR(add_null_document());
             } else {
@@ -420,7 +453,8 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
                     continue;
                 }
                 auto* v = (Slice*)((const uint8_t*)value_ptr + j * field_size);
-                if ((!_should_analyzer && v->get_size() > _ignore_above) ||
+                if ((!_should_analyzer && (v->get_size() > _ignore_above ||
+                                           skip_untokenized_term_with_nul(*v, _field_name))) ||
                     (_should_analyzer && v->empty())) {
                     // is here a null value?
                     // TODO. Maybe here has performance problem for large size string.

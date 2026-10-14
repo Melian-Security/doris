@@ -1478,4 +1478,135 @@ TEST_F(InvertedIndexWriterTest, FileCreationAndOutputErrorHandling) {
     // but it should not crash
 }
 
+
+TEST_F(InvertedIndexWriterTest, UntokenizedTermWithNulIsSkipped) {
+    auto tablet_schema = create_schema();
+    auto index_meta_pb = std::make_unique<TabletIndexPB>();
+    index_meta_pb->set_index_type(IndexType::INVERTED);
+    index_meta_pb->set_index_id(1);
+    index_meta_pb->set_index_name("test");
+    index_meta_pb->clear_col_unique_id();
+    index_meta_pb->add_col_unique_id(1);
+    TabletIndex idx_meta;
+    idx_meta.init_from_pb(*index_meta_pb.get());
+
+    std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+            local_segment_path(kTestDir, "test_nul_term", 0))};
+    std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+    io::FileWriterPtr file_writer;
+    io::FileWriterOptions opts;
+    auto fs = io::global_local_filesystem();
+    Status sts = fs->create_file(index_path, &file_writer, &opts);
+    ASSERT_TRUE(sts.ok()) << sts;
+    auto index_file_writer = std::make_unique<IndexFileWriter>(
+            fs, index_path_prefix, "test_nul_term", 0, InvertedIndexStorageFormatPB::V2,
+            std::move(file_writer));
+
+    const TabletColumn* field = &(tablet_schema->column(1));
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status =
+            IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
+    ASSERT_TRUE(status.ok()) << status;
+
+    // Row 1 holds a NUL followed by more bytes, the term CLucene rejects; a trailing NUL is
+    // accepted by CLucene and stays indexed.
+    const char nul_inside[] = {'a', 'b', '\0', 'c', 'd'};
+    std::vector<Slice> values = {Slice("apple"), Slice(nul_inside, sizeof(nul_inside)),
+                                 Slice("cherry"), Slice("apple")};
+    status = column_writer->add_values("c2", values.data(), values.size());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->finish();
+    EXPECT_TRUE(status.ok()) << status;
+    ASSERT_TRUE(index_file_writer->begin_close().ok());
+    ASSERT_TRUE(index_file_writer->finish_close().ok());
+
+    // The other rows keep their row ids and terms.
+    ExpectedDocMap expected {{"apple", {0, 3}}, {"cherry", {2}}};
+    check_terms_stats(index_path_prefix, &expected, {}, InvertedIndexStorageFormatPB::V2,
+                      &idx_meta);
+}
+
+TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
+    TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
+    TabletSchemaPB tablet_schema_pb;
+    tablet_schema_pb.set_keys_type(DUP_KEYS);
+    tablet_schema->init_from_pb(tablet_schema_pb);
+    TabletColumn array_column;
+    array_column.set_name("arr1");
+    array_column.set_type(FieldType::OLAP_FIELD_TYPE_ARRAY);
+    array_column.set_length(0);
+    array_column.set_index_length(0);
+    array_column.set_is_nullable(false);
+    TabletColumn child_column;
+    child_column.set_name("arr_sub_string");
+    child_column.set_type(FieldType::OLAP_FIELD_TYPE_STRING);
+    child_column.set_length(INT_MAX);
+    array_column.add_sub_column(child_column);
+    tablet_schema->append_column(array_column);
+
+    auto index_meta_pb = std::make_unique<TabletIndexPB>();
+    index_meta_pb->set_index_type(IndexType::INVERTED);
+    index_meta_pb->set_index_id(1);
+    index_meta_pb->set_index_name("test");
+    index_meta_pb->clear_col_unique_id();
+    index_meta_pb->add_col_unique_id(0);
+    TabletIndex idx_meta;
+    idx_meta.init_from_pb(*index_meta_pb.get());
+
+    std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+            local_segment_path(kTestDir, "test_array_nul", 0))};
+    std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+    io::FileWriterPtr file_writer;
+    io::FileWriterOptions opts;
+    auto fs = io::global_local_filesystem();
+    Status sts = fs->create_file(index_path, &file_writer, &opts);
+    ASSERT_TRUE(sts.ok()) << sts;
+    auto index_file_writer = std::make_unique<IndexFileWriter>(
+            fs, index_path_prefix, "test_array_nul", 0, InvertedIndexStorageFormatPB::V2,
+            std::move(file_writer));
+
+    const TabletColumn* field = &(array_column);
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status =
+            IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
+    ASSERT_TRUE(status.ok()) << status;
+
+    // Array 1: ["apple", "x\0y"]; array 2: ["x\0y"] (every element skipped); array 3: ["banana"].
+    Array a1, a2, a3;
+    a1.push_back(Field::create_field<TYPE_STRING>("apple"));
+    a1.push_back(Field::create_field<TYPE_STRING>(std::string("x\0y", 3)));
+    a2.push_back(Field::create_field<TYPE_STRING>(std::string("x\0y", 3)));
+    a3.push_back(Field::create_field<TYPE_STRING>("banana"));
+    DataTypePtr inner_string_type =
+            std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+    DataTypePtr array_type = std::make_shared<DataTypeArray>(inner_string_type);
+    MutableColumnPtr col = array_type->create_column();
+    col->insert(Field::create_field<TYPE_ARRAY>(a1));
+    col->insert(Field::create_field<TYPE_ARRAY>(a2));
+    col->insert(Field::create_field<TYPE_ARRAY>(a3));
+    ColumnPtr column_array = std::move(col);
+    Block block;
+    block.insert(ColumnWithTypeAndName(column_array, array_type, "arr1"));
+
+    OlapBlockDataConvertor convertor(tablet_schema.get(), {0});
+    convertor.set_source_content(&block, 0, block.rows());
+    auto [st, accessor] = convertor.convert_column_data(0);
+    ASSERT_EQ(st, Status::OK());
+    const auto* data_ptr = reinterpret_cast<const uint64_t*>(accessor->get_data());
+    const auto* offsets_ptr = reinterpret_cast<const uint8_t*>(data_ptr[1]);
+    const void* item_data = reinterpret_cast<const void*>(data_ptr[2]);
+    const auto* item_nullmap = reinterpret_cast<const uint8_t*>(data_ptr[3]);
+    auto field_size = field_type_size(field->get_sub_column(0).type());
+
+    status = column_writer->add_array_values(field_size, item_data, item_nullmap, offsets_ptr,
+                                             block.rows());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->add_array_nulls(accessor->get_nullmap(), block.rows());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->finish();
+    EXPECT_TRUE(status.ok()) << status;
+    ASSERT_TRUE(index_file_writer->begin_close().ok());
+    ASSERT_TRUE(index_file_writer->finish_close().ok());
+}
+
 } // namespace doris::segment_v2
