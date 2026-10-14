@@ -1637,12 +1637,19 @@ TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
             IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
     ASSERT_TRUE(status.ok()) << status;
 
-    // Array 1: ["apple", "x\0y"]; array 2: ["x\0y"] (every element skipped); array 3: ["banana"].
-    Array a1, a2, a3;
+    // Array 1: ["apple", "x\0y"]; array 2: ["x\0y"] (every element skipped); array 3: ["banana"];
+    // array 4: leading, all-NUL and trailing NUL elements (every element skipped);
+    // array 5: ["cherry", "\0lead"].
+    Array a1, a2, a3, a4, a5;
     a1.push_back(Field::create_field<TYPE_STRING>("apple"));
     a1.push_back(Field::create_field<TYPE_STRING>(std::string("x\0y", 3)));
     a2.push_back(Field::create_field<TYPE_STRING>(std::string("x\0y", 3)));
     a3.push_back(Field::create_field<TYPE_STRING>("banana"));
+    a4.push_back(Field::create_field<TYPE_STRING>(std::string("\0z", 2)));
+    a4.push_back(Field::create_field<TYPE_STRING>(std::string("\0\0", 2)));
+    a4.push_back(Field::create_field<TYPE_STRING>(std::string("z\0", 2)));
+    a5.push_back(Field::create_field<TYPE_STRING>("cherry"));
+    a5.push_back(Field::create_field<TYPE_STRING>(std::string("\0lead", 5)));
     DataTypePtr inner_string_type =
             std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
     DataTypePtr array_type = std::make_shared<DataTypeArray>(inner_string_type);
@@ -1650,6 +1657,8 @@ TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
     col->insert(Field::create_field<TYPE_ARRAY>(a1));
     col->insert(Field::create_field<TYPE_ARRAY>(a2));
     col->insert(Field::create_field<TYPE_ARRAY>(a3));
+    col->insert(Field::create_field<TYPE_ARRAY>(a4));
+    col->insert(Field::create_field<TYPE_ARRAY>(a5));
     ColumnPtr column_array = std::move(col);
     Block block;
     block.insert(ColumnWithTypeAndName(column_array, array_type, "arr1"));
@@ -1710,6 +1719,20 @@ TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
     EXPECT_TRUE(bitmap->isEmpty()) << bitmap->toString();
     status = query(std::string("x\0y", 3), &bitmap);
     EXPECT_EQ(status.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << status;
+    // Rows after the skipped elements keep their row ids.
+    status = query("cherry", &bitmap);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 4));
+    for (const auto& truncated : {"z", "lead", ""}) {
+        status = query(truncated, &bitmap);
+        ASSERT_TRUE(status.ok()) << status;
+        EXPECT_TRUE(bitmap->isEmpty()) << truncated << ": " << bitmap->toString();
+    }
+    for (const auto& skipped : {std::string("\0z", 2), std::string("\0\0", 2),
+                                std::string("z\0", 2), std::string("\0lead", 5)}) {
+        status = query(skipped, &bitmap);
+        EXPECT_EQ(status.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << status;
+    }
 
     InvertedIndexQueryCacheHandle null_handle;
     ASSERT_TRUE(str_reader->read_null_bitmap(context, &null_handle, nullptr).ok());
