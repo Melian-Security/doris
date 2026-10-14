@@ -250,7 +250,9 @@ bvar::Adder<uint64_t> g_inverted_index_nul_terms_skipped("inverted_index_nul_ter
 // An untokenized value holding a NUL byte is left out of this index (see
 // untokenized_term_has_nul) instead of failing the load or being indexed under a truncated
 // term; the stored value is unchanged, and StringTypeInvertedIndexReader::query declines lookups
-// for such values so the predicate is evaluated on the data.
+// for such values so the predicate is evaluated on the data. Known limitation, shared with
+// ignore_above: an index-served MATCH_PHRASE_PREFIX or MATCH_REGEXP query only sees indexed
+// terms, so it does not find a value left out here.
 bool skip_untokenized_term_with_nul(const Slice& v, const std::wstring& field_name) {
     std::string_view term(v.get_data(), v.get_size());
     if (!untokenized_term_has_nul(term)) {

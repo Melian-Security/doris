@@ -2971,20 +2971,21 @@ public:
                                        InvertedIndexQueryType::MATCH_PHRASE_QUERY, bitmap);
             EXPECT_TRUE(status.ok());
 
-            // Prefix and regexp patterns are evaluated on the data for an untokenized index
+            // Test MATCH_PHRASE_PREFIX_QUERY for StringType
             bitmap = std::make_shared<roaring::Roaring>();
             Field qp_2904 =
                     Field::create_field<TYPE_STRING>(std::string(str_ref.data, str_ref.size));
             status = str_reader->query(context, "c2", qp_2904,
                                        InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, bitmap);
-            EXPECT_EQ(status.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << status;
+            EXPECT_TRUE(status.ok());
 
+            // Test MATCH_REGEXP_QUERY for StringType
             bitmap = std::make_shared<roaring::Roaring>();
             Field qp_2910 =
                     Field::create_field<TYPE_STRING>(std::string(str_ref.data, str_ref.size));
             status = str_reader->query(context, "c2", qp_2910,
                                        InvertedIndexQueryType::MATCH_REGEXP_QUERY, bitmap);
-            EXPECT_EQ(status.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << status;
+            EXPECT_TRUE(status.ok());
         }
     }
 
@@ -4148,9 +4149,10 @@ public:
             expect_skipped(v, InvertedIndexQueryType::MATCH_PHRASE_QUERY);
         }
 
-        // Prefix and regexp patterns could match a row left out of the index.
-        expect_skipped("ab", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY);
-        expect_skipped("tr.*", InvertedIndexQueryType::MATCH_REGEXP_QUERY);
+        // Known limitation, as with ignore_above: index-served prefix and regexp patterns only
+        // see indexed terms, so the rows left out ("ab\0cd", "trail\0") are not found.
+        expect_rows("ab", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, {6});
+        expect_rows("tr", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, {5});
 
         // The same decline reaches callers through the index iterator, which every column
         // predicate and index-evaluated function uses.

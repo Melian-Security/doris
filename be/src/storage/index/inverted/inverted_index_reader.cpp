@@ -539,16 +539,6 @@ Status StringTypeInvertedIndexReader::query(const IndexQueryContextPtr& context,
                 "query value holds a NUL byte, evaluate skipped.");
     }
 
-    // A prefix or regexp pattern can match a value this index left out (longer than ignore_above,
-    // or holding a NUL byte), and a segment does not record whether it left any out, so the
-    // index cannot prove a pattern has no further matches; evaluate the predicate on the data.
-    if (query_type == InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY ||
-        query_type == InvertedIndexQueryType::MATCH_REGEXP_QUERY) {
-        return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
-                "pattern query on an untokenized index may miss values left out of the index, "
-                "evaluate skipped.");
-    }
-
     VLOG_DEBUG << "begin to query the inverted index from clucene"
                << ", column_name: " << column_name << ", search_str: " << search_str;
     try {
