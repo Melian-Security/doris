@@ -1572,11 +1572,13 @@ TEST_F(InvertedIndexWriterTest, UntokenizedTermWithNulIsSkipped) {
             IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
     ASSERT_TRUE(status.ok()) << status;
 
-    // Row 1 holds a NUL followed by more bytes, the term CLucene rejects; a trailing NUL is
-    // accepted by CLucene and stays indexed.
+    // Row 1 holds a NUL followed by more bytes, the term CLucene rejects; row 4 ends with a NUL,
+    // which CLucene would cut off and index under "apple".
     const char nul_inside[] = {'a', 'b', '\0', 'c', 'd'};
+    const char nul_trailing[] = {'a', 'p', 'p', 'l', 'e', '\0'};
     std::vector<Slice> values = {Slice("apple"), Slice(nul_inside, sizeof(nul_inside)),
-                                 Slice("cherry"), Slice("apple")};
+                                 Slice("cherry"), Slice("apple"),
+                                 Slice(nul_trailing, sizeof(nul_trailing))};
     status = column_writer->add_values("c2", values.data(), values.size());
     EXPECT_TRUE(status.ok()) << status;
     status = column_writer->finish();
@@ -1671,6 +1673,48 @@ TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
     EXPECT_TRUE(status.ok()) << status;
     ASSERT_TRUE(index_file_writer->begin_close().ok());
     ASSERT_TRUE(index_file_writer->finish_close().ok());
+
+    // Read back as array_contains does: indexed elements are found, a lookup for the skipped
+    // element declines so the rows are filtered on the data, and array 2, whose only element
+    // was skipped, is not NULL.
+    auto file_reader = std::make_shared<IndexFileReader>(
+            io::global_local_filesystem(), index_path_prefix, InvertedIndexStorageFormatPB::V2);
+    ASSERT_TRUE(file_reader->init().ok());
+    auto str_reader = StringTypeInvertedIndexReader::create_shared(&idx_meta, file_reader);
+    OlapReaderStatistics stats;
+    RuntimeState runtime_state;
+    TQueryOptions query_options;
+    query_options.enable_inverted_index_searcher_cache = false;
+    runtime_state.set_query_options(query_options);
+    io::IOContext io_ctx;
+    auto context = std::make_shared<IndexQueryContext>();
+    context->io_ctx = &io_ctx;
+    context->stats = &stats;
+    context->runtime_state = &runtime_state;
+    const std::string field_name = std::to_string(array_column.unique_id());
+    auto query = [&](const std::string& value, std::shared_ptr<roaring::Roaring>* bitmap) {
+        *bitmap = std::make_shared<roaring::Roaring>();
+        Field qp = Field::create_field<TYPE_STRING>(value);
+        return str_reader->query(context, field_name, qp, InvertedIndexQueryType::EQUAL_QUERY,
+                                 *bitmap);
+    };
+    std::shared_ptr<roaring::Roaring> bitmap;
+    status = query("apple", &bitmap);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 0));
+    status = query("banana", &bitmap);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 2));
+    status = query("x", &bitmap);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_TRUE(bitmap->isEmpty()) << bitmap->toString();
+    status = query(std::string("x\0y", 3), &bitmap);
+    EXPECT_EQ(status.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << status;
+
+    InvertedIndexQueryCacheHandle null_handle;
+    ASSERT_TRUE(str_reader->read_null_bitmap(context, &null_handle, nullptr).ok());
+    auto null_bitmap = null_handle.get_bitmap();
+    EXPECT_TRUE(null_bitmap == nullptr || null_bitmap->isEmpty());
 }
 
 TEST_F(InvertedIndexWriterTest, TokenizedValueWithNulIsIndexed) {
@@ -1728,6 +1772,76 @@ TEST_F(InvertedIndexWriterTest, TokenizedValueWithNulIsIndexed) {
     for (const auto& term : seen_terms) {
         EXPECT_EQ(term.find('\0'), std::string::npos) << "term holds a NUL: " << term;
     }
+}
+
+// A query against a tokenized index is analyzed as the indexed values were, with NUL bytes as
+// spaces, so a 4-gram spanning a NUL in the query matches the same 4-gram in the index.
+TEST_F(InvertedIndexWriterTest, TokenizedNulQueryIsAnalyzedAsSpace) {
+    ScopedNgramAnalyzer ngram_analyzer;
+    auto tablet_schema = create_schema();
+    auto index_meta_pb = std::make_unique<TabletIndexPB>();
+    index_meta_pb->set_index_type(IndexType::INVERTED);
+    index_meta_pb->set_index_id(1);
+    index_meta_pb->set_index_name("test");
+    index_meta_pb->clear_col_unique_id();
+    index_meta_pb->add_col_unique_id(1);
+    (*index_meta_pb->mutable_properties())["analyzer"] = ScopedNgramAnalyzer::kName;
+    TabletIndex idx_meta;
+    idx_meta.init_from_pb(*index_meta_pb.get());
+
+    std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+            local_segment_path(kTestDir, "test_tokenized_nul_query", 0))};
+    std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+    io::FileWriterPtr file_writer;
+    io::FileWriterOptions opts;
+    auto fs = io::global_local_filesystem();
+    ASSERT_TRUE(fs->create_file(index_path, &file_writer, &opts).ok());
+    auto index_file_writer = std::make_unique<IndexFileWriter>(
+            fs, index_path_prefix, "test_tokenized_nul_query", 0, InvertedIndexStorageFormatPB::V2,
+            std::move(file_writer));
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status = IndexColumnWriter::create(&(tablet_schema->column(1)), &column_writer,
+                                            index_file_writer.get(), &idx_meta);
+    ASSERT_TRUE(status.ok()) << status;
+
+    // Row 0 is indexed as "ab cdef": 4-grams "ab c", "b cd", " cde", "cdef".
+    const std::string nul_inside("ab\0cdef", 7);
+    std::vector<Slice> values = {Slice(nul_inside), Slice("abcdef")};
+    status = column_writer->add_values("c2", values.data(), values.size());
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_TRUE(column_writer->finish().ok());
+    ASSERT_TRUE(index_file_writer->begin_close().ok());
+    ASSERT_TRUE(index_file_writer->finish_close().ok());
+
+    auto file_reader = std::make_shared<IndexFileReader>(
+            io::global_local_filesystem(), index_path_prefix, InvertedIndexStorageFormatPB::V2);
+    ASSERT_TRUE(file_reader->init().ok());
+    auto fulltext_reader = FullTextIndexReader::create_shared(&idx_meta, file_reader);
+    OlapReaderStatistics stats;
+    RuntimeState runtime_state;
+    TQueryOptions query_options;
+    query_options.enable_inverted_index_searcher_cache = false;
+    query_options.enable_inverted_index_query_cache = false;
+    runtime_state.set_query_options(query_options);
+    io::IOContext io_ctx;
+    auto context = std::make_shared<IndexQueryContext>();
+    context->io_ctx = &io_ctx;
+    context->stats = &stats;
+    context->runtime_state = &runtime_state;
+    const std::string field_name = std::to_string(tablet_schema->column(1).unique_id());
+    auto match_any = [&](const std::string& value) {
+        auto bitmap = std::make_shared<roaring::Roaring>();
+        Field qp = Field::create_field<TYPE_STRING>(value);
+        auto st = fulltext_reader->query(context, field_name, qp,
+                                         InvertedIndexQueryType::MATCH_ANY_QUERY, bitmap);
+        EXPECT_TRUE(st.ok()) << st;
+        return *bitmap;
+    };
+
+    EXPECT_EQ(match_any(std::string("b\0cd", 4)), roaring::Roaring::bitmapOf(1, 0));
+    EXPECT_EQ(match_any(std::string("b cd")), roaring::Roaring::bitmapOf(1, 0));
+    EXPECT_EQ(match_any(std::string("cdef")), roaring::Roaring::bitmapOf(2, 0, 1));
+    EXPECT_EQ(match_any(std::string("bcde")), roaring::Roaring::bitmapOf(1, 1));
 }
 
 // The array path analyzes every element through its own reader; with a NUL the reader reads a

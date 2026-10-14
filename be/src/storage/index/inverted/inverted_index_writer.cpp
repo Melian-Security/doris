@@ -247,27 +247,21 @@ namespace {
 
 bvar::Adder<uint64_t> g_inverted_index_nul_terms_skipped("inverted_index_nul_terms_skipped");
 
-// CLucene rejects an untokenized term holding a NUL byte followed by any other byte
-// (SDocumentsWriter::FieldData::addPosition) and the error fails the whole load. Such a value
-// is left out of this index instead; the stored value is unchanged.
+// An untokenized value holding a NUL byte is left out of this index (see
+// untokenized_term_has_nul) instead of failing the load or being indexed under a truncated
+// term; the stored value is unchanged, and StringTypeInvertedIndexReader::query declines lookups
+// for such values so the predicate is evaluated on the data.
 bool skip_untokenized_term_with_nul(const Slice& v, const std::wstring& field_name) {
-    const char* begin = v.get_data();
-    const char* end = begin + v.get_size();
-    const auto* nul = static_cast<const char*>(memchr(begin, '\0', v.get_size()));
-    if (nul == nullptr) {
+    std::string_view term(v.get_data(), v.get_size());
+    if (!untokenized_term_has_nul(term)) {
         return false;
     }
-    for (const char* p = nul; p < end; ++p) {
-        if (*p != '\0') {
-            g_inverted_index_nul_terms_skipped << 1;
-            LOG_EVERY_N(WARNING, 1000)
-                    << "inverted index skips an untokenized term with an embedded NUL byte, field="
-                    << std::string(field_name.begin(), field_name.end())
-                    << ", size=" << v.get_size() << ", nul_at=" << (nul - begin);
-            return true;
-        }
-    }
-    return false;
+    g_inverted_index_nul_terms_skipped << 1;
+    LOG_EVERY_N(WARNING, 1000) << "inverted index skips an untokenized term holding a NUL byte, "
+                                  "field="
+                               << std::string(field_name.begin(), field_name.end())
+                               << ", size=" << term.size() << ", nul_at=" << term.find('\0');
+    return true;
 }
 
 bvar::Adder<uint64_t> g_inverted_index_nul_values_sanitized("inverted_index_nul_values_sanitized");
@@ -279,19 +273,17 @@ bvar::Adder<uint64_t> g_inverted_index_nul_values_sanitized("inverted_index_nul_
 // slice over `buf`, which must outlive the token stream that reads it.
 Slice nul_free_value_for_analyzer(const Slice& v, std::string* buf,
                                   const std::wstring& field_name) {
-    const auto* nul = static_cast<const char*>(memchr(v.get_data(), '\0', v.get_size()));
-    if (nul == nullptr) {
+    const std::string_view value(v.get_data(), v.get_size());
+    const std::string_view analyzed = nul_as_space_for_analyzer(value, buf);
+    if (analyzed.data() == value.data()) {
         return v;
     }
-    const size_t nul_at = nul - v.get_data();
     g_inverted_index_nul_values_sanitized << 1;
     LOG_EVERY_N(WARNING, 1000)
             << "inverted index analyzes NUL bytes as spaces in a tokenized value, field="
             << std::string(field_name.begin(), field_name.end()) << ", size=" << v.get_size()
-            << ", nul_at=" << nul_at;
-    buf->assign(v.get_data(), v.get_size());
-    std::replace(buf->begin() + nul_at, buf->end(), '\0', ' ');
-    return {buf->data(), buf->size()};
+            << ", nul_at=" << value.find('\0');
+    return {analyzed.data(), analyzed.size()};
 }
 
 } // namespace

@@ -48,6 +48,7 @@
 #include "storage/index/index_reader_helper.h"
 #include "storage/index/inverted/analyzer/analyzer.h"
 #include "storage/index/inverted/inverted_index_cache.h"
+#include "storage/index/inverted/inverted_index_common.h"
 #include "storage/index/inverted/inverted_index_fs_directory.h"
 #include "storage/index/inverted/inverted_index_iterator.h"
 #include "storage/index/inverted/inverted_index_parser.h"
@@ -390,6 +391,19 @@ Status FullTextIndexReader::query(const IndexQueryContextPtr& context,
     VLOG_DEBUG << column_name << " begin to search the fulltext index from clucene, query_str ["
                << search_str << "]";
 
+    // The query is analyzed as the indexed values were, with NUL bytes as spaces. A keyword
+    // lookup is not analyzed and CLucene would cut its term at the NUL, so it is evaluated on the
+    // data; a regexp pattern is matched against terms as written.
+    if (query_type != InvertedIndexQueryType::MATCH_REGEXP_QUERY &&
+        untokenized_term_has_nul(search_str)) {
+        if (analyzer_ctx != nullptr && !analyzer_ctx->should_tokenize()) {
+            return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
+                    "keyword query value holds a NUL byte, evaluate skipped.");
+        }
+        std::string nul_free;
+        search_str = std::string(nul_as_space_for_analyzer(search_str, &nul_free));
+    }
+
     const auto& queryOptions = context->runtime_state->query_options();
     try {
         InvertedIndexQueryInfo query_info;
@@ -516,6 +530,23 @@ Status StringTypeInvertedIndexReader::query(const IndexQueryContextPtr& context,
         search_str.size() > ignore_above) {
         return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
                 "query value is too long, evaluate skipped.");
+    }
+
+    // A value holding a NUL byte is never written to an untokenized index, and CLucene would cut
+    // the query term at its first NUL and match other values; evaluate the predicate on the data.
+    if (untokenized_term_has_nul(search_str)) {
+        return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
+                "query value holds a NUL byte, evaluate skipped.");
+    }
+
+    // A prefix or regexp pattern can match a value this index left out (longer than ignore_above,
+    // or holding a NUL byte), and a segment does not record whether it left any out, so the
+    // index cannot prove a pattern has no further matches; evaluate the predicate on the data.
+    if (query_type == InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY ||
+        query_type == InvertedIndexQueryType::MATCH_REGEXP_QUERY) {
+        return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
+                "pattern query on an untokenized index may miss values left out of the index, "
+                "evaluate skipped.");
     }
 
     VLOG_DEBUG << "begin to query the inverted index from clucene"

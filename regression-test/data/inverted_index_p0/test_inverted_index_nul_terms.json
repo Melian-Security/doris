@@ -1,0 +1,8 @@
+{"id":1,"s":"ok","t":"hello ok","arr":["ok","x"],"v":{"k":"ok"}}
+{"id":2,"s":"ab\u0000cd","t":"ab\u0000cd","arr":["ab\u0000cd"],"v":{"k":"ab\u0000cd"}}
+{"id":3,"s":"a\u0000\u0000b","t":"hello\u0000world","arr":["ok","a\u0000\u0000b"],"v":{"k":"a\u0000\u0000b"}}
+{"id":4,"s":"trail\u0000","t":"trail\u0000","arr":["trail\u0000"],"v":{"k":"trail\u0000"}}
+{"id":5,"s":"","t":"","arr":[],"v":{"k":""}}
+{"id":6,"s":null,"t":null,"arr":null,"v":{"k":null}}
+{"id":7,"s":"trail","t":"trail","arr":["trail"],"v":{"k":"trail"}}
+{"id":8,"s":"ab","t":"ab","arr":["ab\u0000cd","ab"],"v":{"k":"ab"}}
