@@ -1458,6 +1458,9 @@ DECLARE_Int32(inverted_index_read_buffer_size);
 DECLARE_Int32(max_depth_in_bkd_tree);
 // index compaction
 DECLARE_mBool(inverted_index_compaction_enable);
+// Merge the inverted indexes of VARIANT string sub-columns during compaction instead of
+// rebuilding them, when every input segment materializes the sub-column.
+DECLARE_mBool(enable_variant_subcolumn_index_compaction);
 // Only for debug, do not use in production
 DECLARE_mBool(debug_inverted_index_compaction);
 // index by RAM directory

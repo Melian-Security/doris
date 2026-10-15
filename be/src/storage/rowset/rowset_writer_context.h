@@ -21,8 +21,11 @@
 #include <glog/logging.h>
 
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 
 #include "cloud/config.h"
@@ -39,6 +42,34 @@
 #include "storage/tablet/tablet_schema.h"
 
 namespace doris {
+
+// A VARIANT sub-column inverted index that compaction merges from the input segments; the writer
+// does not build it.
+struct VariantSubcolumnIndexToCompact {
+    int32_t variant_uid = -1;
+    std::string path; // relative to the VARIANT column
+    TabletIndexPtr index;
+};
+
+// The sub-column indexes each output segment left to compaction, recorded by the column writers
+// and keyed by the segment's index file writer. Compaction merges an index only into segments that
+// wrote its path as a string sub-column.
+class VariantSubcolumnIndexWrites {
+public:
+    void add(const void* index_file_writer, int64_t index_id, const std::string& index_suffix) {
+        std::lock_guard lock(_mutex);
+        _deferred.emplace(index_file_writer, index_id, index_suffix);
+    }
+    bool contains(const void* index_file_writer, int64_t index_id,
+                  const std::string& index_suffix) const {
+        std::lock_guard lock(_mutex);
+        return _deferred.contains({index_file_writer, index_id, index_suffix});
+    }
+
+private:
+    mutable std::mutex _mutex;
+    std::set<std::tuple<const void*, int64_t, std::string>> _deferred;
+};
 
 class RowsetWriterContextBuilder;
 using RowsetWriterContextBuilderSharedPtr = std::shared_ptr<RowsetWriterContextBuilder>;
@@ -89,6 +120,18 @@ struct RowsetWriterContext {
     bool enable_unique_key_merge_on_write = false;
     // store column_unique_id to do index compaction
     std::set<int32_t> columns_to_do_index_compaction;
+    std::vector<VariantSubcolumnIndexToCompact> variant_subcolumn_indexes_to_compact;
+    std::shared_ptr<VariantSubcolumnIndexWrites> variant_subcolumn_index_writes =
+            std::make_shared<VariantSubcolumnIndexWrites>();
+
+    bool is_variant_subcolumn_index_compacted(int32_t variant_uid, const TabletIndex& index) const {
+        return std::any_of(variant_subcolumn_indexes_to_compact.begin(),
+                           variant_subcolumn_indexes_to_compact.end(), [&](const auto& entry) {
+                               return entry.variant_uid == variant_uid &&
+                                      entry.index->index_id() == index.index_id() &&
+                                      entry.index->get_index_suffix() == index.get_index_suffix();
+                           });
+    }
     DataWriteType write_type = DataWriteType::TYPE_DEFAULT;
     // need to figure out the sub type of compaction
     ReaderType compaction_type = ReaderType::UNKNOWN;
