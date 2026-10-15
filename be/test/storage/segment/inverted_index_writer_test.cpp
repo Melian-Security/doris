@@ -20,6 +20,7 @@
 #include <CLucene.h>
 #include <CLucene/config/repl_wchar.h>
 #include <CLucene/index/IndexReader.h>
+#include <gen_cpp/AgentService_types.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -36,6 +38,8 @@
 #include "core/data_type/data_type_number.h"
 #include "core/field.h"
 #include "io/fs/local_file_system.h"
+#include "runtime/exec_env.h"
+#include "runtime/index_policy/index_policy_mgr.h"
 #include "runtime/runtime_state.h"
 #include "storage/index/index_file_reader.h"
 #include "storage/index/index_file_writer.h"
@@ -57,6 +61,63 @@ namespace doris::segment_v2 {
 using InvertedIndexDirectoryMap =
         std::map<std::pair<int64_t, std::string>, std::shared_ptr<lucene::store::Directory>>;
 
+// ExecEnv creates its IndexPolicyMgr only in ExecEnv::init, which unit tests do not run, and
+// offers no setter. An explicit instantiation may name a private member, so this grants the
+// tests below a way to install a manager that holds a custom analyzer.
+template <typename Tag, typename Tag::type Member>
+struct PrivateMemberAccess {
+    friend typename Tag::type private_member(Tag) { return Member; }
+};
+struct ExecEnvIndexPolicyMgrTag {
+    using type = IndexPolicyMgr* ExecEnv::*;
+    friend type private_member(ExecEnvIndexPolicyMgrTag);
+};
+template struct PrivateMemberAccess<ExecEnvIndexPolicyMgrTag, &ExecEnv::_index_policy_mgr>;
+
+// Installs the custom analyzer `ngram4_lower` (ngram tokenizer, min_gram = max_gram = 4,
+// lowercase filter) for the lifetime of the object. The ngram tokenizer treats every character
+// as a token character, so a NUL byte inside a value ends up inside a term.
+class ScopedNgramAnalyzer {
+public:
+    static constexpr const char* kName = "ngram4_lower";
+
+    ScopedNgramAnalyzer() {
+        TIndexPolicy tokenizer;
+        tokenizer.id = 1;
+        tokenizer.name = "ngram4";
+        tokenizer.type = TIndexPolicyType::TOKENIZER;
+        tokenizer.properties["type"] = "ngram";
+        tokenizer.properties["min_gram"] = "4";
+        tokenizer.properties["max_gram"] = "4";
+
+        TIndexPolicy filter;
+        filter.id = 2;
+        filter.name = "ngram4_lowercase";
+        filter.type = TIndexPolicyType::TOKEN_FILTER;
+        filter.properties["type"] = "lowercase";
+
+        TIndexPolicy analyzer;
+        analyzer.id = 3;
+        analyzer.name = kName;
+        analyzer.type = TIndexPolicyType::ANALYZER;
+        analyzer.properties["tokenizer"] = "ngram4";
+        analyzer.properties["token_filter"] = "ngram4_lowercase";
+
+        _mgr.apply_policy_changes({tokenizer, filter, analyzer}, {});
+        auto& slot = ExecEnv::GetInstance()->*private_member(ExecEnvIndexPolicyMgrTag {});
+        _previous = slot;
+        slot = &_mgr;
+    }
+
+    ~ScopedNgramAnalyzer() {
+        ExecEnv::GetInstance()->*private_member(ExecEnvIndexPolicyMgrTag {}) = _previous;
+    }
+
+private:
+    IndexPolicyMgr _mgr;
+    IndexPolicyMgr* _previous = nullptr;
+};
+
 class InvertedIndexWriterTest : public testing::Test {
     using ExpectedDocMap = std::map<std::string, std::vector<int>>;
 
@@ -66,7 +127,8 @@ public:
     void check_terms_stats(std::string index_prefix, ExpectedDocMap* expected,
                            std::vector<int> expected_null_bitmap = {},
                            InvertedIndexStorageFormatPB format = InvertedIndexStorageFormatPB::V1,
-                           const TabletIndex* index_meta = nullptr) {
+                           const TabletIndex* index_meta = nullptr,
+                           std::set<std::string>* seen_terms = nullptr) {
         std::string file_str;
         if (format == InvertedIndexStorageFormatPB::V1) {
             file_str = InvertedIndexDescriptor::get_index_file_path_v1(index_prefix,
@@ -130,6 +192,9 @@ public:
                     lucene_wcstoutf8string(te->term(false)->text(), te->term(false)->textLength());
 
             printf("Term: %s ", token.c_str());
+            if (seen_terms) {
+                seen_terms->insert(token);
+            }
             if (expected) {
                 auto it = expected->find(token);
                 if (it != expected->end()) {
@@ -1478,7 +1543,6 @@ TEST_F(InvertedIndexWriterTest, FileCreationAndOutputErrorHandling) {
     // but it should not crash
 }
 
-
 TEST_F(InvertedIndexWriterTest, UntokenizedTermWithNulIsSkipped) {
     auto tablet_schema = create_schema();
     auto index_meta_pb = std::make_unique<TabletIndexPB>();
@@ -1607,6 +1671,162 @@ TEST_F(InvertedIndexWriterTest, ArrayElementWithNulIsSkipped) {
     EXPECT_TRUE(status.ok()) << status;
     ASSERT_TRUE(index_file_writer->begin_close().ok());
     ASSERT_TRUE(index_file_writer->finish_close().ok());
+}
+
+TEST_F(InvertedIndexWriterTest, TokenizedValueWithNulIsIndexed) {
+    ScopedNgramAnalyzer ngram_analyzer;
+    auto tablet_schema = create_schema();
+    auto index_meta_pb = std::make_unique<TabletIndexPB>();
+    index_meta_pb->set_index_type(IndexType::INVERTED);
+    index_meta_pb->set_index_id(1);
+    index_meta_pb->set_index_name("test");
+    index_meta_pb->clear_col_unique_id();
+    index_meta_pb->add_col_unique_id(1);
+    (*index_meta_pb->mutable_properties())["analyzer"] = ScopedNgramAnalyzer::kName;
+    TabletIndex idx_meta;
+    idx_meta.init_from_pb(*index_meta_pb.get());
+
+    std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+            local_segment_path(kTestDir, "test_tokenized_nul", 0))};
+    std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+    io::FileWriterPtr file_writer;
+    io::FileWriterOptions opts;
+    auto fs = io::global_local_filesystem();
+    Status sts = fs->create_file(index_path, &file_writer, &opts);
+    ASSERT_TRUE(sts.ok()) << sts;
+    auto index_file_writer = std::make_unique<IndexFileWriter>(
+            fs, index_path_prefix, "test_tokenized_nul", 0, InvertedIndexStorageFormatPB::V2,
+            std::move(file_writer));
+
+    const TabletColumn* field = &(tablet_schema->column(1));
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status =
+            IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
+    ASSERT_TRUE(status.ok()) << status;
+
+    // Unsanitized, rows 1 and 2 yield 4-grams with a NUL followed by another byte, which
+    // CLucene rejects. A NUL is analyzed as a space instead.
+    const char nul_inside[] = {'a', 'b', '\0', 'c', 'd', 'e', 'f'};
+    const char nul_run[] = {'x', '\0', '\0', 'y'};
+    std::vector<Slice> values = {Slice("Hello"), Slice(nul_inside, sizeof(nul_inside)),
+                                 Slice(nul_run, sizeof(nul_run))};
+    status = column_writer->add_values("c2", values.data(), values.size());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->finish();
+    EXPECT_TRUE(status.ok()) << status;
+    ASSERT_TRUE(index_file_writer->begin_close().ok());
+    ASSERT_TRUE(index_file_writer->finish_close().ok());
+
+    ExpectedDocMap expected {
+            {"hell", {0}}, {"ello", {0}}, {"b cd", {1}}, {"cdef", {1}}, {"x  y", {2}}};
+    std::set<std::string> seen_terms;
+    check_terms_stats(index_path_prefix, &expected, {}, InvertedIndexStorageFormatPB::V2, &idx_meta,
+                      &seen_terms);
+    for (const auto& [term, docs] : expected) {
+        EXPECT_TRUE(seen_terms.contains(term)) << "missing term: " << term;
+    }
+    for (const auto& term : seen_terms) {
+        EXPECT_EQ(term.find('\0'), std::string::npos) << "term holds a NUL: " << term;
+    }
+}
+
+// The array path analyzes every element through its own reader; with a NUL the reader reads a
+// sanitized copy that must stay alive until add_document. A custom analyzer's array token stream
+// is reset twice and indexes nothing, so this uses the builtin standard parser.
+TEST_F(InvertedIndexWriterTest, TokenizedArrayElementWithNulIsIndexed) {
+    TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
+    TabletSchemaPB tablet_schema_pb;
+    tablet_schema_pb.set_keys_type(DUP_KEYS);
+    tablet_schema->init_from_pb(tablet_schema_pb);
+    TabletColumn array_column;
+    array_column.set_name("arr1");
+    array_column.set_type(FieldType::OLAP_FIELD_TYPE_ARRAY);
+    array_column.set_length(0);
+    array_column.set_index_length(0);
+    array_column.set_is_nullable(false);
+    TabletColumn child_column;
+    child_column.set_name("arr_sub_string");
+    child_column.set_type(FieldType::OLAP_FIELD_TYPE_STRING);
+    child_column.set_length(INT_MAX);
+    array_column.add_sub_column(child_column);
+    tablet_schema->append_column(array_column);
+
+    auto index_meta_pb = std::make_unique<TabletIndexPB>();
+    index_meta_pb->set_index_type(IndexType::INVERTED);
+    index_meta_pb->set_index_id(1);
+    index_meta_pb->set_index_name("test");
+    index_meta_pb->clear_col_unique_id();
+    index_meta_pb->add_col_unique_id(0);
+    (*index_meta_pb->mutable_properties())["parser"] = "standard";
+    TabletIndex idx_meta;
+    idx_meta.init_from_pb(*index_meta_pb.get());
+
+    std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+            local_segment_path(kTestDir, "test_tokenized_array_nul", 0))};
+    std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+    io::FileWriterPtr file_writer;
+    io::FileWriterOptions opts;
+    auto fs = io::global_local_filesystem();
+    Status sts = fs->create_file(index_path, &file_writer, &opts);
+    ASSERT_TRUE(sts.ok()) << sts;
+    auto index_file_writer = std::make_unique<IndexFileWriter>(
+            fs, index_path_prefix, "test_tokenized_array_nul", 0, InvertedIndexStorageFormatPB::V2,
+            std::move(file_writer));
+
+    const TabletColumn* field = &(array_column);
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status =
+            IndexColumnWriter::create(field, &column_writer, index_file_writer.get(), &idx_meta);
+    ASSERT_TRUE(status.ok()) << status;
+
+    // Array 1: ["Hello", "ab\0cdef"]; array 2: ["x\0\0y"]; array 3: ["zzzz"].
+    Array a1, a2, a3;
+    a1.push_back(Field::create_field<TYPE_STRING>("Hello"));
+    a1.push_back(Field::create_field<TYPE_STRING>(std::string("ab\0cdef", 7)));
+    a2.push_back(Field::create_field<TYPE_STRING>(std::string("x\0\0y", 4)));
+    a3.push_back(Field::create_field<TYPE_STRING>("zzzz"));
+    DataTypePtr inner_string_type =
+            std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+    DataTypePtr array_type = std::make_shared<DataTypeArray>(inner_string_type);
+    MutableColumnPtr col = array_type->create_column();
+    col->insert(Field::create_field<TYPE_ARRAY>(a1));
+    col->insert(Field::create_field<TYPE_ARRAY>(a2));
+    col->insert(Field::create_field<TYPE_ARRAY>(a3));
+    ColumnPtr column_array = std::move(col);
+    Block block;
+    block.insert(ColumnWithTypeAndName(column_array, array_type, "arr1"));
+
+    OlapBlockDataConvertor convertor(tablet_schema.get(), {0});
+    convertor.set_source_content(&block, 0, block.rows());
+    auto [st, accessor] = convertor.convert_column_data(0);
+    ASSERT_EQ(st, Status::OK());
+    const auto* data_ptr = reinterpret_cast<const uint64_t*>(accessor->get_data());
+    const auto* offsets_ptr = reinterpret_cast<const uint8_t*>(data_ptr[1]);
+    const void* item_data = reinterpret_cast<const void*>(data_ptr[2]);
+    const auto* item_nullmap = reinterpret_cast<const uint8_t*>(data_ptr[3]);
+    auto field_size = field_type_size(field->get_sub_column(0).type());
+
+    status = column_writer->add_array_values(field_size, item_data, item_nullmap, offsets_ptr,
+                                             block.rows());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->add_array_nulls(accessor->get_nullmap(), block.rows());
+    EXPECT_TRUE(status.ok()) << status;
+    status = column_writer->finish();
+    EXPECT_TRUE(status.ok()) << status;
+    ASSERT_TRUE(index_file_writer->begin_close().ok());
+    ASSERT_TRUE(index_file_writer->finish_close().ok());
+
+    ExpectedDocMap expected {{"hello", {0}}, {"ab", {0}}, {"cdef", {0}},
+                             {"x", {1}},     {"y", {1}},  {"zzzz", {2}}};
+    std::set<std::string> seen_terms;
+    check_terms_stats(index_path_prefix, &expected, {}, InvertedIndexStorageFormatPB::V2, &idx_meta,
+                      &seen_terms);
+    for (const auto& [term, docs] : expected) {
+        EXPECT_TRUE(seen_terms.contains(term)) << "missing term: " << term;
+    }
+    for (const auto& term : seen_terms) {
+        EXPECT_EQ(term.find('\0'), std::string::npos) << "term holds a NUL: " << term;
+    }
 }
 
 } // namespace doris::segment_v2

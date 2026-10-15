@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "storage/index/inverted/inverted_index_writer.h"
+
 #include <bvar/bvar.h>
 
+#include <algorithm>
 #include <cstring>
-#include "storage/index/inverted/inverted_index_writer.h"
+#include <list>
+#include <string>
 
 #include "storage/index/inverted/analyzer/analyzer.h"
 #include "storage/index/inverted/inverted_index_common.h"
@@ -266,6 +270,30 @@ bool skip_untokenized_term_with_nul(const Slice& v, const std::wstring& field_na
     return false;
 }
 
+bvar::Adder<uint64_t> g_inverted_index_nul_values_sanitized("inverted_index_nul_values_sanitized");
+
+// A tokenizer can keep a NUL byte inside a token (the ngram tokenizer treats every character as a
+// token character), and CLucene rejects such a term the same way it rejects an untokenized one.
+// A tokenized value is therefore analyzed with every NUL replaced by a space, so a NUL separates
+// tokens; the stored value is unchanged. Returns `v` itself when it holds no NUL, otherwise a
+// slice over `buf`, which must outlive the token stream that reads it.
+Slice nul_free_value_for_analyzer(const Slice& v, std::string* buf,
+                                  const std::wstring& field_name) {
+    const auto* nul = static_cast<const char*>(memchr(v.get_data(), '\0', v.get_size()));
+    if (nul == nullptr) {
+        return v;
+    }
+    const size_t nul_at = nul - v.get_data();
+    g_inverted_index_nul_values_sanitized << 1;
+    LOG_EVERY_N(WARNING, 1000)
+            << "inverted index analyzes NUL bytes as spaces in a tokenized value, field="
+            << std::string(field_name.begin(), field_name.end()) << ", size=" << v.get_size()
+            << ", nul_at=" << nul_at;
+    buf->assign(v.get_data(), v.get_size());
+    std::replace(buf->begin() + nul_at, buf->end(), '\0', ' ');
+    return {buf->data(), buf->size()};
+}
+
 } // namespace
 
 template <FieldType field_type>
@@ -402,6 +430,7 @@ Status InvertedIndexColumnWriter<field_type>::add_values(const std::string fn, c
             return Status::InternalError("field or index writer is null in inverted index writer");
         }
         const auto* v = (Slice*)values;
+        std::string nul_free_value;
         for (size_t i = 0; i < count; ++i) {
             // only ignore_above UNTOKENIZED strings and empty strings not tokenized
             if ((!_should_analyzer && (v->get_size() > _ignore_above ||
@@ -409,7 +438,10 @@ Status InvertedIndexColumnWriter<field_type>::add_values(const std::string fn, c
                 (_should_analyzer && v->empty())) {
                 RETURN_IF_ERROR(add_null_document());
             } else {
-                RETURN_IF_ERROR(new_inverted_index_field(v->get_data(), v->get_size()));
+                const Slice indexed = _should_analyzer ? nul_free_value_for_analyzer(
+                                                                 *v, &nul_free_value, _field_name)
+                                                       : *v;
+                RETURN_IF_ERROR(new_inverted_index_field(indexed.get_data(), indexed.get_size()));
                 RETURN_IF_ERROR(add_document());
             }
             ++v;
@@ -441,6 +473,8 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
         }
         size_t start_off = 0;
         std::vector<ReaderPtr> keep_readers;
+        // A list keeps each copy's address stable while its reader still points into it.
+        std::list<std::string> keep_nul_free_values;
         for (size_t i = 0; i < count; ++i) {
             // nullmap & value ptr-array may not from offsets[i] because olap_convertor make offsets accumulate from _base_offset which may not is 0, but nullmap & value in this segment is from 0, we only need
             // every single array row element size to go through the nullmap & value ptr-array, and also can go through the every row in array to keep with _rid++
@@ -483,8 +517,13 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
                         bool own_token_stream = true;
                         ReaderPtr char_string_reader = DORIS_TRY(
                                 create_char_string_reader(_analyzer_config.char_filter_map));
-                        char_string_reader->init(v->get_data(), cast_set<int32_t>(v->get_size()),
-                                                 false);
+                        Slice analyzed = *v;
+                        if (memchr(v->get_data(), '\0', v->get_size()) != nullptr) {
+                            analyzed = nul_free_value_for_analyzer(
+                                    *v, &keep_nul_free_values.emplace_back(), _field_name);
+                        }
+                        char_string_reader->init(analyzed.get_data(),
+                                                 cast_set<int32_t>(analyzed.get_size()), false);
                         ts = _analyzer->tokenStream(new_field->name(), char_string_reader);
                         new_field->setValue(ts, own_token_stream);
                         keep_readers.emplace_back(std::move(char_string_reader));
@@ -540,6 +579,7 @@ Status InvertedIndexColumnWriter<field_type>::add_array_values(size_t field_size
             }
             _rid++;
             keep_readers.clear();
+            keep_nul_free_values.clear();
         }
     } else if constexpr (field_is_numeric_type(field_type)) {
         size_t start_off = 0;
