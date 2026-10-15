@@ -4041,10 +4041,367 @@ public:
         }
     }
 
+    // Values holding a NUL byte are left out of an untokenized index, so lookups for them and
+    // pattern queries must decline (EVALUATE_SKIPPED) and be evaluated on the data, while plain
+    // lookups keep using the index and the null bitmap keeps only real NULLs.
+    void test_untokenized_nul_terms_read() {
+        std::string_view rowset_id = "test_untokenized_nul";
+        int seg_id = 0;
+
+        TabletIndex idx_meta;
+        auto index_meta_pb = std::make_unique<TabletIndexPB>();
+        index_meta_pb->set_index_type(IndexType::INVERTED);
+        index_meta_pb->set_index_id(1);
+        index_meta_pb->set_index_name("test_untokenized_nul");
+        index_meta_pb->add_col_unique_id(1);
+        idx_meta.init_from_pb(*index_meta_pb.get());
+
+        // rows: 0 "ok", 1 "ab\0cd", 2 "a\0\0b", 3 "trail\0", 4 "", 5 "trail", 6 "ab", 7 NULL
+        const std::string inner_nul("ab\0cd", 5);
+        const std::string double_nul("a\0\0b", 4);
+        const std::string trailing_nul("trail\0", 6);
+        std::vector<Slice> values = {Slice("ok"),         Slice(inner_nul), Slice(double_nul),
+                                     Slice(trailing_nul), Slice(""),        Slice("trail"),
+                                     Slice("ab")};
+
+        auto tablet_schema = create_schema();
+        std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+                local_segment_path(kTestDir, rowset_id, seg_id))};
+        {
+            std::string index_path =
+                    InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+            io::FileWriterPtr file_writer;
+            io::FileWriterOptions opts;
+            auto fs = io::global_local_filesystem();
+            ASSERT_TRUE(fs->create_file(index_path, &file_writer, &opts).ok());
+            auto index_file_writer = std::make_unique<IndexFileWriter>(
+                    fs, index_path_prefix, std::string {rowset_id}, seg_id,
+                    InvertedIndexStorageFormatPB::V2, std::move(file_writer));
+            std::unique_ptr<IndexColumnWriter> column_writer;
+            ASSERT_TRUE(IndexColumnWriter::create(&tablet_schema->column(1), &column_writer,
+                                                  index_file_writer.get(), &idx_meta)
+                                .ok());
+            auto st = column_writer->add_values("c2", values.data(), values.size());
+            ASSERT_TRUE(st.ok()) << st;
+            st = column_writer->add_nulls(1);
+            ASSERT_TRUE(st.ok()) << st;
+            ASSERT_TRUE(column_writer->finish().ok());
+            ASSERT_TRUE(index_file_writer->begin_close().ok());
+            ASSERT_TRUE(index_file_writer->finish_close().ok());
+        }
+
+        auto file_reader = std::make_shared<IndexFileReader>(
+                io::global_local_filesystem(), index_path_prefix, InvertedIndexStorageFormatPB::V2);
+        ASSERT_TRUE(file_reader->init().ok());
+        auto str_reader = StringTypeInvertedIndexReader::create_shared(&idx_meta, file_reader);
+
+        OlapReaderStatistics stats;
+        RuntimeState runtime_state;
+        TQueryOptions query_options;
+        query_options.enable_inverted_index_searcher_cache = false;
+        query_options.enable_inverted_index_query_cache = false;
+        runtime_state.set_query_options(query_options);
+        io::IOContext io_ctx;
+        auto context = std::make_shared<IndexQueryContext>();
+        context->io_ctx = &io_ctx;
+        context->stats = &stats;
+        context->runtime_state = &runtime_state;
+
+        // V2 index files name the field after the column unique id
+        const std::string field_name = "1";
+        auto query = [&](const std::string& value, InvertedIndexQueryType type,
+                         std::shared_ptr<roaring::Roaring>* bitmap) {
+            *bitmap = std::make_shared<roaring::Roaring>();
+            Field qp = Field::create_field<TYPE_STRING>(value);
+            return str_reader->query(context, field_name, qp, type, *bitmap);
+        };
+        auto expect_rows = [&](const std::string& value, InvertedIndexQueryType type,
+                               std::vector<uint32_t> rows) {
+            std::shared_ptr<roaring::Roaring> bitmap;
+            auto st = query(value, type, &bitmap);
+            ASSERT_TRUE(st.ok()) << st;
+            roaring::Roaring expected;
+            expected.addMany(rows.size(), rows.data());
+            EXPECT_EQ(*bitmap, expected)
+                    << "query value size " << value.size() << ", got " << bitmap->toString();
+        };
+        auto expect_skipped = [&](const std::string& value, InvertedIndexQueryType type) {
+            std::shared_ptr<roaring::Roaring> bitmap;
+            auto st = query(value, type, &bitmap);
+            EXPECT_EQ(st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED)
+                    << "query value size " << value.size() << ": " << st;
+        };
+
+        // Plain lookups are answered by the index, and no NUL-holding row is conflated with
+        // the text before its NUL.
+        expect_rows("ok", InvertedIndexQueryType::EQUAL_QUERY, {0});
+        expect_rows("trail", InvertedIndexQueryType::EQUAL_QUERY, {5});
+        expect_rows("ab", InvertedIndexQueryType::EQUAL_QUERY, {6});
+        expect_rows("a", InvertedIndexQueryType::EQUAL_QUERY, {});
+        expect_rows("", InvertedIndexQueryType::EQUAL_QUERY, {4});
+        expect_rows("ok", InvertedIndexQueryType::MATCH_ANY_QUERY, {0});
+
+        // Lookups for values holding a NUL byte decline, whatever the NUL position.
+        for (const auto& v : {inner_nul, double_nul, trailing_nul, std::string("\0", 1)}) {
+            expect_skipped(v, InvertedIndexQueryType::EQUAL_QUERY);
+            expect_skipped(v, InvertedIndexQueryType::MATCH_ANY_QUERY);
+            expect_skipped(v, InvertedIndexQueryType::MATCH_ALL_QUERY);
+            expect_skipped(v, InvertedIndexQueryType::MATCH_PHRASE_QUERY);
+        }
+
+        // Known limitation, as with ignore_above: index-served prefix and regexp patterns only
+        // see indexed terms, so the rows left out ("ab\0cd", "trail\0") are not found.
+        expect_rows("ab", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, {6});
+        expect_rows("tr", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, {5});
+
+        // The same decline reaches callers through the index iterator, which every column
+        // predicate and index-evaluated function uses.
+        std::unique_ptr<IndexIterator> iterator;
+        ASSERT_TRUE(str_reader->new_iterator(&iterator).ok());
+        auto* inverted_iterator = static_cast<InvertedIndexIterator*>(iterator.get());
+        inverted_iterator->set_context(context);
+        InvertedIndexParam param;
+        param.column_name = field_name;
+        param.query_value = Field::create_field<TYPE_STRING>(inner_nul);
+        param.query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        param.num_rows = 8;
+        param.roaring = std::make_shared<roaring::Roaring>();
+        auto st = iterator->read_from_index(&param);
+        EXPECT_EQ(st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << st;
+        param.query_value = Field::create_field<TYPE_STRING>(std::string("ok"));
+        param.roaring = std::make_shared<roaring::Roaring>();
+        st = iterator->read_from_index(&param);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(*param.roaring, roaring::Roaring::bitmapOf(1, 0));
+
+        // Rows left out of the index are not NULL: a NOT EQUAL computed as the complement of
+        // the equal bitmap minus the null bitmap keeps them.
+        InvertedIndexQueryCacheHandle null_handle;
+        ASSERT_TRUE(str_reader->read_null_bitmap(context, &null_handle, nullptr).ok());
+        auto null_bitmap = null_handle.get_bitmap();
+        ASSERT_NE(null_bitmap, nullptr);
+        EXPECT_EQ(*null_bitmap, roaring::Roaring::bitmapOf(1, 7));
+        roaring::Roaring not_equal_ok;
+        not_equal_ok.addRange(0, 8);
+        not_equal_ok -= *null_bitmap;
+        not_equal_ok -= *param.roaring;
+        EXPECT_EQ(not_equal_ok, roaring::Roaring::bitmapOf(6, 1, 2, 3, 4, 5, 6));
+
+        // ignore_above keeps its own query-length decline.
+        {
+            TabletIndex ia_meta;
+            auto ia_pb = std::make_unique<TabletIndexPB>();
+            ia_pb->set_index_type(IndexType::INVERTED);
+            ia_pb->set_index_id(2);
+            ia_pb->set_index_name("test_untokenized_nul_ignore_above");
+            ia_pb->add_col_unique_id(1);
+            ia_pb->mutable_properties()->insert({"ignore_above", "5"});
+            ia_meta.init_from_pb(*ia_pb.get());
+            std::vector<Slice> ia_values = {Slice("short"), Slice("longer_than_five")};
+            std::string ia_prefix;
+            prepare_string_index("test_untokenized_nul_ia", 0, ia_values, &ia_meta, &ia_prefix);
+            auto ia_file_reader = std::make_shared<IndexFileReader>(
+                    io::global_local_filesystem(), ia_prefix, InvertedIndexStorageFormatPB::V2);
+            ASSERT_TRUE(ia_file_reader->init().ok());
+            auto ia_reader = StringTypeInvertedIndexReader::create_shared(&ia_meta, ia_file_reader);
+            auto bitmap = std::make_shared<roaring::Roaring>();
+            Field qp = Field::create_field<TYPE_STRING>(std::string("short"));
+            ASSERT_TRUE(ia_reader
+                                ->query(context, field_name, qp,
+                                        InvertedIndexQueryType::EQUAL_QUERY, bitmap)
+                                .ok());
+            EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 0));
+            bitmap = std::make_shared<roaring::Roaring>();
+            qp = Field::create_field<TYPE_STRING>(std::string("longer_than_five"));
+            auto ia_st = ia_reader->query(context, field_name, qp,
+                                          InvertedIndexQueryType::EQUAL_QUERY, bitmap);
+            EXPECT_EQ(ia_st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << ia_st;
+        }
+    }
+
+    // Writes `before`, then `nulls` SQL NULL rows, then `after` into an untokenized index on c2 and
+    // returns a reader over it.
+    std::shared_ptr<StringTypeInvertedIndexReader> write_untokenized_index(
+            std::string_view rowset_id, TabletIndex* idx_meta, std::vector<Slice> before,
+            uint32_t nulls, std::vector<Slice> after) {
+        auto tablet_schema = create_schema();
+        std::string index_path_prefix {InvertedIndexDescriptor::get_index_file_path_prefix(
+                local_segment_path(kTestDir, rowset_id, 0))};
+        std::string index_path = InvertedIndexDescriptor::get_index_file_path_v2(index_path_prefix);
+        io::FileWriterPtr file_writer;
+        io::FileWriterOptions opts;
+        auto fs = io::global_local_filesystem();
+        EXPECT_TRUE(fs->create_file(index_path, &file_writer, &opts).ok());
+        auto index_file_writer = std::make_unique<IndexFileWriter>(
+                fs, index_path_prefix, std::string {rowset_id}, 0, InvertedIndexStorageFormatPB::V2,
+                std::move(file_writer));
+        std::unique_ptr<IndexColumnWriter> column_writer;
+        EXPECT_TRUE(IndexColumnWriter::create(&tablet_schema->column(1), &column_writer,
+                                              index_file_writer.get(), idx_meta)
+                            .ok());
+        if (!before.empty()) {
+            EXPECT_TRUE(column_writer->add_values("c2", before.data(), before.size()).ok());
+        }
+        if (nulls > 0) {
+            EXPECT_TRUE(column_writer->add_nulls(nulls).ok());
+        }
+        if (!after.empty()) {
+            EXPECT_TRUE(column_writer->add_values("c2", after.data(), after.size()).ok());
+        }
+        EXPECT_TRUE(column_writer->finish().ok());
+        EXPECT_TRUE(index_file_writer->begin_close().ok());
+        EXPECT_TRUE(index_file_writer->finish_close().ok());
+
+        auto file_reader = std::make_shared<IndexFileReader>(
+                io::global_local_filesystem(), index_path_prefix, InvertedIndexStorageFormatPB::V2);
+        EXPECT_TRUE(file_reader->init().ok());
+        return StringTypeInvertedIndexReader::create_shared(idx_meta, file_reader);
+    }
+
+    // A NUL in any position, a value of NULs only, and the empty string; valid rows before and
+    // after left-out rows and SQL NULLs keep their row ids.
+    void test_untokenized_nul_positions_and_row_ids() {
+        TabletIndex idx_meta;
+        auto index_meta_pb = std::make_unique<TabletIndexPB>();
+        index_meta_pb->set_index_type(IndexType::INVERTED);
+        index_meta_pb->set_index_id(1);
+        index_meta_pb->set_index_name("test_untokenized_nul_positions");
+        index_meta_pb->add_col_unique_id(1);
+        idx_meta.init_from_pb(*index_meta_pb.get());
+
+        // rows: 0 "x", 1 "\0ab", 2 "\0\0", 3 "\0", 4 "", 5 "a\0b", 6 "y", 7 NULL, 8 NULL,
+        //       9 "ab\0", 10 "z"
+        const std::string leading("\0ab", 3);
+        const std::string all_nul("\0\0", 2);
+        const std::string one_nul("\0", 1);
+        const std::string interior("a\0b", 3);
+        const std::string trailing("ab\0", 3);
+        auto str_reader =
+                write_untokenized_index("test_untokenized_nul_positions", &idx_meta,
+                                        {Slice("x"), Slice(leading), Slice(all_nul), Slice(one_nul),
+                                         Slice(""), Slice(interior), Slice("y")},
+                                        2, {Slice(trailing), Slice("z")});
+
+        OlapReaderStatistics stats;
+        RuntimeState runtime_state;
+        TQueryOptions query_options;
+        query_options.enable_inverted_index_searcher_cache = false;
+        query_options.enable_inverted_index_query_cache = false;
+        runtime_state.set_query_options(query_options);
+        io::IOContext io_ctx;
+        auto context = std::make_shared<IndexQueryContext>();
+        context->io_ctx = &io_ctx;
+        context->stats = &stats;
+        context->runtime_state = &runtime_state;
+
+        const std::string field_name = "1";
+        auto query = [&](const std::string& value, std::shared_ptr<roaring::Roaring>* bitmap) {
+            *bitmap = std::make_shared<roaring::Roaring>();
+            Field qp = Field::create_field<TYPE_STRING>(value);
+            return str_reader->query(context, field_name, qp, InvertedIndexQueryType::EQUAL_QUERY,
+                                     *bitmap);
+        };
+        std::shared_ptr<roaring::Roaring> bitmap;
+        for (const auto& [value, row] : std::vector<std::pair<std::string, uint32_t>> {
+                     {"x", 0}, {"", 4}, {"y", 6}, {"z", 10}}) {
+            auto st = query(value, &bitmap);
+            ASSERT_TRUE(st.ok()) << st;
+            EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, row)) << "value: " << value;
+        }
+        // No left-out value is found under the text around its NULs.
+        for (const std::string value : {"ab", "a", "b"}) {
+            auto st = query(value, &bitmap);
+            ASSERT_TRUE(st.ok()) << st;
+            EXPECT_TRUE(bitmap->isEmpty()) << value << ": " << bitmap->toString();
+        }
+        for (const auto& value : {leading, all_nul, one_nul, interior, trailing}) {
+            auto st = query(value, &bitmap);
+            EXPECT_EQ(st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED)
+                    << "value size " << value.size() << ": " << st;
+        }
+
+        InvertedIndexQueryCacheHandle null_handle;
+        ASSERT_TRUE(str_reader->read_null_bitmap(context, &null_handle, nullptr).ok());
+        auto null_bitmap = null_handle.get_bitmap();
+        ASSERT_NE(null_bitmap, nullptr);
+        EXPECT_EQ(*null_bitmap, roaring::Roaring::bitmapOf(2, 7, 8));
+    }
+
+    // ignore_above keeps a value exactly at the limit and leaves out one byte more; a NUL-holding
+    // value under the limit is left out too. Index-served prefix queries only see indexed terms.
+    void test_untokenized_ignore_above_boundary() {
+        TabletIndex idx_meta;
+        auto index_meta_pb = std::make_unique<TabletIndexPB>();
+        index_meta_pb->set_index_type(IndexType::INVERTED);
+        index_meta_pb->set_index_id(1);
+        index_meta_pb->set_index_name("test_untokenized_ignore_above_boundary");
+        index_meta_pb->add_col_unique_id(1);
+        index_meta_pb->mutable_properties()->insert({"ignore_above", "5"});
+        idx_meta.init_from_pb(*index_meta_pb.get());
+
+        // rows: 0 "12345" (at the limit), 1 "123456" (limit + 1), 2 "1234", 3 "12\0", 4 "12"
+        const std::string with_nul("12\0", 3);
+        auto str_reader = write_untokenized_index(
+                "test_untokenized_ignore_above_boundary", &idx_meta,
+                {Slice("12345"), Slice("123456"), Slice("1234"), Slice(with_nul), Slice("12")}, 0,
+                {});
+
+        OlapReaderStatistics stats;
+        RuntimeState runtime_state;
+        TQueryOptions query_options;
+        query_options.enable_inverted_index_searcher_cache = false;
+        query_options.enable_inverted_index_query_cache = false;
+        runtime_state.set_query_options(query_options);
+        io::IOContext io_ctx;
+        auto context = std::make_shared<IndexQueryContext>();
+        context->io_ctx = &io_ctx;
+        context->stats = &stats;
+        context->runtime_state = &runtime_state;
+
+        const std::string field_name = "1";
+        auto query = [&](const std::string& value, InvertedIndexQueryType type,
+                         std::shared_ptr<roaring::Roaring>* bitmap) {
+            *bitmap = std::make_shared<roaring::Roaring>();
+            Field qp = Field::create_field<TYPE_STRING>(value);
+            return str_reader->query(context, field_name, qp, type, *bitmap);
+        };
+        std::shared_ptr<roaring::Roaring> bitmap;
+        auto st = query("12345", InvertedIndexQueryType::EQUAL_QUERY, &bitmap);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 0));
+        st = query("1234", InvertedIndexQueryType::EQUAL_QUERY, &bitmap);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 2));
+        st = query("12", InvertedIndexQueryType::EQUAL_QUERY, &bitmap);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(1, 4));
+        st = query("123456", InvertedIndexQueryType::EQUAL_QUERY, &bitmap);
+        EXPECT_EQ(st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << st;
+        st = query(with_nul, InvertedIndexQueryType::EQUAL_QUERY, &bitmap);
+        EXPECT_EQ(st.code(), ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED) << st;
+        // Known limitation: the left-out "123456" and "12\0" are not found by an index-served
+        // prefix query.
+        st = query("12", InvertedIndexQueryType::MATCH_PHRASE_PREFIX_QUERY, &bitmap);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(*bitmap, roaring::Roaring::bitmapOf(3, 0, 2, 4));
+    }
+
 private:
     std::unique_ptr<InvertedIndexSearcherCache> _inverted_index_searcher_cache;
     std::unique_ptr<InvertedIndexQueryCache> _inverted_index_query_cache;
 };
+
+TEST_F(InvertedIndexReaderTest, UntokenizedNulTermsRead) {
+    test_untokenized_nul_terms_read();
+}
+
+TEST_F(InvertedIndexReaderTest, UntokenizedNulPositionsAndRowIds) {
+    test_untokenized_nul_positions_and_row_ids();
+}
+
+TEST_F(InvertedIndexReaderTest, UntokenizedIgnoreAboveBoundary) {
+    test_untokenized_ignore_above_boundary();
+}
 
 // String index reading test
 TEST_F(InvertedIndexReaderTest, StringIndexRead) {

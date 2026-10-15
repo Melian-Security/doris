@@ -24,6 +24,7 @@
 #include "runtime/runtime_state.h"
 #include "storage/index/index_reader_helper.h"
 #include "storage/index/inverted/analyzer/analyzer.h"
+#include "storage/index/inverted/inverted_index_common.h"
 #include "util/debug_points.h"
 
 namespace doris {
@@ -216,10 +217,12 @@ std::vector<segment_v2::TermInfo> FunctionMatchBase::analyse_query_str_token(
         return query_tokens;
     }
 
-    // Tokenize using the analyzer
+    // Tokenize using the analyzer, with NUL bytes as spaces as the index does
+    std::string nul_free;
+    auto query_str = segment_v2::nul_as_space_for_analyzer(match_query_str, &nul_free);
     auto reader = doris::segment_v2::inverted_index::InvertedIndexAnalyzer::create_reader(
             analyzer_ctx->char_filter_map);
-    reader->init(match_query_str.data(), (int)match_query_str.size(), true);
+    reader->init(query_str.data(), (int)query_str.size(), true);
     query_tokens = doris::segment_v2::inverted_index::InvertedIndexAnalyzer::get_analyse_result(
             reader, analyzer_ctx->analyzer.get());
     return query_tokens;
@@ -237,6 +240,8 @@ inline std::vector<segment_v2::TermInfo> FunctionMatchBase::analyse_data_token(
     // Determine tokenization strategy based on parser_type
     const bool should_tokenize =
             analyzer_ctx->should_tokenize() && analyzer_ctx->analyzer != nullptr;
+    // Values are analyzed with NUL bytes as spaces, as the index analyzes them
+    std::string nul_free;
 
     if (array_offsets) {
         for (auto next_src_array_offset = (*array_offsets)[current_block_row_idx];
@@ -246,9 +251,11 @@ inline std::vector<segment_v2::TermInfo> FunctionMatchBase::analyse_data_token(
                 data_tokens.emplace_back(str_ref.to_string());
                 continue;
             }
+            auto value = segment_v2::nul_as_space_for_analyzer(
+                    std::string_view(str_ref.data, str_ref.size), &nul_free);
             auto reader = doris::segment_v2::inverted_index::InvertedIndexAnalyzer::create_reader(
                     analyzer_ctx->char_filter_map);
-            reader->init(str_ref.data, (int)str_ref.size, true);
+            reader->init(value.data(), (int)value.size(), true);
             data_tokens =
                     doris::segment_v2::inverted_index::InvertedIndexAnalyzer::get_analyse_result(
                             reader, analyzer_ctx->analyzer.get());
@@ -258,9 +265,11 @@ inline std::vector<segment_v2::TermInfo> FunctionMatchBase::analyse_data_token(
         if (!should_tokenize) {
             data_tokens.emplace_back(str_ref.to_string());
         } else {
+            auto value = segment_v2::nul_as_space_for_analyzer(
+                    std::string_view(str_ref.data, str_ref.size), &nul_free);
             auto reader = doris::segment_v2::inverted_index::InvertedIndexAnalyzer::create_reader(
                     analyzer_ctx->char_filter_map);
-            reader->init(str_ref.data, (int)str_ref.size, true);
+            reader->init(value.data(), (int)value.size(), true);
             data_tokens =
                     doris::segment_v2::inverted_index::InvertedIndexAnalyzer::get_analyse_result(
                             reader, analyzer_ctx->analyzer.get());

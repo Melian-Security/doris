@@ -17,9 +17,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace lucene {
 namespace store {
@@ -61,6 +65,27 @@ TermDocsPtr make_term_doc_ptr(lucene::index::IndexReader* reader, Args&&... args
 
 template <typename... Args>
 TermPositionsPtr make_term_positions_ptr(lucene::index::IndexReader* reader, Args&&... args);
+
+// CLucene keeps term text NUL-terminated, so an untokenized term holding a NUL byte has no
+// faithful representation: a NUL followed by other bytes makes the writer throw, and trailing
+// NULs are cut off, which would index "a\0" under the term "a". The writer leaves such a value
+// out of an untokenized index, and the reader must not answer a lookup for one from the index.
+inline bool untokenized_term_has_nul(std::string_view term) {
+    return !term.empty() && std::memchr(term.data(), '\0', term.size()) != nullptr;
+}
+
+// A tokenizer can keep a NUL byte inside a token, which CLucene cannot store or look up, so a
+// tokenized value and a query against a tokenized index are both analyzed with every NUL byte
+// replaced by a space. Returns `value` itself when it holds no NUL, otherwise a view of `buf`.
+inline std::string_view nul_as_space_for_analyzer(std::string_view value, std::string* buf) {
+    const size_t nul_at = value.find('\0');
+    if (nul_at == std::string_view::npos) {
+        return value;
+    }
+    buf->assign(value);
+    std::replace(buf->begin() + static_cast<std::ptrdiff_t>(nul_at), buf->end(), '\0', ' ');
+    return *buf;
+}
 
 struct ErrorContext {
     std::string err_msg;

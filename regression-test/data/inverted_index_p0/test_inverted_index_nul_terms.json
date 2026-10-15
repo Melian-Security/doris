@@ -1,0 +1,9 @@
+{"id":1,"s":"ok","t":"hello ok","g":"hello ok","arr_hex":"6F6B,78","v":{"k":"ok"}}
+{"id":2,"s":"ab\u0000cd","t":"ab\u0000cd","g":"ab\u0000cd","arr_hex":"6162006364","v":{"k":"ab\u0000cd"}}
+{"id":3,"s":"a\u0000\u0000b","t":"hello\u0000world","g":"hello\u0000world","arr_hex":"6F6B,61000062","v":{"k":"a\u0000\u0000b"}}
+{"id":4,"s":"trail\u0000","t":"trail\u0000","g":"trail\u0000","arr_hex":"747261696C00","v":{"k":"trail\u0000"}}
+{"id":5,"s":"","t":"","g":"","arr_hex":"","v":{"k":""}}
+{"id":6,"s":null,"t":null,"g":null,"arr_hex":null,"v":{"k":null}}
+{"id":7,"s":"trail","t":"trail","g":"trail","arr_hex":"747261696C","v":{"k":"trail"}}
+{"id":8,"s":"ab","t":"ab","g":"ab","arr_hex":"6162006364,6162","v":{"k":"ab"}}
+{"id":12,"s":"zz","t":"zz","g":"zz","arr_hex":"7A7A","v":{"k":"zz"}}
