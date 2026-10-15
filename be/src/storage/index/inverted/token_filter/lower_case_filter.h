@@ -19,13 +19,16 @@
 
 #include <unicode/ucasemap.h>
 
+#include <optional>
+#include <string_view>
+
 #include "storage/index/inverted/token_filter/token_filter.h"
 
 namespace doris::segment_v2::inverted_index {
 
 /**
  * @brief A token filter that converts Unicode text to lowercase using ICU library.
- * 
+ *
  * This filter handles full Unicode case conversion, not just ASCII characters.
  * It uses ICU's ucasemap functionality to properly handle case folding for all Unicode characters.
  */
@@ -51,8 +54,35 @@ public:
         if (_in->next(t) == nullptr) {
             return nullptr;
         }
-        std::string_view term(t->termBuffer<char>(), t->termLength<char>());
+        auto lower = to_lower(std::string_view(t->termBuffer<char>(), t->termLength<char>()));
+        if (!lower.has_value()) {
+            return nullptr;
+        }
+        set_text(t, *lower);
+        return t;
+    }
 
+    void reset() override { DorisTokenFilter::reset(); }
+
+private:
+    // Returns the lower-cased term in a buffer the next call reuses, or nullopt when ICU fails.
+    // In ASCII only 'A'-'Z' have a lower-case mapping, so a term without a byte >= 0x80 is
+    // lower-cased bytewise to the same bytes ICU produces; any other term goes through ICU.
+    std::optional<std::string_view> to_lower(std::string_view term) {
+        if (!is_ascii(term)) {
+            return to_lower_with_icu(term);
+        }
+        if (_lower_term.size() < term.size()) {
+            _lower_term.resize(term.size());
+        }
+        for (size_t i = 0; i < term.size(); ++i) {
+            const char c = term[i];
+            _lower_term[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+        }
+        return std::string_view(_lower_term.data(), term.size());
+    }
+
+    std::optional<std::string_view> to_lower_with_icu(std::string_view term) {
         size_t max_len = term.size() * 2;
         if (_lower_term.size() < max_len) {
             _lower_term.resize(max_len);
@@ -66,16 +96,20 @@ public:
                          << "Term: '" << term << "', "
                          << "ICU Error: " << status << " - " << u_errorName(status)
                          << ", Buffer size: " << max_len << std::endl;
-            return nullptr;
+            return std::nullopt;
         }
-
-        set_text(t, std::string_view(_lower_term.data(), result_len));
-        return t;
+        return std::string_view(_lower_term.data(), result_len);
     }
 
-    void reset() override { DorisTokenFilter::reset(); }
+    static bool is_ascii(std::string_view term) {
+        for (const char c : term) {
+            if (static_cast<unsigned char>(c) >= 0x80) {
+                return false;
+            }
+        }
+        return true;
+    }
 
-private:
     std::unique_ptr<UCaseMap, decltype(&ucasemap_close)> _ucsm;
     std::string _lower_term;
 };

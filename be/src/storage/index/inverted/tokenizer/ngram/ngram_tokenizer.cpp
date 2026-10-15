@@ -138,6 +138,22 @@ std::pair<int32_t, int32_t> NGramTokenizer::to_code_points(const char* char_buff
 }
 
 void NGramTokenizer::to_chars(const std::vector<UChar32>& buffer, int32_t start, int32_t size) {
+    // An ASCII code point is encoded as its own byte, the bytes ICU produces for it; a gram with
+    // any other code point is encoded by ICU.
+    for (int32_t i = start; i < start + size; i++) {
+        if (buffer[i] < 0 || buffer[i] >= 0x80) {
+            to_chars_with_icu(buffer, start, size);
+            return;
+        }
+    }
+    _utf8_buffer.clear();
+    for (int32_t i = start; i < start + size; i++) {
+        _utf8_buffer.push_back(static_cast<char>(buffer[i]));
+    }
+}
+
+void NGramTokenizer::to_chars_with_icu(const std::vector<UChar32>& buffer, int32_t start,
+                                       int32_t size) {
     icu::UnicodeString unistr;
     for (int32_t i = start; i < start + size; i++) {
         unistr.append(buffer[i]);

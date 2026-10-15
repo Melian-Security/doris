@@ -32,6 +32,7 @@
 #include "benchmark_fastunion.hpp"
 #include "benchmark_fmod.hpp"
 #include "benchmark_hll_merge.hpp"
+#include "benchmark_inverted_index_lowercase.hpp"
 #include "benchmark_jemalloc_free_stall.hpp"
 #include "benchmark_local_tablet_writer.hpp"
 #include "benchmark_segment_compression.hpp"
