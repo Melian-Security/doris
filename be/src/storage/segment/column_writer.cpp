@@ -35,6 +35,7 @@
 #include "storage/index/ordinal_page_index.h"
 #include "storage/index/zone_map/zone_map_index.h"
 #include "storage/olap_common.h"
+#include "storage/rowset/rowset_writer_context.h"
 #include "storage/segment/encoding_info.h"
 #include "storage/segment/options.h"
 #include "storage/segment/page_builder.h"
@@ -478,6 +479,25 @@ ScalarColumnWriter::ScalarColumnWriter(const ColumnWriterOptions& opts, TabletCo
     DCHECK(opts.meta->has_compression());
     DCHECK(opts.meta->has_is_nullable());
     DCHECK(file_writer != nullptr);
+    if (_opts.rowset_ctx != nullptr &&
+        !_opts.rowset_ctx->variant_subcolumn_indexes_to_compact.empty() &&
+        get_column()->is_extracted_column()) {
+        const int32_t variant_uid = get_column()->parent_unique_id();
+        const bool is_string = field_is_slice_type(get_column()->type());
+        std::erase_if(_opts.inverted_indexes, [&](const TabletIndex* index) {
+            if (!_opts.rowset_ctx->is_variant_subcolumn_index_compacted(variant_uid, *index)) {
+                return false;
+            }
+            if (is_string) {
+                _opts.rowset_ctx->variant_subcolumn_index_writes->add(
+                        _opts.index_file_writer, index->index_id(), index->get_index_suffix());
+            }
+            return true;
+        });
+        if (_opts.inverted_indexes.empty()) {
+            _opts.need_inverted_index = false;
+        }
+    }
     _inverted_index_builders.resize(_opts.inverted_indexes.size());
 }
 

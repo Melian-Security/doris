@@ -45,6 +45,9 @@
 #include "storage/tablet/tablet_fwd.h"
 
 namespace doris {
+namespace segment_v2 {
+class IndexFileWriter;
+} // namespace segment_v2
 
 class MemTrackerLimiter;
 class RowsetWriter;
@@ -112,6 +115,11 @@ protected:
                                     const std::function<void(int64_t, int64_t)>& error_handler);
 
     void construct_index_compaction_columns(RowsetWriterContext& ctx);
+    void construct_variant_subcolumn_index_compaction(RowsetWriterContext& ctx);
+    Status check_variant_subcolumn_index_outputs(
+            const RowsetWriterContext& ctx,
+            const std::vector<const segment_v2::IndexFileWriter*>& dest_writers,
+            const std::function<void(int64_t, int64_t)>& error_handler);
 
     virtual Status construct_output_rowset_writer(RowsetWriterContext& ctx) = 0;
 
