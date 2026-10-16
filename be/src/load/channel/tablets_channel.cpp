@@ -311,6 +311,8 @@ std::unique_ptr<BaseDeltaWriter> TabletsChannel::create_delta_writer(const Write
 }
 
 Status BaseTabletsChannel::_close_and_notify(std::unique_lock<std::mutex>& lock, int sender_id,
+                                             LoadChannel* parent,
+                                             const PTabletWriterAddBlockRequest& req,
                                              PTabletWriterAddBlockResult* response) {
     DCHECK_EQ(_num_remaining_senders, 0);
     // Stop accepting data before releasing the lock. The arrival barrier allows
@@ -323,7 +325,7 @@ Status BaseTabletsChannel::_close_and_notify(std::unique_lock<std::mutex>& lock,
     _eos_completion->complete(Status::OK());
     lock.lock();
 
-    _close_status = _close_writers(response);
+    _close_status = _close_writers(parent, req, response);
     _final_close_result = std::make_unique<PTabletWriterAddBlockResult>(*response);
     _final_close_in_progress = false;
     _final_close_cv.notify_all();
@@ -374,10 +376,11 @@ Status TabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlockReq
         return Status::OK();
     }
 
-    return _close_and_notify(l, sender_id, res);
+    return _close_and_notify(l, sender_id, parent, req, res);
 }
 
-Status TabletsChannel::_close_writers(PTabletWriterAddBlockResult* res) {
+Status TabletsChannel::_close_writers(LoadChannel* parent, const PTabletWriterAddBlockRequest& req,
+                                      PTabletWriterAddBlockResult* res) {
     auto* tablet_errors = res->mutable_tablet_errors();
     TEST_SYNC_POINT_RETURN_WITH_VALUE("TabletsChannel::close.before_flush", Status::OK(), res);
 

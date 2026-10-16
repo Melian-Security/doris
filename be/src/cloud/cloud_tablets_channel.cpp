@@ -158,10 +158,12 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
         return Status::OK();
     }
 
-    return _close_and_notify(l, sender_id, res);
+    return _close_and_notify(l, sender_id, parent, req, res);
 }
 
-Status CloudTabletsChannel::_close_writers(PTabletWriterAddBlockResult* res) {
+Status CloudTabletsChannel::_close_writers(LoadChannel* /*parent*/,
+                                           const PTabletWriterAddBlockRequest& /*req*/,
+                                           PTabletWriterAddBlockResult* res) {
     auto* tablet_errors = res->mutable_tablet_errors();
     auto* tablet_vec = res->mutable_tablet_vec();
     TEST_SYNC_POINT_RETURN_WITH_VALUE("CloudTabletsChannel::close.before_flush", Status::OK(), res);
