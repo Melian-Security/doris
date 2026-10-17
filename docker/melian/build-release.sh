@@ -184,8 +184,10 @@ for component in fe be ms; do
     label="$(${DOCKER} inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${image}")"
     [[ "${label}" == "${SHA}" ]] || die "${image}: revision label is ${label}"
     echo "build-release: smoke ${image}"
-    ${DOCKER} run --rm --entrypoint bash "${image}" -c "${SMOKE[${component}]}" 2>&1 | head -5 ||
-        die "${image}: smoke check failed"
+    # Capture the output first: cutting the stream short would fail the check on SIGPIPE.
+    smoke_output="$(${DOCKER} run --rm --entrypoint bash "${image}" -c "${SMOKE[${component}]}" 2>&1)" ||
+        die "${image}: smoke check failed: ${smoke_output}"
+    printf '%s\n' "${smoke_output}" | sed -n '1,8p'
 done
 
 for component in fe be ms; do
