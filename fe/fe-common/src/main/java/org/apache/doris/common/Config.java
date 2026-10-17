@@ -803,6 +803,15 @@ public class Config extends ConfigBase {
     })
     public static boolean enable_stream_load_profile = false;
 
+    @ConfField(mutable = true, masterOnly = false, description = {
+            "导入未指定分区时，自动分区表只打开导入行实际落入的分区，而不是打开全部分区",
+            "When a load into an AUTO PARTITION table names no partitions, open only the partitions "
+                    + "its rows land in, resolved on demand like a new partition, instead of every "
+                    + "partition of the table. Applies to Stream Load, Routine Load, Broker/S3 Load and "
+                    + "MySQL Load; not to group commit, partial update or single-replica load, nor to a "
+                    + "table that is not in NORMAL state."})
+    public static boolean enable_auto_partition_lazy_open_for_load = true;
+
     @ConfField(mutable = true, masterOnly = true, description = {
             "是否启用 stream load 和 broker load 的单副本写入。",
             "Whether to enable to write single replica for stream load and broker load."},
