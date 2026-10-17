@@ -4346,10 +4346,14 @@ void MetaServiceImpl::get_prepare_txn_by_coordinator(
             return TxnErrorCode::TXN_INVALID_DATA;
         }
         const auto& coordinate = info_pb.coordinator();
+        // A coordinator recorded with its backend id is matched by that id alone: the address a
+        // backend registers under can differ from the address it connected from, and a restarted
+        // backend may come back on a different address. The address is only used for
+        // coordinators recorded without an id.
+        bool same_coordinator = coordinate.id() != 0 ? coordinate.id() == request->id()
+                                                     : coordinate.ip() == request->ip();
         bool matches = info_pb.status() == TxnStatusPB::TXN_STATUS_PREPARED &&
-                       coordinate.sourcetype() == TXN_SOURCE_TYPE_BE &&
-                       coordinate.ip() == request->ip() &&
-                       (coordinate.id() == 0 || coordinate.id() == request->id());
+                       coordinate.sourcetype() == TXN_SOURCE_TYPE_BE && same_coordinator;
         if (matches && has_start_time_filter) {
             matches = coordinate.start_time() < request->start_time();
         }

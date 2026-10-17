@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -3055,6 +3056,81 @@ TEST(MetaServiceTest, GetPrepareTxnByCoordinatorTest) {
     }
 }
 
+TEST(MetaServiceTest, GetPrepareTxnByCoordinatorMatchesByIdTest) {
+    auto meta_service = get_meta_service();
+    const int64_t db_id = 889;
+    const int64_t table_id = 1000;
+    const std::string cloud_unique_id = "test_cloud_unique_id";
+    const std::string old_ip = "10.30.26.84";
+    const std::string new_ip = "10.30.26.85";
+    const int64_t be_id = 101;
+    const int64_t other_be_id = 202;
+    const int64_t start_time = 1000000;
+
+    auto begin = [&](const std::string& label, int64_t id, const std::string& ip,
+                     int64_t coordinator_start_time) {
+        brpc::Controller cntl;
+        BeginTxnRequest req;
+        BeginTxnResponse res;
+        req.set_cloud_unique_id(cloud_unique_id);
+        auto* info = req.mutable_txn_info();
+        info->set_db_id(db_id);
+        info->set_label(label);
+        info->add_table_ids(table_id);
+        info->set_timeout_ms(36000);
+        auto* coordinator = info->mutable_coordinator();
+        coordinator->set_id(id);
+        coordinator->set_ip(ip);
+        coordinator->set_sourcetype(::doris::cloud::TxnSourceTypePB::TXN_SOURCE_TYPE_BE);
+        coordinator->set_start_time(coordinator_start_time);
+        meta_service->begin_txn(&cntl, &req, &res, nullptr);
+        EXPECT_EQ(res.status().code(), MetaServiceCode::OK);
+        return res.txn_id();
+    };
+    // Begun by backend 101 at its old address, before it restarted.
+    const int64_t restarted_be_txn = begin("match_by_id_old_ip", be_id, old_ip, start_time);
+    // Another backend, recorded at the address the restarted backend came back on.
+    const int64_t other_be_txn = begin("match_by_id_other_be", other_be_id, new_ip, start_time);
+    // A coordinator recorded without a backend id.
+    const int64_t no_id_txn = begin("match_by_id_no_id", 0, old_ip, start_time);
+    // Begun by backend 101 after it restarted.
+    const int64_t after_restart_txn = begin("match_by_id_after_restart", be_id, new_ip,
+                                            start_time + 50);
+
+    auto query = [&](int64_t id, const std::string& ip, int64_t request_start_time) {
+        brpc::Controller cntl;
+        GetPrepareTxnByCoordinatorRequest req;
+        GetPrepareTxnByCoordinatorResponse resp;
+        req.set_cloud_unique_id(cloud_unique_id);
+        req.set_id(id);
+        req.set_ip(ip);
+        if (request_start_time > 0) {
+            req.set_start_time(request_start_time);
+        }
+        meta_service->get_prepare_txn_by_coordinator(&cntl, &req, &resp, nullptr);
+        EXPECT_EQ(resp.status().code(), MetaServiceCode::OK);
+        std::set<int64_t> txn_ids;
+        for (const auto& info : resp.txn_infos()) {
+            txn_ids.insert(info.txn_id());
+        }
+        return txn_ids;
+    };
+
+    // The restarted backend reports its new address: its old transaction matches by id, the other
+    // backend's transaction on that address does not, and the start time still excludes the
+    // transaction begun after the restart.
+    EXPECT_EQ(query(be_id, new_ip, start_time + 10), std::set<int64_t>({restarted_be_txn}));
+    // Without a start time, every prepared transaction of the backend matches.
+    EXPECT_EQ(query(be_id, new_ip, 0), std::set<int64_t>({restarted_be_txn, after_restart_txn}));
+    // A coordinator recorded without an id falls back to the address.
+    EXPECT_EQ(query(999, old_ip, start_time + 10), std::set<int64_t>({no_id_txn}));
+    // The other backend's transaction matches by its id whatever address the request names.
+    EXPECT_EQ(query(other_be_id, old_ip, start_time + 10),
+              std::set<int64_t>({other_be_txn, no_id_txn}));
+    EXPECT_EQ(query(other_be_id, new_ip, start_time + 10),
+              std::set<int64_t>({other_be_txn}));
+}
+
 TEST(MetaServiceTest, GetPrepareTxnByCoordinatorScanRetryTest) {
     auto meta_service = get_meta_service();
     const bool original_mode = config::enable_get_prepare_txn_by_coordinator_by_running_key;
@@ -3302,9 +3378,11 @@ TEST(MetaServiceTest, GetPrepareTxnByCoordinatorScanModeTest) {
         req.set_start_time(150);
         meta_service->get_prepare_txn_by_coordinator(&cntl, &req, &resp, nullptr);
         ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
-        ASSERT_EQ(resp.txn_infos_size(), 2);
+        // Txn 3 is recorded with the coordinator's id at another address, so it matches by id.
+        ASSERT_EQ(resp.txn_infos_size(), 3);
         EXPECT_EQ(resp.txn_infos(0).txn_id(), 1);
         EXPECT_EQ(resp.txn_infos(1).txn_id(), 2);
+        EXPECT_EQ(resp.txn_infos(2).txn_id(), 3);
     }
 
     // Skip malformed running keys on the first, middle and last data pages.
@@ -3338,9 +3416,11 @@ TEST(MetaServiceTest, GetPrepareTxnByCoordinatorScanModeTest) {
         req.set_start_time(150);
         meta_service->get_prepare_txn_by_coordinator(&cntl, &req, &resp, nullptr);
         ASSERT_EQ(resp.status().code(), MetaServiceCode::OK);
-        ASSERT_EQ(resp.txn_infos_size(), 2);
+        // Txn 3 is recorded with the coordinator's id at another address, so it matches by id.
+        ASSERT_EQ(resp.txn_infos_size(), 3);
         EXPECT_EQ(resp.txn_infos(0).txn_id(), 1);
         EXPECT_EQ(resp.txn_infos(1).txn_id(), 2);
+        EXPECT_EQ(resp.txn_infos(2).txn_id(), 3);
         EXPECT_EQ(pages, 9 + 3 + 1);
     }
 
