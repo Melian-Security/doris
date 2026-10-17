@@ -3094,8 +3094,8 @@ TEST(MetaServiceTest, GetPrepareTxnByCoordinatorMatchesByIdTest) {
     // A coordinator recorded without a backend id.
     const int64_t no_id_txn = begin("match_by_id_no_id", 0, old_ip, start_time);
     // Begun by backend 101 after it restarted.
-    const int64_t after_restart_txn = begin("match_by_id_after_restart", be_id, new_ip,
-                                            start_time + 50);
+    const int64_t after_restart_txn =
+            begin("match_by_id_after_restart", be_id, new_ip, start_time + 50);
 
     auto query = [&](int64_t id, const std::string& ip, int64_t request_start_time) {
         brpc::Controller cntl;
@@ -3127,8 +3127,7 @@ TEST(MetaServiceTest, GetPrepareTxnByCoordinatorMatchesByIdTest) {
     // The other backend's transaction matches by its id whatever address the request names.
     EXPECT_EQ(query(other_be_id, old_ip, start_time + 10),
               std::set<int64_t>({other_be_txn, no_id_txn}));
-    EXPECT_EQ(query(other_be_id, new_ip, start_time + 10),
-              std::set<int64_t>({other_be_txn}));
+    EXPECT_EQ(query(other_be_id, new_ip, start_time + 10), std::set<int64_t>({other_be_txn}));
 }
 
 TEST(MetaServiceTest, GetPrepareTxnByCoordinatorScanRetryTest) {
