@@ -158,7 +158,9 @@ if [[ "${PUSH}" -eq 1 ]]; then
         ${DOCKER} login --username AWS --password-stdin "${REGISTRY_HOST}" >/dev/null
 fi
 
-# The binaries need libjvm from the image's JDK on the library path even for --version.
+# The binaries need libjvm from the image's JDK on the library path even for --version. The
+# expression is expanded inside the image, so it stays unexpanded here.
+# shellcheck disable=SC2016
 JVM_PATH='$(dirname "$(find / -name libjvm.so 2>/dev/null | head -1)")'
 declare -A SMOKE=(
     [fe]="python3 -c 'import re,zipfile; s=zipfile.ZipFile(\"/opt/apache-doris/fe/lib/doris-fe.jar\").read(\"build/org/apache/doris/common/Version.java\").decode(); print(chr(10).join(re.findall(r\"DORIS_BUILD_(?:VERSION|SHORT_HASH|TIME) = .*\", s)))' && java -version"
